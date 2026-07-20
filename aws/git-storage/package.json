@@ -1,0 +1,22 @@
+{
+  "name": "vibesdk-git-storage",
+  "private": true,
+  "version": "0.0.1",
+  "description": "S3-only git object storage backend for isomorphic-git (see docs/aws-migration-technical-design.md decision 3). Not part of the main vibesdk build.",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/s3-fs.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/s3-fs.js --external:@aws-sdk/*",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts --root ."
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.600.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
+  }
+}

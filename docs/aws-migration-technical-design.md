@@ -292,6 +292,15 @@ particular needs real measurement, not an estimate.
    and full clone protocol support (rebase-on-template) all need to work
    identically post-migration.
 
+   First cut exists: [`aws/git-storage/`](../aws/git-storage/) in this
+   repo — the `S3FS` adapter (same public interface, chunking scheme,
+   and error semantics as today's `SqliteFS`), unit-tested against an
+   in-memory S3 stand-in (28 tests) since no real S3 or local emulator
+   was available to test against directly. Not yet integrated with a
+   real session or S3 bucket, and not yet tested against actual S3
+   (multipart/large-object behavior, IAM edges) — see that directory's
+   README.
+
    Known tradeoff: isomorphic-git does many small reads during tree
    walks, and S3 request latency/cost per object is higher than a local
    DO-SQLite row read. Mitigation: while a sandbox task is warm and
