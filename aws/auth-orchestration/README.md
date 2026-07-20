@@ -125,16 +125,16 @@ security-event methods depend on `vibesdk-db-audit`, wired in as an
 reports a zeroed-out low-risk status, so a caller that doesn't want to
 provision Table 5 isn't forced to.
 
+`unlinkOAuthIdentity` also repoints the primary `provider`/`providerId`
+on the `users` row to another remaining identity when the removed one
+was primary (display/back-compat) -- this needed a small addition to
+`db-identity`, `UserStore.setPrimaryProvider`, since
+`updateUserProfile` only ever exposed display-field updates. Was a real,
+acknowledged gap in an earlier version of this package; closed now.
+
 Not ported:
 - Cloudflare OAuth (`CloudflareConnectOAuthProvider`) -- out of scope,
   same as `aws/oauth-clients`.
-- `unlinkOAuthIdentity`'s primary-provider repoint on the `users` row
-  (when the removed identity was the "primary" one, the original
-  repoints `provider`/`providerId` to another remaining identity for
-  display/back-compat). `db-identity`'s `UserStore.updateUserProfile`
-  only exposes display-field updates, not the primary-provider fields.
-  A real gap, not silently dropped -- noted in the code where it would
-  go.
 - Lockout enforcement reading `AuthAttemptStore.countRecentFailures` --
   the original never wired this up either; `logAuthAttempt` records
   every attempt, nothing reads it back to lock an account. Ported

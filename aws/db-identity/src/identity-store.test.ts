@@ -151,6 +151,17 @@ describe('username management', () => {
 	});
 });
 
+describe('setPrimaryProvider', () => {
+	it('repoints provider/providerId on the user row', async () => {
+		const { users } = makeStores();
+		const alice = await users.createUser(baseNewUser({ provider: 'github', providerId: 'gh-1' }));
+
+		await users.setPrimaryProvider(alice.id, 'google', 'go-1');
+
+		expect(await users.findUser({ id: alice.id })).toMatchObject({ provider: 'google', providerId: 'go-1' });
+	});
+});
+
 describe('AI Gateway preference', () => {
 	it('defaults to off for a Cloudflare-signed-in user, on otherwise', async () => {
 		const { users } = makeStores();

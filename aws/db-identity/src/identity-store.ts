@@ -232,6 +232,28 @@ export class UserStore {
 		);
 	}
 
+	/**
+	 * Repoints the primary `provider`/`providerId` on the user row --
+	 * separate from `updateUserProfile`, which only touches display
+	 * fields, since this pair is also the OAuth-identity uniqueness
+	 * lookup's key material at creation time and deserves its own
+	 * explicit call site rather than being smuggled into a generic
+	 * profile update. Added for `aws/auth-orchestration`'s
+	 * `unlinkOAuthIdentity`, which needs it when the identity being
+	 * removed was the "primary" one shown on the user row, and another
+	 * identity remains to repoint to.
+	 */
+	async setPrimaryProvider(userId: string, provider: string, providerId: string): Promise<void> {
+		await this.ddb.send(
+			new UpdateCommand({
+				TableName: this.tableName,
+				Key: { pk: userPk(userId), sk: SK_PROFILE },
+				UpdateExpression: 'SET provider = :provider, providerId = :providerId, updatedAt = :now',
+				ExpressionAttributeValues: { ':provider': provider, ':providerId': providerId, ':now': Date.now() },
+			}),
+		);
+	}
+
 	async getAiGatewayPreference(
 		userId: string,
 	): Promise<{ enabled: boolean; isExplicit: boolean }> {

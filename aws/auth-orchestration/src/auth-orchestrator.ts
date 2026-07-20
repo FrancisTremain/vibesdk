@@ -479,13 +479,15 @@ export class AuthOrchestrator {
 
 		await this.identities.unlink(userId, provider, target.providerId);
 
-		// The original also repoints the primary `provider`/`providerId`
-		// on the users row to another remaining identity when the removed
-		// one was primary, for display/back-compat. Not ported:
-		// `UserStore.updateUserProfile` only exposes display-field
-		// updates, not the primary-provider fields -- see this package's
-		// README for why that's a real, acknowledged gap rather than a
-		// silent omission.
+		// If the removed identity was the primary one on the users row
+		// (display/back-compat), repoint to another remaining identity so
+		// the row stays coherent -- matches the original.
+		if (user && user.provider === provider) {
+			const next = identities.find((i) => i.provider !== provider);
+			if (next) {
+				await this.users.setPrimaryProvider(userId, next.provider, next.providerId);
+			}
+		}
 	}
 
 	// ========================================

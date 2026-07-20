@@ -297,6 +297,46 @@ describe('OAuth account linking', () => {
 			auth.completeOAuthLink('github', 'code', state2, 'https://app.example.com/callback', nonce2, second.user.id),
 		).rejects.toThrow(/already linked to another user/);
 	});
+
+	it('repoints the primary provider on the users row when the removed identity was primary', async () => {
+		const auth = makeOrchestrator();
+
+		const { authUrl: url1, nonce: nonce1 } = await auth.getOAuthAuthorizationUrl('github', 'https://app.example.com/login');
+		const state1 = new URL(url1).searchParams.get('state')!;
+		stubGithub(321);
+		const registered = await auth.handleOAuthCallback('github', 'code', state1, 'https://app.example.com/callback', nonce1);
+		expect(registered.user.provider).toBe('github');
+
+		vi.stubGlobal(
+			'fetch',
+			mockFetch({
+				'https://oauth2.googleapis.com/token': () => ({ access_token: 'tok', token_type: 'bearer' }),
+				'https://www.googleapis.com/oauth2/v2/userinfo': () => ({
+					id: 'go-1',
+					email: 'linked@example.com',
+					verified_email: true,
+					name: 'Linked',
+				}),
+			}),
+		);
+		const { authUrl: url2, nonce: nonce2 } = await auth.getOAuthAuthorizationUrl(
+			'google',
+			'https://app.example.com/link',
+			undefined,
+			registered.user.id,
+		);
+		const state2 = new URL(url2).searchParams.get('state')!;
+		await auth.completeOAuthLink('google', 'code', state2, 'https://app.example.com/callback', nonce2, registered.user.id);
+
+		await auth.unlinkOAuthIdentity(registered.user.id, 'github');
+
+		const updated = await auth.getUserForAuth(registered.user.id);
+		expect(updated?.provider).toBe('google');
+
+		const identities = await auth.getUserIdentities(registered.user.id);
+		expect(identities).toHaveLength(1);
+		expect(identities[0]).toMatchObject({ provider: 'google' });
+	});
 });
 
 describe('email verification via OTP', () => {
