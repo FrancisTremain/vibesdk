@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "build": "esbuild src/handler.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/handler.js --external:@aws-sdk/*",
-    "package": "npm run build && cd dist && zip -r ../user-api-lambda.zip handler.js",
+    "package": "npm run build && echo '{\"type\":\"module\"}' > dist/package.json && cd dist && zip -r ../user-api-lambda.zip handler.js package.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts --root ."
   },
