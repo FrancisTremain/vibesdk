@@ -439,8 +439,20 @@ guess. These are starting points, not final tuning:
 4. **Stateless surface port** — D1→DynamoDB (query-layer rewrite, 10
    migrations' worth of schema to re-derive as access patterns — target
    schema designed in
-   [docs/aws-dynamodb-schema.md](aws-dynamodb-schema.md)), R2→S3,
-   KV→DynamoDB, port the Worker entrypoint to API Gateway + Lambda.
+   [docs/aws-dynamodb-schema.md](aws-dynamodb-schema.md), all six
+   tables now ported and tested), R2→S3 (`aws/git-storage/`),
+   KV→DynamoDB (`aws/rate-limit/`), port the Worker entrypoint to API
+   Gateway + Lambda. The auth slice of the entrypoint is done:
+   [`aws/auth-api-lambda/`](../aws/auth-api-lambda/) is an API Gateway
+   HTTP API (v2) Lambda handler porting
+   `worker/api/routes/authRoutes.ts` + its controller's HTTP-adapter
+   behavior, wired to `aws/auth-orchestration` (11 tests, a full mocked
+   GitHub OAuth login round trip included). The rest of
+   `worker/index.ts` (apps, analytics, model-config, deployments, and
+   everything not auth) is not yet ported to a Lambda entrypoint —
+   substantially more surface area, but every database primitive it
+   would need is already built (`aws/db-apps`, `aws/db-analytics`,
+   `aws/db-model-config`).
 5. **Sandbox + deploy port** — replace `UserAppSandboxService` with
    on-demand `RunTask`-launched sandboxes plus Tier-2 keep-warm (decision
    1), replace the wrangler/dispatch deployer with the AWS provisioning

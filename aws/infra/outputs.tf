@@ -38,3 +38,8 @@ output "system_settings_table_name" {
 output "git_storage_bucket_name" {
   value = aws_s3_bucket.git_storage.bucket
 }
+
+output "auth_api_endpoint" {
+  description = "https:// base URL for the auth API (invoke_url already includes the $default stage)."
+  value       = aws_apigatewayv2_stage.auth_api.invoke_url
+}

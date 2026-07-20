@@ -4,8 +4,10 @@
   "version": "0.0.1",
   "description": "Port of AuthService (worker/database/services/AuthService.ts) -- register/login/logout/OAuth callback/account-linking orchestration, assembled from aws/db-identity, aws/db-auth-flows, aws/auth-crypto, and aws/oauth-clients. Not part of the main vibesdk build.",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --external:@aws-sdk/*",
+    "build": "tsc --emitDeclarationOnly --outDir dist && esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --external:@aws-sdk/*",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts --root ."
   },

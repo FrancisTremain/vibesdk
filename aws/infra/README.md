@@ -45,23 +45,38 @@ directly, so there's no networking dependency to stand up first.
   group.
 - `apigateway.tf` — WebSocket API wired to the Lambda across
   `$connect`/`$disconnect`/`$default`.
+- `auth-api.tf` — the auth slice of the real API surface: IAM role
+  scoped to just the identity/auth-flows/audit-log tables, the
+  `aws/auth-api-lambda` Lambda function, and an API Gateway HTTP API
+  (v2) with one explicit route per `(method, path)` the handler's
+  `routeKey` switch matches (kept in sync with that file — see its
+  comment) rather than a single `ANY /{proxy+}` catch-all, so an
+  unmatched request 404s at API Gateway instead of reaching the
+  Lambda. `$default`-stage, `auto_deploy = true`, matching the
+  actor-spike API's shape.
 - `variables.tf` / `outputs.tf`.
 
-Lambda source lives in [`../actor-spike/`](../actor-spike/) in this same
-repo. `lambda_package_s3_bucket`/`lambda_package_s3_key` have no
-defaults — there's no CI pipeline yet to build and upload the package;
-set them once one exists.
+Lambda source for the actor-spike lives in
+[`../actor-spike/`](../actor-spike/); for the auth API, in
+[`../auth-api-lambda/`](../auth-api-lambda/). Both packages'
+`*_package_s3_bucket`/`*_package_s3_key` variables have no defaults —
+there's no CI pipeline yet to build and upload either package; set them
+once one exists. `jwt_secret` also has no default and is marked
+`sensitive` — see its description in `variables.tf` for why it
+shouldn't be passed as a literal Terraform variable in a real apply
+(source it from SSM Parameter Store / Secrets Manager once a secrets
+pipeline exists instead).
 
 ## Status
 
 Not applied. Not run through `terraform validate`/`fmt` — no `terraform`
 binary was available in the environment this was written in. Needs both,
-plus human review of the IAM/network-facing pieces, before any apply.
-`lambda.tf`'s IAM role and `apigateway.tf`'s routing cover the
-actor-spike only; nothing in this directory yet stands up a Lambda/API
-Gateway surface for the six application tables' real callers (the
-`aws/db-*`/`aws/auth-*` packages) -- that's the next infra piece once
-`worker/index.ts`'s routing itself gets ported to API Gateway + Lambda.
+plus human review of the IAM/network-facing pieces (especially
+`jwt_secret` sourcing), before any apply. Nothing in this directory yet
+stands up a Lambda/API Gateway surface for the apps/analytics/model-config
+tables' real callers (`aws/db-apps`, `aws/db-analytics`,
+`aws/db-model-config`) — those don't have a Lambda handler ported yet
+either, only the auth slice does.
 
 ## What this measures
 
