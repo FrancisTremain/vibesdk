@@ -78,11 +78,19 @@ resource "aws_lambda_function" "user_api" {
 
   environment {
     variables = {
-      APPS_TABLE         = aws_dynamodb_table.apps.name
-      MODEL_CONFIG_TABLE = aws_dynamodb_table.model_config.name
-      IDENTITY_TABLE     = aws_dynamodb_table.identity.name
-      AUTH_FLOWS_TABLE   = aws_dynamodb_table.auth_flows.name
-      JWT_SECRET         = var.jwt_secret
+      APPS_TABLE               = aws_dynamodb_table.apps.name
+      MODEL_CONFIG_TABLE       = aws_dynamodb_table.model_config.name
+      IDENTITY_TABLE           = aws_dynamodb_table.identity.name
+      AUTH_FLOWS_TABLE         = aws_dynamodb_table.auth_flows.name
+      JWT_SECRET               = var.jwt_secret
+      # Read by vibesdk-model-config-defaults (AGENT_CONFIG selection,
+      # BYOK-platform-key check) -- see that package's README.
+      PLATFORM_MODEL_PROVIDERS = var.platform_model_providers
+      ANTHROPIC_API_KEY        = var.anthropic_api_key
+      OPENAI_API_KEY           = var.openai_api_key
+      GOOGLE_AI_STUDIO_API_KEY = var.google_ai_studio_api_key
+      CEREBRAS_API_KEY         = var.cerebras_api_key
+      GROQ_API_KEY             = var.groq_api_key
     }
   }
 
@@ -111,6 +119,11 @@ locals {
     "POST /api/user/providers",
     "PUT /api/user/providers/{id}",
     "DELETE /api/user/providers/{id}",
+    "GET /api/model-configs",
+    "GET /api/model-configs/{agentAction}",
+    "PUT /api/model-configs/{agentAction}",
+    "DELETE /api/model-configs/{agentAction}",
+    "POST /api/model-configs/reset-all",
   ]
 }
 

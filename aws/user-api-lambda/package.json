@@ -2,7 +2,7 @@
   "name": "vibesdk-user-api-lambda",
   "private": true,
   "version": "0.0.1",
-  "description": "API Gateway HTTP API (v2) Lambda handler for user stats (worker/api/routes/statsRoutes.ts) and custom model-provider listing (worker/api/routes/modelProviderRoutes.ts), wired to vibesdk-db-analytics, vibesdk-db-model-config, and vibesdk-auth-orchestration (token validation only). Not part of the main vibesdk build.",
+  "description": "API Gateway HTTP API (v2) Lambda handler for user stats (worker/api/routes/statsRoutes.ts), custom model-provider listing, and model-config CRUD (worker/api/routes/modelProviderRoutes.ts, modelConfigRoutes.ts), wired to vibesdk-db-analytics, vibesdk-db-model-config, vibesdk-model-config-defaults, and vibesdk-auth-orchestration (token validation only). Not part of the main vibesdk build.",
   "type": "module",
   "scripts": {
     "build": "esbuild src/handler.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/handler.js --external:@aws-sdk/*",
@@ -15,7 +15,8 @@
     "@aws-sdk/lib-dynamodb": "^3.600.0",
     "vibesdk-auth-orchestration": "file:../auth-orchestration",
     "vibesdk-db-analytics": "file:../db-analytics",
-    "vibesdk-db-model-config": "file:../db-model-config"
+    "vibesdk-db-model-config": "file:../db-model-config",
+    "vibesdk-model-config-defaults": "file:../model-config-defaults"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.138",

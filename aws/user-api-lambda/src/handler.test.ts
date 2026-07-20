@@ -141,3 +141,152 @@ describe('user-api-lambda handler', () => {
 		}
 	});
 });
+
+describe('model-config routes', () => {
+	let ddb: FakeDynamoDocumentClient;
+
+	beforeEach(() => {
+		JWTUtils.resetInstanceForTests();
+		ddb = new FakeDynamoDocumentClient();
+		setDdbClientForTests(ddb as unknown as DynamoDBDocumentClient);
+		process.env.GOOGLE_AI_STUDIO_API_KEY = 'test-platform-key-1234567890';
+	});
+	afterEach(() => {
+		setDdbClientForTests(null);
+		delete process.env.GOOGLE_AI_STUDIO_API_KEY;
+	});
+
+	it('lists all agent-action configs, defaulted, for a fresh user', async () => {
+		const { token } = await registerUser(ddb, 'mc-list@example.com');
+		const result = asStructured(
+			await handler(event({ routeKey: 'GET /api/model-configs', headers: { authorization: `Bearer ${token}` } })),
+		);
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data.configs.blueprint.isUserOverride).toBe(false);
+	});
+
+	it('rejects an invalid agent action name', async () => {
+		const { token } = await registerUser(ddb, 'mc-invalid@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'GET /api/model-configs/{agentAction}',
+					pathParameters: { agentAction: 'not-a-real-action' },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(400);
+	});
+
+	it('updates and then reads back a model config for an allowed model', async () => {
+		const { token } = await registerUser(ddb, 'mc-update@example.com');
+
+		const update = asStructured(
+			await handler(
+				event({
+					routeKey: 'PUT /api/model-configs/{agentAction}',
+					pathParameters: { agentAction: 'templateSelection' },
+					headers: { authorization: `Bearer ${token}` },
+					body: JSON.stringify({ modelName: 'google-ai-studio/gemini-2.5-flash-lite' }),
+				}),
+			),
+		);
+		expect(update.statusCode).toBe(200);
+
+		const fetched = asStructured(
+			await handler(
+				event({
+					routeKey: 'GET /api/model-configs/{agentAction}',
+					pathParameters: { agentAction: 'templateSelection' },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(body(fetched).data.config.isUserOverride).toBe(true);
+		expect(body(fetched).data.config.name).toBe('google-ai-studio/gemini-2.5-flash-lite');
+	});
+
+	it("rejects a model that violates the agent action's constraint", async () => {
+		const { token } = await registerUser(ddb, 'mc-constraint@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'PUT /api/model-configs/{agentAction}',
+					pathParameters: { agentAction: 'templateSelection' },
+					headers: { authorization: `Bearer ${token}` },
+					// A LARGE model, not allowed for templateSelection (constrained to lite models).
+					body: JSON.stringify({ modelName: 'google-ai-studio/gemini-2.5-pro' }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(400);
+	});
+
+	it('rejects a model whose provider has no platform key configured', async () => {
+		const { token } = await registerUser(ddb, 'mc-no-key@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'PUT /api/model-configs/{agentAction}',
+					pathParameters: { agentAction: 'deepDebugger' },
+					headers: { authorization: `Bearer ${token}` },
+					body: JSON.stringify({ modelName: 'anthropic/claude-sonnet-4-5' }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(403);
+	});
+
+	it('deletes a config back to defaults, then 404s on a second delete', async () => {
+		const { token } = await registerUser(ddb, 'mc-delete@example.com');
+		await handler(
+			event({
+				routeKey: 'PUT /api/model-configs/{agentAction}',
+				pathParameters: { agentAction: 'templateSelection' },
+				headers: { authorization: `Bearer ${token}` },
+				body: JSON.stringify({ modelName: 'google-ai-studio/gemini-2.5-flash-lite' }),
+			}),
+		);
+
+		const first = asStructured(
+			await handler(
+				event({
+					routeKey: 'DELETE /api/model-configs/{agentAction}',
+					pathParameters: { agentAction: 'templateSelection' },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(first.statusCode).toBe(200);
+
+		const second = asStructured(
+			await handler(
+				event({
+					routeKey: 'DELETE /api/model-configs/{agentAction}',
+					pathParameters: { agentAction: 'templateSelection' },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(second.statusCode).toBe(404);
+	});
+
+	it('resets all configs and reports the count', async () => {
+		const { token } = await registerUser(ddb, 'mc-reset@example.com');
+		await handler(
+			event({
+				routeKey: 'PUT /api/model-configs/{agentAction}',
+				pathParameters: { agentAction: 'templateSelection' },
+				headers: { authorization: `Bearer ${token}` },
+				body: JSON.stringify({ modelName: 'google-ai-studio/gemini-2.5-flash-lite' }),
+			}),
+		);
+
+		const result = asStructured(
+			await handler(event({ routeKey: 'POST /api/model-configs/reset-all', headers: { authorization: `Bearer ${token}` } })),
+		);
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data.resetCount).toBe(1);
+	});
+});

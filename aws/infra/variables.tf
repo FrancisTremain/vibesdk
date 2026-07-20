@@ -96,3 +96,39 @@ variable "user_api_lambda_package_s3_key" {
   description = "S3 key for the built aws/user-api-lambda deployment package."
   type        = string
 }
+
+variable "platform_model_providers" {
+  description = "Optional comma-separated provider list for vibesdk-model-config-defaults' AGENT_CONFIG selection and BYOK platform-key check (matches the original's env.PLATFORM_MODEL_PROVIDERS). Empty disables it -- falls back to per-provider *_api_key variables below."
+  type        = string
+  default     = ""
+}
+
+variable "anthropic_api_key" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+
+variable "openai_api_key" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+
+variable "google_ai_studio_api_key" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+
+variable "cerebras_api_key" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+
+variable "groq_api_key" {
+  type      = string
+  default   = ""
+  sensitive = true
+}

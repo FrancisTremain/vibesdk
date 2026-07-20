@@ -1,58 +1,79 @@
 # user-api-lambda
 
 API Gateway HTTP API (v2) Lambda handler for user stats
-(`worker/api/routes/statsRoutes.ts`) and custom model-provider listing
-(`worker/api/routes/modelProviderRoutes.ts`), wired to
+(`worker/api/routes/statsRoutes.ts`), custom model-provider listing
+(`worker/api/routes/modelProviderRoutes.ts`), and model-config CRUD
+(`worker/api/routes/modelConfigRoutes.ts`), wired to
 [`vibesdk-db-analytics`](../db-analytics/),
-[`vibesdk-db-model-config`](../db-model-config/), and
+[`vibesdk-db-model-config`](../db-model-config/),
+[`vibesdk-model-config-defaults`](../model-config-defaults/), and
 [`vibesdk-auth-orchestration`](../auth-orchestration/) (token
 validation only). Same `event.routeKey`-switch shape as the other
 `aws/*-api-lambda` packages.
 
-## Deliberately narrow — two real reasons, not scope-trimming for its own sake
+## Model-config CRUD
 
-1. **Model-config CRUD isn't here.** `worker/api/controllers/modelConfig/controller.ts`
-   validates every `agentAction` against `AGENT_CONFIG`
-   (`worker/agents/inferutils/config.ts`) and merges stored overrides
-   with per-action defaults/constraints pulled from it on nearly every
-   endpoint. `aws/db-model-config`'s README already documents this as
-   explicitly not ported — that package is storage only, with no
-   `AGENT_CONFIG` dependency. Porting the model-config HTTP routes
-   faithfully would mean also porting or duplicating that large,
-   product-specific static config into a separate Lambda deployment —
-   a materially different, larger task than every other handler in
-   this migration, not attempted here.
-2. **Provider create/update/delete return 503, matching the live
-   product.** `ModelProvidersController.createProvider`/
+`worker/api/controllers/modelConfig/controller.ts` validates every
+`agentAction` against `AGENT_CONFIG`
+(`worker/agents/inferutils/config.ts`) and merges stored overrides with
+per-action defaults/constraints pulled from it. `aws/db-model-config`
+never ported that merge logic (storage only, by design). This handler
+gets it from `vibesdk-model-config-defaults` instead — a duplicated
+snapshot of `AGENT_CONFIG`/`AGENT_CONSTRAINTS` plus the pure
+merge/constraint/BYOK-platform-key-check logic, built specifically to
+unblock these routes. See that package's README for why duplication
+(not a shared import from `worker/`) was the right call for now.
+
+Ported: `GET /` (all agent actions, each merged+constrained),
+`GET /{agentAction}`, `PUT /{agentAction}` (validates the model against
+both the agent action's constraint and platform-key availability,
+exactly like the original's two-stage check — the model must be
+*allowed* for that action AND the deployment must actually have a
+platform key configured for its provider), `DELETE /{agentAction}`
+(reset one to default), `POST /reset-all`.
+
+Not ported: `testModelConfig`'s live-network-call path (out of scope
+for a storage-layer Lambda), and the BYOK-user-key half of model access
+validation — see `model-config-defaults`'s README on why that's
+already a no-op stub in the live product today, not something this
+port simplified away.
+
+## Model-provider listing
+
+1. **Only listing is live.** `ModelProvidersController.createProvider`/
    `updateProvider`/`deleteProvider` are themselves disabled right now
-   in `worker/api/controllers/modelProviders/controller.ts` — each
-   returns 503 "Custom model providers are temporarily disabled..."
-   unconditionally, before ever touching the database. This handler
-   mirrors that exact current behavior for API-contract parity rather
-   than reviving a feature the live product has turned off. If/when
-   it's re-enabled upstream, `vibesdk-db-model-config`'s
-   `ModelProviderStore` already has full `createProvider`/
-   `updateProvider`/`deleteProvider` support (tested, see that
-   package's README) — wiring it into these three routes is
-   mechanical whenever that happens.
-3. `testProvider`'s live-connection-test path (ad-hoc `baseUrl`/`apiKey`
-   testing, not the disabled stored-provider path) makes a real
-   network call to an LLM provider — out of scope for a storage-layer
-   Lambda, not ported at all (not even a stub).
+   in the original — each returns 503 "Custom model providers are
+   temporarily disabled..." unconditionally, before ever touching the
+   database. This handler mirrors that exact current behavior for
+   API-contract parity rather than reviving a feature the live product
+   has turned off. `vibesdk-db-model-config`'s `ModelProviderStore`
+   already has full CRUD support (tested) — wiring it into these three
+   routes is mechanical whenever upstream re-enables the feature.
+2. `testProvider`'s live-connection-test path (ad-hoc `baseUrl`/`apiKey`
+   testing) makes a real network call to an LLM provider — out of scope
+   for a storage-layer Lambda, not ported at all.
 
 ## What's ported
 
 `GET /api/stats` (`AnalyticsStore.getUserStats`), `GET /api/stats/activity`
 (`AnalyticsStore.getUserActivityTimeline`, 20 most recent),
 `GET /api/user/providers` (active providers only, matching the
-original's `.filter(p => p.isActive)`), `GET /api/user/providers/{id}`.
+original's `.filter(p => p.isActive)`), `GET /api/user/providers/{id}`,
+and the model-config CRUD routes above.
 
 ## Testing
 
-6 tests, no real AWS or DynamoDB: the `/stats` auth gate, zeroed stats
+13 tests, no real AWS or DynamoDB: the `/stats` auth gate, zeroed stats
 and an empty activity timeline for a fresh user, provider listing
 filtering out a deactivated provider, fetching a single provider by
-id, and all three disabled-provider-mutation routes returning 503.
+id, all three disabled-provider-mutation routes returning 503, listing
+all agent-action configs defaulted for a fresh user, an invalid
+agent-action name rejected, a full update-then-read-back round trip for
+an allowed model, a constraint-violating model rejected with 400, a
+model with no configured platform key rejected with 403, delete then
+404-on-repeat-delete, and reset-all reporting the count. `process.env.GOOGLE_AI_STUDIO_API_KEY`
+is set in the model-config test suite's `beforeEach` to exercise the
+platform-key-present path realistically rather than mocking it away.
 
 ## Build
 

@@ -454,25 +454,27 @@ guess. These are starting points, not final tuning:
    visibility/delete routes, wired to `aws/db-apps` for storage and
    `aws/auth-orchestration` for token validation only (7 tests); and
    [`aws/user-api-lambda/`](../aws/user-api-lambda/) ports user stats
-   (`worker/api/routes/statsRoutes.ts`, wired to `aws/db-analytics`)
-   and custom-model-provider listing
+   (`worker/api/routes/statsRoutes.ts`, wired to `aws/db-analytics`),
+   custom-model-provider listing
    (`worker/api/routes/modelProviderRoutes.ts`, wired to
-   `aws/db-model-config`) — 6 tests, including the create/update/delete
-   provider routes mirroring their current *disabled* status in the
-   live product (they 503 upstream too) rather than reviving a
-   feature that's off. All three have matching Terraform in
-   `aws/infra/` (`auth-api.tf`, `apps-api.tf`, `user-api.tf`), not
-   applied. Deliberately not ported: the model-config CRUD routes
-   themselves (`worker/api/routes/modelConfigRoutes.ts`) — they
-   validate every request against `AGENT_CONFIG`
-   (`worker/agents/inferutils/config.ts`), a large product-specific
-   static config `aws/db-model-config` never ported either (storage
-   only, by design — see that package's README); porting the HTTP
-   routes faithfully would mean also porting or duplicating that
-   config, a materially larger and different task than every other
-   handler in this migration. `worker/index.ts`'s remaining surface
-   (deployments and everything else not auth/apps/stats/providers) is
-   also not yet ported.
+   `aws/db-model-config` — create/update/delete routes mirror their
+   current *disabled* status in the live product, which 503s them
+   upstream too, rather than reviving a feature that's off), and
+   model-config CRUD (`worker/api/routes/modelConfigRoutes.ts`) — 13
+   tests. The model-config CRUD routes needed `AGENT_CONFIG`'s
+   merge/constraint logic, which `aws/db-model-config` deliberately
+   never ported (storage only, by design); resolved via a new package,
+   [`aws/model-config-defaults/`](../aws/model-config-defaults/) — a
+   duplicated snapshot of `AGENT_CONFIG`/`AGENT_CONSTRAINTS` (the AI
+   model catalog) and the pure merge/constraint/BYOK-platform-key-check
+   logic from `ModelConfigService` (22 tests). Duplication over a
+   shared import from `worker/` was a deliberate choice, not an
+   oversight — see that package's README for the tradeoff and when to
+   revisit it (Phase 6 cutover prep, not before). All three Lambda
+   packages have matching Terraform in `aws/infra/` (`auth-api.tf`,
+   `apps-api.tf`, `user-api.tf`), not applied. `worker/index.ts`'s
+   remaining surface (deployments and everything else not
+   auth/apps/stats/providers/model-config) is not yet ported.
 5. **Sandbox + deploy port** — replace `UserAppSandboxService` with
    on-demand `RunTask`-launched sandboxes plus Tier-2 keep-warm (decision
    1), replace the wrangler/dispatch deployer with the AWS provisioning
