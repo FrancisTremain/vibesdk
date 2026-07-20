@@ -176,7 +176,7 @@ either.
 | D1 + Drizzle | DynamoDB on-demand, single-table design keyed by entity access patterns | Medium-High — no relational engine, so this is a query-layer rewrite, not a dialect swap (see decision above) |
 | R2 | S3 | Low |
 | KV | DynamoDB on-demand | Low |
-| `DORateLimitStore` | DynamoDB conditional-update token bucket (own implementation of the governor pattern) | Low-Medium |
+| `DORateLimitStore` | DynamoDB conditional-update token bucket (own implementation of the governor pattern). First cut: [`aws/rate-limit/`](../aws/rate-limit/), unit-tested (11 tests), not yet wired to a real table. | Low-Medium |
 | `UserSecretsStore` | Same crypto (VMK/SK hierarchy, AES-GCM/XChaCha20-Poly1305) unchanged; storage moves to DynamoDB. See decision 4 below — the Lambda model actually simplifies this. | Medium — crypto logic ports directly |
 | CF Sandbox / Containers (`UserAppSandboxService`) | On-demand ECS Fargate Spot tasks, launched fresh per session via `RunTask`, no standing pool, reachable via ALB path/host routing for preview URLs | Medium-High — CF's sandbox SDK handles port exposure/proxying/token validation for free; on ECS this needs to be built (a thin router mapping session ID → task IP:port). See Cost model for sizing. |
 | Deployer (`wrangler.jsonc` + Workers-for-Platforms dispatch) | Programmatic provisioning: `RunTask` for ephemeral previews, vibesdk's own blue-green Terraform module for apps a user explicitly deploys long-term | High — biggest architectural change from how vibesdk deploys today |
