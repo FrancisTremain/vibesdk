@@ -33,16 +33,31 @@ AWS infrastructure from scratch.
 
 Two persistence layers matter, and they are **not** the same thing:
 
-1. **D1** — ordinary relational control-plane data. Maps cleanly onto
-   Aurora Serverless v2 (Postgres), since Drizzle already abstracts the
-   query layer; this is a dialect swap plus a migration rewrite, not a
-   redesign.
+1. **D1** — ordinary relational control-plane data (users, apps, api
+   keys, sessions, model configs). Access patterns here are key-lookup
+   shaped (by user, by app, by session, by api key), not join-heavy, so
+   this maps onto DynamoDB single-table design rather than a relational
+   engine — see decision below. This is not a dialect swap; it's a
+   query-layer rewrite (Drizzle's relational query API goes away, access
+   patterns must be enumerated up front).
 2. **DO-local SQLite** — per-agent-instance transactional storage
    (agent state blob, git object chunks, secrets vault). This is
    Durable-Object-specific: it gets its consistency guarantees from the
    DO being a single-threaded actor with storage colocated in the same
    transaction boundary. This is the part with no AWS equivalent and is
    the actual crux of the migration.
+
+**Decision: no Aurora.** Given vibe-platform's "cost is king" constraint,
+this design does not introduce a relational database. Control-plane data
+goes to DynamoDB on-demand (same table class vibe-platform already uses
+for `governor`/`parked_tasks`); git objects and other large blobs go to
+S3. The tradeoff is explicit: anything join-shaped (admin reporting,
+cross-entity analytics) needs either an access pattern designed into the
+table up front (GSIs) or a separate export path (e.g. periodic S3 export
+queried via Athena) — there is no ad hoc query escape hatch once this is
+built. If a genuine join-heavy requirement shows up during Phase 4 that
+can't be reasonably served by DynamoDB access patterns, that's the
+trigger to revisit this decision, not a default fallback to Aurora.
 
 ## What vibe-platform already provides that we should reuse as-is
 
@@ -73,16 +88,16 @@ out explicitly as an open design question below.
 
 | vibesdk component | AWS target | Effort/risk |
 |---|---|---|
-| Worker entrypoint | Containerize (Node/Hono or similar), run as an ECS Fargate service behind the shared ALB via `app-blue-green` | Medium — mechanical, ALB supports WebSocket passthrough natively |
-| D1 + Drizzle | Aurora Serverless v2 Postgres + Drizzle pg driver | Medium — schema/migration rewrite (10 migrations), query-level dialect issues (SQLite-specific functions, `INSERT OR REPLACE`, etc.) |
+| Worker entrypoint | Containerize (Node/Hono or similar), run as an ECS Fargate (Spot) service behind the shared ALB via `app-blue-green` | Medium — mechanical, ALB supports WebSocket passthrough natively |
+| D1 + Drizzle | DynamoDB on-demand, single-table design keyed by entity access patterns | Medium-High — no relational engine, so this is a query-layer rewrite, not a dialect swap (see decision above) |
 | R2 | S3 | Low |
 | KV | DynamoDB on-demand | Low |
 | `DORateLimitStore` | DynamoDB conditional-update token bucket (same pattern as vibe-platform's governor) | Low-Medium |
-| `UserSecretsStore` | Same crypto (VMK/SK hierarchy, AES-GCM/XChaCha20-Poly1305) unchanged; storage moves to DynamoDB or Aurora; consider KMS-wrapping the top-level key | Medium — crypto logic ports directly, session-affinity for the WS-bound vault session needs a story (see actor-model section) |
-| CF Sandbox / Containers (`UserAppSandboxService`) | Ephemeral ECS Fargate tasks, one per active session, reachable via ALB path/host routing for preview URLs | Medium-High — CF's sandbox SDK handles port exposure/proxying/token validation for free; on ECS this needs to be built (a thin router service mapping session ID → task IP:port, or an ALB rule per active preview) |
+| `UserSecretsStore` | Same crypto (VMK/SK hierarchy, AES-GCM/XChaCha20-Poly1305) unchanged; storage moves to DynamoDB; consider KMS-wrapping the top-level key | Medium — crypto logic ports directly; piggybacks on the session-worker pinning boundary (see decision in actor-model section) rather than a separate stateful service |
+| CF Sandbox / Containers (`UserAppSandboxService`) | Ephemeral ECS Fargate (Spot) tasks drawn from a warm blue/green pool, reachable via ALB path/host routing for preview URLs | Medium-High — CF's sandbox SDK handles port exposure/proxying/token validation for free; on ECS this needs to be built (a thin router service mapping session ID → task IP:port, or an ALB rule per active preview). See warm-pool decision below. |
 | Deployer (`wrangler.jsonc` + Workers-for-Platforms dispatch) | Programmatic per-app provisioning against the `app-blue-green` module — **not** literal `terraform apply` per app (see open question below) | High — biggest divergence from how vibe-platform currently onboards apps |
 | `CodeGeneratorAgent` (Durable Object actor + state machine) | No direct analog. See dedicated section below. | **High — this is the critical-path risk for the whole migration** |
-| Git-per-session (isomorphic-git on DO SQLite) | Isomorphic-git unchanged; filesystem adapter re-targeted at Aurora (a `git_objects` table keyed by session ID, same chunking scheme) or S3 for large blobs + Aurora for refs/tree metadata | Medium |
+| Git-per-session (isomorphic-git on DO SQLite) | Isomorphic-git unchanged; filesystem adapter re-targeted at S3 for object blobs + DynamoDB for refs/tree metadata | Medium |
 
 ## The actor-model gap (critical path)
 
@@ -101,60 +116,97 @@ into `CodeGeneratorAgent`:
 
 None of these exist natively in ECS/Lambda. Proposed replacement:
 
-- **Compute**: a pool of long-lived ECS Fargate tasks ("session
+- **Compute**: a pool of long-lived ECS Fargate Spot tasks ("session
   workers"), each capable of holding N active sessions in memory
   (similar to how a Node process can hold many objects). A lightweight
   router (could live in the ALB-fronted control-plane service) maps
-  `sessionId → workerTaskId` and pins WebSocket connections there via
-  ALB sticky sessions (or, more robustly, an explicit routing layer
-  since ALB stickiness is cookie-based and WS wants connection-level
-  pinning).
+  `sessionId → workerTaskId` via an explicit routing table (DynamoDB),
+  not ALB sticky sessions — see decision below.
 - **Serialization**: per-session mutation lock via a DynamoDB conditional
-  write (`sessionId` as key, optimistic lock / row lock) or a Postgres
-  advisory lock in Aurora — either enforces the DO's single-threaded
-  guarantee explicitly instead of getting it for free.
-- **Durability**: state blob + git object chunks persisted to Aurora
-  (or DynamoDB for the state blob, Aurora/S3 for git objects) on every
-  mutation, same shape as today's DO-SQLite writes, just an explicit
-  write instead of an implicit one.
-- **Rehydration**: on task restart or session migration, reload state
-  from Aurora/DynamoDB before accepting the next message — this replaces
-  DO hibernation. Reconnect-and-resync WS logic (currently handled by the
-  CF `agents` SDK) needs to be reimplemented; this is a real chunk of new
-  code, not a config change.
+  write (`sessionId` as key, optimistic lock) — enforces the DO's
+  single-threaded guarantee explicitly instead of getting it for free.
+- **Durability**: state blob persisted to DynamoDB, git object chunks to
+  S3, on every mutation — same shape as today's DO-SQLite writes, just an
+  explicit write instead of an implicit one.
+- **Rehydration**: on task restart, session migration, or Spot
+  interruption, reload state from DynamoDB/S3 before accepting the next
+  message — this replaces DO hibernation. Reconnect-and-resync WS logic
+  (currently handled by the CF `agents` SDK) needs to be reimplemented;
+  this is a real chunk of new code, not a config change.
+
+**Decision: Fargate Spot, not always-on.** This matches vibe-platform's
+own stated constraint ("Fargate Spot over EC2") and is close to free
+correctness-wise: the design above already externalizes all session state
+to DynamoDB/S3 so a worker can rehydrate on any node, which is exactly
+what's needed to survive a Spot interruption (2-minute reclaim notice) —
+on notice, stop accepting new messages for the sessions on that task,
+let in-flight mutations finish and persist, and let the router reassign
+those sessions to another warm worker. Keep a small on-demand baseline
+alongside the Spot fleet so a reclaim doesn't cause a visible gap for
+active sessions; size that baseline during the Phase 3 spike based on
+observed interruption frequency.
 
 This is the single highest-risk, highest-effort piece of the whole
 migration and should be prototyped before committing to the rest of the
 plan (see Phase 3 below).
 
-## Open design questions
+## Design decisions (resolved)
 
-1. **Per-generated-app provisioning speed.** vibe-platform's onboarding
-   flow (commit Terraform, `apply`) is too slow for vibesdk's per-session
-   deploy/preview flow. Candidate approaches:
-   - Direct AWS SDK calls (not Terraform) from a provisioning service to
-     spin up ECR push + ECS task def + service + ALB rule per generated
-     app, with Terraform only describing the *shared* scaffolding
-     (cluster, ALB, IAM roles) that provisioning calls into.
-   - A shared multi-tenant "preview runner" fleet where generated apps
-     run as processes/containers-within-a-task behind a single
-     path-or-host router, avoiding one-ECS-service-per-app entirely for
-     ephemeral previews, and only using the full `app-blue-green` module
-     for apps the user explicitly "deploys" long-term.
-   This needs a decision before Phase 4 (see below) starts.
-2. **WebSocket session pinning mechanism** — ALB sticky sessions vs. a
-   custom connection router. Affects the session-worker design directly.
-3. **Git storage medium** — Aurora row-chunking (mirrors today's design,
-   simplest port) vs. S3 for git objects with Aurora only for refs
-   (cheaper at scale, more moving parts).
-4. **Secrets vault session-affinity** — `UserSecretsStore`'s in-memory
-   `VaultSession` (SK, encrypted VMK) currently lives in one DO's memory
-   for the life of a session. On ECS this either needs the same
-   session-worker pinning as the main agent, or a separate small stateful
-   service just for the vault.
-5. **Cost model** — DO/D1/R2/KV usage-based pricing vs. always-on Aurora
-   Serverless v2 + Fargate. Worth a rough cost comparison before Phase 2
-   starts, since "cost is king" is a stated vibe-platform constraint.
+1. **Per-generated-app provisioning speed — warm blue/green pool.**
+   vibe-platform's onboarding flow (commit Terraform, `apply`) is too
+   slow for vibesdk's per-session deploy/preview flow. Decision: maintain
+   two pools ("blue" and "green") of pre-warmed, generic sandbox/session-
+   worker tasks running on Spot capacity. An incoming session claims a
+   warm slot immediately from whichever pool has capacity — no image
+   pull, no cold boot — and the pool is replenished asynchronously in the
+   background to maintain a target warm count. The blue/green split does
+   double duty: it's also the mechanism for rolling out a new base
+   runner/sandbox image (drain and repoint new sessions to the freshly
+   warmed pool, retire the old one) without disrupting live sessions,
+   reusing the same conceptual pattern as `app-blue-green`'s canary
+   deploys even though the resource shape here is a warm capacity pool,
+   not a versioned service swap. Terraform still only describes the
+   shared scaffolding (cluster, ALB, IAM roles, warm-pool ASG/capacity
+   provider config); claiming a slot and provisioning the replacement is
+   a runtime AWS SDK call from a provisioning service, not a Terraform
+   apply. The full `app-blue-green` module (ECR, CodeDeploy canary, ALB
+   listener rules) is reserved for apps a user explicitly "deploys"
+   long-term, not ephemeral previews.
+2. **WebSocket session pinning — explicit router, not ALB stickiness.**
+   ALB sticky sessions are cookie-based and don't give the connection-
+   level pinning a long-lived WS needs. Decision: a `sessionId →
+   workerTaskId` lookup table in DynamoDB, consulted by the routing layer
+   on every new connection and updated on rebalance/Spot reclaim.
+3. **Git storage medium — S3 + DynamoDB, no Aurora.** Object blobs to S3,
+   refs/tree metadata to DynamoDB. See the persistence-layer decision
+   above for the reasoning (cost, consistency with the rest of the
+   control-plane storage decision).
+4. **Secrets vault session-affinity — piggyback on session-worker
+   pinning.** `UserSecretsStore`'s in-memory `VaultSession` (SK,
+   encrypted VMK) needs the same connection-level pinning as the main
+   agent for the life of a session. Decision: reuse the session-worker
+   router from #2 rather than standing up a separate stateful service —
+   one fewer moving part, and the trust boundary (in-memory-only key
+   material, never persisted) is preserved either way since it rides on
+   the same worker process, not a shared store.
+5. **Cost model — Spot, on-demand, no Aurora.** Resolved in favor of
+   Fargate Spot for session workers/sandboxes (see actor-model section)
+   and DynamoDB/S3 over Aurora for all persistence (see decision above).
+   A concrete cost estimate (expected concurrent sessions × warm-pool
+   size × Spot task-hours × DynamoDB/S3 usage) should still be run before
+   Phase 2 starts to size the warm pool and on-demand baseline, but the
+   architecture-level question — no always-on relational database, no
+   always-on compute fleet — is settled.
+
+## Remaining open questions
+
+- Interruption-frequency data to size the on-demand baseline alongside
+  the Spot fleet (decision 5) — needs either historical Spot interruption
+  rates for the chosen instance family/AZ or a measured trial during
+  Phase 3.
+- Target warm-pool size for decision 1 (blue/green preview capacity) —
+  depends on expected concurrent-session volume, which should come from
+  current vibesdk production metrics rather than a guess.
 
 ## Phased plan
 
@@ -165,17 +217,20 @@ plan (see Phase 3 below).
    cluster/`app-blue-green` module. Provisions the hosting shell only:
    no vibesdk-specific compute or data yet.
 3. **Actor-model spike** — prototype the session-worker replacement for
-   `CodeGeneratorAgent` (routing, locking, Aurora/DynamoDB-backed state,
-   reconnect/resync) in isolation, before porting the full agent. This
-   is the de-risking step; if it doesn't work well, it changes the rest
-   of the plan.
-4. **Stateless surface port** — D1→Aurora (Drizzle dialect swap, 10
-   migrations), R2→S3, KV→DynamoDB, containerize the Worker entrypoint,
-   deploy it as an ECS service via `app-blue-green`.
-5. **Sandbox + deploy port** — resolve open question #1, replace
-   `UserAppSandboxService` with ECS-task-backed sandboxes, replace the
-   wrangler/dispatch deployer with the AWS provisioning path decided in
-   Phase 3/#1.
+   `CodeGeneratorAgent` (routing, locking, DynamoDB/S3-backed state,
+   Spot-interruption handling, reconnect/resync) in isolation, before
+   porting the full agent. This is the de-risking step; if it doesn't
+   work well, it changes the rest of the plan. Also where the remaining
+   open questions (Spot interruption rate, warm-pool sizing) get real
+   numbers.
+4. **Stateless surface port** — D1→DynamoDB (query-layer rewrite, 10
+   migrations' worth of schema to re-derive as access patterns), R2→S3,
+   KV→DynamoDB, containerize the Worker entrypoint, deploy it as an ECS
+   Fargate Spot service via `app-blue-green`.
+5. **Sandbox + deploy port** — stand up the warm blue/green preview pool
+   (decision 1), replace `UserAppSandboxService` with ECS-task-backed
+   sandboxes drawn from it, replace the wrangler/dispatch deployer with
+   the AWS provisioning path from decision 1.
 6. **Cutover** — once parity is verified end-to-end in a non-prod
    environment, plan the actual traffic cutover (DNS, data migration for
    existing D1/DO data if any needs to carry over).
