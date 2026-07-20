@@ -146,11 +146,23 @@ concrete benefit of that scope cut.
 | Item type | PK | SK |
 |---|---|---|
 | Model config | `USER#<userId>` | `MODELCONFIG#<agentActionName>` |
-| Model provider | `USER#<userId>` | `MODELPROVIDER#<name>` |
+| Model provider | `USER#<userId>` | `MODELPROVIDER#<id>` |
+| Model provider name lookup | `USER#<userId>` | `MODELPROVIDERNAME#<name>` |
 
 Both are naturally scoped to a user and queried as "give me this user's
 full config," a single `Query` on `USER#<userId>` with an SK prefix —
 no GSI needed.
+
+**Corrected after building the actual port** (`aws/db-model-config/`):
+the provider item is keyed by its own ID, not by name as an earlier
+draft of this row proposed. `getProvider(userId, providerId)` is the
+access pattern `updateProvider`/`deleteProvider`/`toggleProviderStatus`
+all actually use — keying by name alone would have made that
+impossible without an ID→name lookup anyway, so the ID is the primary
+key and a `MODELPROVIDERNAME#<name>` lookup item (written
+transactionally, same pattern as the identity table's username
+handling) covers `getProviderByName` and the real `(userId, name)`
+uniqueness constraint instead.
 
 ## Table 5: `vibesdk-audit-log`
 
