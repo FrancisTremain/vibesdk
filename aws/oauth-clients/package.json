@@ -1,0 +1,19 @@
+{
+  "name": "vibesdk-oauth-clients",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Port of the OAuth provider HTTP clients (worker/services/oauth/base.ts, github.ts, google.ts) -- pure fetch-based OAuth 2.0 + PKCE flow, no AWS SDK dependency. Not part of the main vibesdk build.",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts --root ."
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
+  }
+}
