@@ -1,0 +1,22 @@
+{
+  "name": "vibesdk-secrets-vault",
+  "private": true,
+  "version": "0.0.1",
+  "description": "DynamoDB-backed secrets vault storage/session/crypto layer replacing UserSecretsStore (see docs/aws-migration-technical-design.md decision 4). Not part of the main vibesdk build.",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/vault-store.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/vault-store.js --external:@aws-sdk/*",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts --root ."
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
+  }
+}

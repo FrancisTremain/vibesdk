@@ -177,7 +177,7 @@ either.
 | R2 | S3 | Low |
 | KV | DynamoDB on-demand | Low |
 | `DORateLimitStore` | DynamoDB conditional-update token bucket (own implementation of the governor pattern). First cut: [`aws/rate-limit/`](../aws/rate-limit/), unit-tested (11 tests), not yet wired to a real table. | Low-Medium |
-| `UserSecretsStore` | Same crypto (VMK/SK hierarchy, AES-GCM/XChaCha20-Poly1305) unchanged; storage moves to DynamoDB. See decision 4 below — the Lambda model actually simplifies this. | Medium — crypto logic ports directly |
+| `UserSecretsStore` | Same crypto (VMK/SK hierarchy, AES-GCM — confirmed directly from the current source, not the possibly-stale AES-GCM/XChaCha20-Poly1305 description in this repo's CLAUDE.md) unchanged; storage moves to DynamoDB. See decision 4 below — the Lambda model actually simplifies this. First cut: [`aws/secrets-vault/`](../aws/secrets-vault/), 19 tests including a direct test that the session key is never persisted. | Medium — crypto logic ports directly |
 | CF Sandbox / Containers (`UserAppSandboxService`) | On-demand ECS Fargate Spot tasks, launched fresh per session via `RunTask`, no standing pool, reachable via ALB path/host routing for preview URLs | Medium-High — CF's sandbox SDK handles port exposure/proxying/token validation for free; on ECS this needs to be built (a thin router mapping session ID → task IP:port). See Cost model for sizing. |
 | Deployer (`wrangler.jsonc` + Workers-for-Platforms dispatch) | Programmatic provisioning: `RunTask` for ephemeral previews, vibesdk's own blue-green Terraform module for apps a user explicitly deploys long-term | High — biggest architectural change from how vibesdk deploys today |
 | `CodeGeneratorAgent` (Durable Object actor + state machine) | Lambda, invoked per WebSocket message, no standing worker process. See dedicated section below. | **High — this is the critical-path risk for the whole migration** |
@@ -327,12 +327,19 @@ particular needs real measurement, not an estimate.
    instead of "one DO's memory for the session's duration," and no
    pinned worker is needed to make that true.
 
+   First cut: [`aws/secrets-vault/`](../aws/secrets-vault/) — storage,
+   session lifecycle, and decryption ported, with a direct test that the
+   session key is never persisted anywhere. WebSocket message routing
+   and the connection-auth ticket mechanism (a different, Cloudflare-WS-
+   specific concern) are explicitly out of scope for that package — see
+   its README.
+
 ## Cost model
 
 Numbers below use AWS list pricing (Linux/x86, us-east-1 reference —
 ap-southeast-2 runs ~10-20% higher; reprice before committing) and an
 **illustrative low-to-moderate usage scenario**, not real vibesdk traffic
-— that's still a missing input (see Remaining open questions).
+— that's still a missing input (see "Data that still needs to come from outside this repo" below).
 
 | Component | Basis | Estimated $/month |
 |---|---|---|
