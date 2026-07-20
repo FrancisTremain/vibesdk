@@ -2,12 +2,13 @@
   "name": "vibesdk-actor-spike",
   "private": true,
   "version": "0.0.1",
-  "description": "Phase 3 actor-model spike for the AWS migration (see docs/aws-migration-design.md). Not part of the main vibesdk build.",
+  "description": "Phase 3 actor-model spike for the AWS migration (see docs/aws-migration-technical-design.md). Not part of the main vibesdk build.",
   "type": "module",
   "scripts": {
     "build": "esbuild src/handler.ts --bundle --platform=node --target=node20 --outfile=dist/handler.js --external:@aws-sdk/*",
     "package": "npm run build && cd dist && zip -r ../actor-spike.zip handler.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts --root ."
   },
   "dependencies": {
     "@aws-sdk/client-apigatewaymanagementapi": "^3.600.0",
@@ -17,7 +18,9 @@
   "devDependencies": {
     "@types/aws-lambda": "^8.10.138",
     "@types/node": "^20.14.0",
+    "aws-sdk-client-mock": "^4.1.0",
     "esbuild": "^0.21.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
   }
 }
