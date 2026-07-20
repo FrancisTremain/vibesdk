@@ -46,7 +46,10 @@ the worked numbers.
 | Deploying a generated app | Dynamically-written `wrangler.jsonc` + Workers-for-Platforms `dispatch_namespaces`, deployed via CF API | `worker/services/deployer/*` |
 | Blob storage | R2 | scattered |
 | KV | Workers KV | scattered |
-| LLM inference for code fixing / eval | Workers AI, Browser Rendering bindings | assistants/codeDebugger etc. |
+| Headless browser (console log / screenshot capture from generated apps) | CF `BROWSER` binding via `@cloudflare/puppeteer` | `worker/services/browser-capture/binding-client.ts` |
+| LLM usage analytics/gateway (per-user connect-your-own-account for AI Gateway analytics + LLM proxying/caching) | CF AI Gateway, OAuth-connected per user (`aig.*` scopes) | `worker/services/analytics/AiGatewayAnalyticsService.ts`, `worker/services/oauth/cloudflare-connect.ts`, `worker/agents/inferutils/core.ts` |
+| Frontend WebSocket client | `PartySocket` (CF Agents-SDK-oriented WS client, expects a DO-style single addressable endpoint per session) | `src/routes/chat/hooks/use-chat.ts`, `src/routes/chat/utils/websocket-helpers.ts`, and 6 other call sites |
+| Deploy-generated-app-to-CF-Workers-for-Platforms UI flow (separate from the AI Gateway OAuth above — same `worker/services/deployer/*` CF API client, different feature) | CF API via `deployer/api/cloudflare-api.ts` | already covered by the Deployer row below; called out here only because it's a second, distinct CF surface easy to miss |
 
 Two persistence layers matter, and they are **not** the same thing:
 
@@ -150,6 +153,10 @@ either.
 | Deployer (`wrangler.jsonc` + Workers-for-Platforms dispatch) | Programmatic provisioning: `RunTask` for ephemeral previews, `app-blue-green` module for apps a user explicitly deploys long-term | High — biggest divergence from how vibe-platform currently onboards apps |
 | `CodeGeneratorAgent` (Durable Object actor + state machine) | Lambda, invoked per WebSocket message, no standing worker process. See dedicated section below. | **High — this is the critical-path risk for the whole migration** |
 | Git-per-session (isomorphic-git on DO SQLite) | Isomorphic-git unchanged; filesystem adapter re-targeted at S3 only (chunked objects + manifest, no DynamoDB) | Medium — must reach full feature parity with today (see decision 3) |
+| `BROWSER` binding (`@cloudflare/puppeteer`) | Headless Chromium via Playwright/Puppeteer, invoked the same way as the session-actor Lambda (per-capture invocation, e.g. a Lambda with a Chromium layer such as `@sparticuz/chromium`, or an on-demand ECS `RunTask` if a capture needs more memory/time than Lambda's limits allow) | Medium — no reserved capacity either way, matches the Lambda-first billing model rather than a standing browser-rendering service |
+| AI Gateway (analytics + per-user OAuth-connect) | **Decision: drop the per-user "connect your own AI Gateway" OAuth flow — no AWS product to connect to, and it's a CF-specific gateway product, not a BYO-provider-key feature (that's `UserSecretsStore`, already mapped and kept).** Keep the underlying need (LLM usage analytics) by logging request metadata from each LLM call already passing through the ported code to CloudWatch/DynamoDB instead. Revisit only if usage data post-MVP shows this was load-bearing for users, not before. | Low — this is a scope cut, not a port |
+| `PartySocket` (frontend WS client) | Native browser `WebSocket` against the API Gateway WebSocket endpoint. `PartySocket`'s reconnect/backoff logic is CF-Agents-SDK-flavored and assumes a DO-style single addressable session endpoint; the AWS side is a standard WS API, so this is a rewrite of the client wrapper (`use-chat.ts`, `websocket-helpers.ts`), not a drop-in swap | Low-Medium — mechanical once the backend's connection/session-resume semantics are finalized (Phase 3) |
+| Deploy-to-CF-Workers-for-Platforms UI flow | Already covered by the Deployer row above — same `RunTask`/`app-blue-green` target, just called out separately since it's a second CF surface (`deployer/api/cloudflare-api.ts`) distinct from the AI Gateway OAuth connection | Covered above |
 
 ## The actor-model gap (critical path)
 
@@ -323,40 +330,37 @@ architecturally available for the sandbox tier if Phase 3 finds Spot
 availability to be a real problem, but isn't part of the baseline design
 below the $100 target.
 
-## Remaining open questions
+## Defaults chosen to unblock building (revisit after MVP, not before)
+
+Per-decision: don't wait on data that isn't available yet — pick a
+reasonable default, build, and let the MVP's real behavior replace the
+guess. These are starting points, not final tuning:
+
+- **Lambda sizing** — 1024 MB memory, 30s timeout for the session-actor
+  function, to start. Revisit from real Phase 3 latency measurements.
+- **Cold-start UX** — accept the 20-60s sandbox cold start for MVP; add a
+  simple client-side "waking up" loading state as the default mitigation
+  (cheap, no infra dependency) rather than blocking on a product decision
+  about pre-emptive launch triggers.
+- **Sandbox Tier-2 idle-eviction grace period** — default to 90 seconds.
+  Tune once real session activity patterns are visible.
+- **Sandbox task sizing** — 0.5 vCPU/1 GB per the Cost model, to start.
+  If MVP usage shows this can't handle real build/install workloads, move
+  to the tiered small/heavy split discussed there.
+- **ALB cost accounting** — treat as shared-platform overhead for now
+  ($0 incremental); revisit only if cross-app cost allocation becomes a
+  real need.
+
+## Data that still needs to come from outside this repo (not a build blocker)
 
 - **Current Cloudflare spend baseline** — pull actual usage from the
   vibesdk Cloudflare account (DO duration-GB-s, D1 reads/writes,
   Containers vCPU-seconds, R2 storage/egress) for a real head-to-head
-  comparison against the AWS estimate above. Still the single
-  highest-value missing input, and still not obtainable from the
-  codebase — needs dashboard/billing access.
-- **Real vibesdk traffic/concurrency numbers** — the cost model above is
-  illustrative. Actual concurrent session counts and active-preview-hours
-  are needed to replace the illustrative range with a real projection,
-  and to size Lambda memory/timeout and sandbox task sizing correctly.
-- **Lambda-per-message latency with realistic state sizes** — the actor
-  model's biggest open risk. Needs the Phase 3 spike to measure actual
-  latency for sessions with large state blobs / deep git history, since
-  every message now pays a rehydration cost that used to be free (DO
-  in-memory state).
-- **Cold-start UX tolerance** — is a 20-60s cold start acceptable for new
-  or long-evicted sessions, or does it need client-side mitigation (a
-  "waking up" state, optimistic UI, pre-emptive launch on an earlier
-  signal like "user started typing a prompt")? This is a product decision
-  as much as an infra one.
-- **Idle-eviction grace period for sandbox Tier 2** — how long to hold a
-  session's sandbox task warm after the UI heartbeat stops before tearing
-  it down. Too short defeats the point (brief tab switches trigger a full
-  cold start); too long wastes Spot capacity on abandoned tabs. Needs a
-  real number from usage data or a Phase 3 trial.
-- **Sandbox task sizing** — whether 0.5 vCPU/1 GB is sufficient for real
-  dev-server/build workloads, or whether a tiered small/heavy split is
-  needed (see Cost model note above).
-- **ALB cost accounting** — whether to treat it as fully shared-platform
-  overhead ($0 incremental) or partially attribute its cost to vibesdk,
-  relevant mainly for cross-app cost allocation, not the architecture
-  itself.
+  comparison against the AWS estimate above. Doesn't block building the
+  MVP; needed for a real before/after once it exists.
+- **Real vibesdk traffic/concurrency numbers** — will come from the MVP
+  itself once it's live, replacing the illustrative cost-model numbers
+  with real ones.
 
 ## Phased plan
 
