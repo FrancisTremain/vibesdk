@@ -2,10 +2,11 @@
 
 Terraform for vibesdk's own AWS foundation: the Phase 3 actor-model
 spike (test whether Lambda-per-message rehydration latency is viable
-before porting the real `CodeGeneratorAgent`) plus the six DynamoDB
-tables and one S3 bucket backing every `aws/db-*`/`aws/auth-*`/
-`aws/git-storage` package built so far — Phase 4's "stateless surface
-port" from
+before porting the real `CodeGeneratorAgent`), the six DynamoDB tables
+and one S3 bucket backing every `aws/db-*`/`aws/auth-*`/`aws/git-storage`
+package built so far (Phase 4's "stateless surface port"), three real
+API Gateway + Lambda surfaces (auth, apps, user/stats/model-config),
+and the ECS infrastructure shape for Phase 5's sandbox port, per
 [docs/aws-migration-technical-design.md](../../docs/aws-migration-technical-design.md).
 
 This lives entirely inside vibesdk. It follows architectural patterns
@@ -15,13 +16,19 @@ on ECS/Lambda) but is not deployed onto or coupled to that platform's
 infrastructure or Terraform state — this stack provisions and owns its
 own AWS resources independently.
 
-Self-contained: no VPC attachment, no shared ALB/ECS cluster. The Lambda
-reaches DynamoDB and API Gateway Management over the AWS network
-directly, so there's no networking dependency to stand up first.
+Everything except `sandbox.tf` is VPC-free by design: Lambda reaches
+DynamoDB and API Gateway Management over the AWS network directly, no
+networking dependency to stand up first. `sandbox.tf` is the one
+exception — ECS Fargate tasks need a VPC to run in, so that file
+provisions its own minimal one (see below for why it's public-subnet-only,
+no NAT).
 
 ## What's here
 
-- `main.tf` — provider, backend, default tags.
+- `main.tf` — provider, backend, default tags. `var.aws_region`
+  (default `ap-southeast-2`) drives the provider region; the S3 backend
+  block's region is kept literal in sync with it since Terraform backend
+  configuration can't reference variables.
 - `dynamodb.tf` — the actor-spike tables: `vibesdk-actor-state`
   (per-session state, optimistic lock via `lock_version`) and
   `vibesdk-ws-connections` (`connectionId → sessionId` routing,
@@ -58,12 +65,28 @@ directly, so there's no networking dependency to stand up first.
   detail/favorite/star/visibility/delete routes. Its IAM role gets
   read/write on the apps table but read-only on identity/auth-flows,
   since this Lambda only validates tokens, never mutates a session.
-- `user-api.tf` — same shape for `aws/user-api-lambda`'s stats and
-  model-provider-listing routes. Read-only on apps (stats never
-  writes), read/write on model-config (provider listing only reads
-  today, but the role isn't narrowed further since `ModelProviderStore`'s
-  write methods exist and may get wired in if the upstream product
-  re-enables custom providers), read-only on identity/auth-flows.
+- `user-api.tf` — same shape for `aws/user-api-lambda`'s stats,
+  model-provider-listing, and model-config CRUD routes. Read-only on
+  apps/identity/auth-flows, read/write on model-config. Also carries
+  `PLATFORM_MODEL_PROVIDERS` and per-provider `*_API_KEY` environment
+  variables that `aws/model-config-defaults`' BYOK-platform-key check
+  reads.
+- `sandbox.tf` — ECS infrastructure shape for Phase 5's on-demand
+  sandbox tasks (Fargate Spot, launched fresh via `RunTask`, no
+  standing pool): a minimal VPC, an ALB for preview traffic, security
+  groups, the ECS cluster/capacity provider, IAM roles, and a task
+  definition referencing a placeholder image. **Infrastructure shape
+  only** — no control-plane server exists to run in that task yet (see
+  [`../sandbox-contract/`](../sandbox-contract/)'s README for why
+  that's a real design task, not a port, and what this shape is for in
+  the meantime). One deliberate deviation from the design doc's literal
+  "small Spot task replacing a NAT Gateway" cost-model line: sandbox
+  tasks run directly in **public** subnets with security-group-restricted
+  inbound (ALB only), avoiding NAT entirely — cheaper and simpler than
+  either a real NAT Gateway (~$32/mo floor, breaks the <$100/mo budget
+  on its own) or a hand-rolled NAT-replacement task (a Fargate task's
+  ENI is ephemeral, a poor fit for a stable route-table target). See
+  that file's header comment for the full reasoning.
 - `variables.tf` / `outputs.tf`.
 
 Lambda source for the actor-spike lives in
@@ -77,7 +100,9 @@ once one exists. `jwt_secret` also has no default and is marked
 `sensitive` — see its description in `variables.tf` for why it
 shouldn't be passed as a literal Terraform variable in a real apply
 (source it from SSM Parameter Store / Secrets Manager once a secrets
-pipeline exists instead).
+pipeline exists instead). `sandbox_task_image` and
+`sandbox_alb_certificate_arn` also have no defaults, for the reasons
+described in `sandbox.tf` above.
 
 ## Status
 
@@ -85,11 +110,12 @@ Not applied. Not run through `terraform validate`/`fmt` — no `terraform`
 binary was available in the environment this was written in. Needs both,
 plus human review of the IAM/network-facing pieces (especially
 `jwt_secret` sourcing), before any apply. Every one of the six
-application DynamoDB tables now has at least one real Lambda caller
-(auth, apps, user/stats/model-provider) except the audit-log table's
-security-event path, which is wired into the auth Lambda already, and
-the model-config table's CRUD surface, which is deliberately unported
-(see `aws/user-api-lambda`'s README for why).
+application DynamoDB tables now has at least one real Lambda caller,
+including the audit-log table's security-event path (wired into the
+auth Lambda) and the model-config table's full CRUD surface (wired
+into the user Lambda via `aws/model-config-defaults`). `sandbox.tf` is
+infrastructure shape only, per above — not wired to any real control
+plane.
 
 ## What this measures
 

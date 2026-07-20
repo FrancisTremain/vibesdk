@@ -26,6 +26,8 @@ terraform {
     }
   }
 
+  # Backend config can't reference variables (a Terraform limitation,
+  # not a choice) -- kept literal, in sync with var.aws_region's default.
   backend "s3" {
     bucket       = "vibesdk-terraform-state"
     key          = "aws-migration/actor-spike/terraform.tfstate"
@@ -36,7 +38,7 @@ terraform {
 }
 
 provider "aws" {
-  region = "ap-southeast-2"
+  region = var.aws_region
 
   default_tags {
     tags = {

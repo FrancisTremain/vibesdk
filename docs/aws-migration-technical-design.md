@@ -479,8 +479,26 @@ guess. These are starting points, not final tuning:
    on-demand `RunTask`-launched sandboxes plus Tier-2 keep-warm (decision
    1), replace the wrangler/dispatch deployer with the AWS provisioning
    path from decision 1, and port the git fs-adapter to S3-only storage
-   (decision 3) with parity verified against today's `GitVersionControl`
-   behavior.
+   (decision 3, done — `aws/git-storage/`) with parity verified against
+   today's `GitVersionControl` behavior.
+
+   Two pieces exist ahead of the rest of this phase, both explicitly
+   *shape, not implementation*: [`aws/sandbox-contract/`](../aws/sandbox-contract/)
+   is a ported-types + target-interface package (`SandboxServiceClient`,
+   derived from `BaseSandboxService`'s abstract methods) with zero
+   implementing classes — the original's real sandbox client talks to
+   Cloudflare's proprietary `@cloudflare/sandbox` SDK and the
+   `cloudflare/sandbox` base container image (see `SandboxDockerfile`),
+   a control-plane protocol with no public specification to port
+   against, so an AWS replacement means *designing* an equivalent
+   protocol, not porting one. `aws/infra/sandbox.tf` provisions the ECS
+   hosting shell that design would run on (VPC, ALB, Fargate Spot
+   cluster/capacity provider, IAM roles, a task definition with a
+   placeholder image) — ahead of and independent from that protocol
+   design, same relationship `aws/infra`'s other Terraform has to the
+   Lambda code it hosts. Both packages' READMEs are explicit that this
+   is not a substitute for the real design work Phase 3's latency
+   numbers are meant to inform.
 6. **Cutover** — once parity is verified end-to-end in a non-prod
    environment, plan the actual traffic cutover (DNS, data migration for
    existing D1/DO data if any needs to carry over).
