@@ -53,31 +53,28 @@ import type {
 	Session,
 	User,
 } from './types';
-
-function userPk(userId: string): string {
-	return `USER#${userId}`;
-}
-const SK_PROFILE = 'PROFILE';
-const sessionSk = (id: string) => `SESSION#${id}`;
-const apiKeySk = (id: string) => `APIKEY#${id}`;
-const emailLookupPk = (email: string) => `EMAIL#${email}`;
-const usernameLookupPk = (username: string) => `USERNAME#${username}`;
-const oauthLookupPk = (provider: string, providerId: string) =>
-	`OAUTHLOOKUP#${provider}#${providerId}`;
-const sessionIdLookupPk = (sessionId: string) => `SESSIONID#${sessionId}`;
-const apiKeyIdLookupPk = (keyId: string) => `APIKEYID#${keyId}`;
-const apiKeyHashLookupPk = (keyHash: string) => `APIKEYHASH#${keyHash}`;
-const SK_LOOKUP = 'LOOKUP';
+import {
+	SK_LOOKUP,
+	SK_PROFILE,
+	apiKeyHashLookupPk,
+	apiKeyIdLookupPk,
+	apiKeySk,
+	emailLookupPk,
+	isConditionalCheckFailed,
+	newId,
+	oauthLookupPk,
+	sessionIdLookupPk,
+	sessionSk,
+	stripStorageFields,
+	userPk,
+	usernameLookupPk,
+} from './keys';
 
 interface LookupItem {
 	pk: string;
 	sk: typeof SK_LOOKUP;
 	userId: string;
 	apiKeyId?: string;
-}
-
-function newId(): string {
-	return crypto.randomUUID();
 }
 
 export class UserStore {
@@ -616,28 +613,4 @@ function toApiKeyInfo(key: ApiKey): ApiKeyInfo {
 		lastUsed: key.lastUsed,
 		isActive: key.isActive,
 	};
-}
-
-/** Drops the DynamoDB storage-only fields (pk/sk/ttl) from a returned item. */
-function stripStorageFields(
-	item: Record<string, unknown> | undefined,
-): Record<string, unknown> | undefined {
-	if (!item) return undefined;
-	const { pk: _pk, sk: _sk, ttl: _ttl, ...rest } = item;
-	return rest;
-}
-
-function isConditionalCheckFailed(err: unknown): boolean {
-	if (typeof err !== 'object' || err === null) return false;
-	const name = (err as { name?: string }).name;
-	if (name === 'ConditionalCheckFailedException') return true;
-	// TransactWriteItems failures surface as TransactionCanceledException
-	// with a CancellationReasons array; a ConditionalCheckFailed among
-	// them means the same thing for our purposes.
-	if (name === 'TransactionCanceledException') {
-		const reasons = (err as { CancellationReasons?: Array<{ Code?: string }> })
-			.CancellationReasons;
-		return (reasons ?? []).some((r) => r.Code === 'ConditionalCheckFailed');
-	}
-	return false;
 }
