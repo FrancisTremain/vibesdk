@@ -76,27 +76,44 @@ stars, likes, comments, comment likes, views) — grouped together since
 
 | Item type | PK | SK | Notes |
 |---|---|---|---|
-| App | `APP#<id>` | `META` | All `apps` fields. |
+| App | `APP#<id>` | `META` | All `apps` fields, plus three maintained counters (`starCount`/`favoriteCount`/`viewCount`) not in the D1 schema — see below. |
 | Favorite | `APP#<appId>` | `FAV#<userId>` | Enables "who favorited this app" via a `Query` on `APP#<id>` with an SK prefix of `FAV#`. |
-| Favorite (reverse) | `USER#<userId>` | `FAV#<appId>` | Duplicated the other direction — this is the standard DynamoDB "write twice for two access patterns" tradeoff, needed for "show me this user's favorited apps" without a table scan. Written together via `TransactWriteItems`. |
-| Star / App-like / Comment-like | Same pattern as Favorite: forward + reverse item pair | | `stars`, `app_likes`, `comment_likes` all follow the identical shape. |
-| Comment | `APP#<appId>` | `COMMENT#<id>` | Threaded replies (`parentCommentId`) are a plain attribute; fetching a comment's replies is a `Query` filtered client-side, or a second reverse-lookup item (`COMMENT#<parentId>` → `REPLY#<id>`) if reply-listing turns out to be a hot path. Start without it, add if needed. |
-| View | `APP#<appId>` | `VIEW#<viewedAt>#<viewerHash>` | High write volume, short-lived value — candidate for a TTL attribute if historical view records don't need to be kept indefinitely (D1's `appViewerIdx` unique-per-viewer constraint becomes a conditional write on this same key instead of a separate lookup). |
+| Favorite (reverse) | `USER#<userId>` | `FAVAPP#<appId>` | Duplicated the other direction — this is the standard DynamoDB "write twice for two access patterns" tradeoff, needed for "show me this user's favorited apps" without a table scan. Written together via `TransactWriteItems`. |
+| Star (forward + reverse) | Same pattern as Favorite | `STAR#<userId>` / `STARAPP#<appId>` | `app_likes`/`comment_likes`/comments are not part of the port below — see status note. |
+| Deployment ID lookup | `DEPLOYMENTID#<deploymentId>` | `LOOKUP` | `{ appId }`. **Added after building the actual port** (`aws/db-apps/`) — same class of gap as the identity table's `SESSIONID#`/`APIKEYID#` lookups: `getAppOwnershipByDeploymentId` looks up by deployment ID directly, a paper design easily misses until the code that needs it gets written. |
+| View (dedup marker) | `APP#<appId>` | `VIEW#<viewerHash>` | TTL'd to the end of the current dedup bucket (`viewedAt` window), not kept indefinitely — the original's per-viewer-per-bucket dedup constraint becomes a conditional write (`attribute_not_exists`) on this same key, and the TTL doubles as automatic cleanup with exactly the intended "dedup only within a bucket" semantics, not an accident of expiry. |
 
-GSI `by-user` (GSI1PK=`userId`, GSI1SK=`created_at`) on the App item —
-"list this user's apps," the profile-page query. GSI `by-visibility`
-(GSI2PK=`visibility`+`status` composite, GSI2SK=`updated_at`) — the
-public app gallery / discovery listing.
+GSI `by-user` (`gsi1pk`=`userId`, `gsi1sk`=`updatedAt`) on the App item
+— "list this user's apps." GSI `by-listing` (`gsi2pk`= a **constant**
+partition value, `gsi2sk`=`updatedAt`) for the public app gallery —
+simplified from an earlier draft of this doc, which proposed a
+`visibility`+`status` composite partition key. The actual qualifying
+condition (`visibility = public OR userId IS NULL`) `AND` (`status IN
+(completed, generating)`) isn't a single equality DynamoDB's partition
+key can express directly; a constant-partition "listing index" — every
+qualifying app in one GSI partition, filtered/maintained at write time
+— is the idiomatic DynamoDB shape for a bounded, browsable listing like
+this one. Accepted tradeoff: a single hot partition, fine at MVP list
+sizes, worth revisiting (e.g. shard by a coarse time bucket) only if
+listing traffic grows enough for it to matter.
 
-**Known gap, not solved here: full-text search.** D1's `apps_search_idx`
-on `(title, description)` has no DynamoDB equivalent — DynamoDB doesn't
-do free-text search. Options: OpenSearch Service (real cost, likely
-blows the cost budget for an MVP), a lighter self-hosted search index,
-or accepting degraded search (prefix-match on title via a GSI, or
-client-side filtering over a bounded result set) for the MVP and
-revisiting if search quality turns out to matter to users. **Flagged as
-an open product/technical question, not decided here** — see the
-product design doc's open questions.
+**Search: resolved, not open.** D1's `apps_search_idx` on
+`(title, description)` has no DynamoDB equivalent. **Decision:**
+degrade to prefix-match on `title` only for the MVP (client-side
+filter over the listing GSI's result set, no OpenSearch, no added
+cost) — see the product design doc's decision log. This was an open
+question in an earlier draft of this doc; it's resolved now, following
+the same "pick a default, build, let real usage replace the guess"
+reasoning as every other MVP default in the technical design doc.
+
+**Status:** `AppStore` in [`aws/db-apps/`](../aws/db-apps/) ports the
+App/Favorite/Star/View shapes above and is tested (26 tests) against
+this schema. Comments, comment-likes, and app-likes (D1's
+`app_comments`/`comment_likes`/`app_likes` tables) are **not** part of
+that port — not modeled here in detail yet, deferred until they're
+actually being built. The weighted trending/popular ranking algorithm
+and fork-detachment-on-delete are also not ported — see that package's
+README for the full list of what's deliberately excluded and why.
 
 ## Table 3: `vibesdk-auth-flows`
 

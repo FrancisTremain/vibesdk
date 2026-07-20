@@ -173,11 +173,13 @@ recent first:
 - **Current Cloudflare spend and real traffic/concurrency numbers** —
   both needed to validate the cost budget and success criteria against
   reality, not just the illustrative model. See technical doc.
-- **App search/discovery quality** — D1's title/description search index
-  has no direct DynamoDB equivalent (see
-  [DynamoDB schema doc](aws-dynamodb-schema.md)). A real search backend
-  (e.g. OpenSearch) likely breaks the cost budget; the alternative is
-  degraded search (prefix-match or client-side filtering) for the MVP.
-  Whether that degradation is acceptable to users, or whether app
-  discovery matters enough to justify the extra cost, is a product call
-  not yet made.
+- ~~App search/discovery quality~~ **Resolved:** degrade search for the
+  MVP — prefix-match on title, no OpenSearch, no added cost. Same
+  reasoning as every other "defaults chosen to unblock building" call in
+  the technical doc: real usage data should drive whether this is good
+  enough, not a guess made before any of this ships. See
+  [`aws/db-apps/`](../aws/db-apps/) for the port and its README for
+  exactly what "prefix-match" means and what it gives up relative to
+  today's substring `LIKE` search (case-insensitive substring anywhere
+  in title or description). Revisit only if real usage shows discovery
+  quality is actually driving user complaints or drop-off — not before.
