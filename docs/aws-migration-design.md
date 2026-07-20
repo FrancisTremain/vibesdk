@@ -1,4 +1,4 @@
-# AWS Migration Design: vibesdk on Dark Factory infrastructure
+# AWS Migration Design: vibesdk on AWS
 
 ## Status
 
@@ -9,11 +9,21 @@ before any Terraform apply or code change.
 ## Goal
 
 Re-host vibesdk — currently a Cloudflare-native app (Workers, Durable
-Objects, D1, Containers, Workers-for-Platforms) — on AWS, using
-`vibe-platform`'s existing Dark Factory infrastructure (VPC, shared ALB,
-ECS Fargate blue/green, the `app-blue-green` Terraform module, DynamoDB,
-SSM, WAF, CodeArtifact) as the hosting substrate rather than building new
-AWS infrastructure from scratch.
+Objects, D1, Containers, Workers-for-Platforms) — on AWS. vibesdk
+provisions and owns all of its own AWS infrastructure end to end, under
+its own Terraform, inside this repo.
+
+Some of the architectural patterns below (ABAC-style resource tagging,
+the blue-green/canary shape for hosting apps on ECS, Spot-first
+cost-conscious compute defaults, a DynamoDB-backed rate/budget-governor
+pattern) were sourced as design inspiration from a separate reference
+platform ("Dark Factory") this project was shown for context. **That
+platform is reference material only — vibesdk does not depend on it,
+provision into it, or share its Terraform state or already-applied AWS
+resources.** Where earlier drafts of this doc assumed reuse of that
+platform's live VPC/ALB/ECS cluster, that assumption has been removed;
+vibesdk stands its own infrastructure up independently, following the
+same patterns where they fit.
 
 ## Cost budget (hard constraint)
 
@@ -69,8 +79,8 @@ Two persistence layers matter, and they are **not** the same thing:
 
 **Decision: no Aurora.** Given the cost budget above, this design does
 not introduce a relational database. Control-plane data goes to DynamoDB
-on-demand (same table class vibe-platform already uses for
-`governor`/`parked_tasks`); git objects and other large blobs go to S3.
+on-demand (pay-per-request billing, no idle floor); git objects and
+other large blobs go to S3.
 The tradeoff is explicit: anything join-shaped (admin reporting,
 cross-entity analytics) needs either an access pattern designed into the
 table up front (GSIs) or a separate export path (e.g. periodic S3 export
@@ -79,7 +89,7 @@ built. If a genuine join-heavy requirement shows up during Phase 4 that
 can't be reasonably served by DynamoDB access patterns, that's the
 trigger to revisit this decision, not a default fallback to Aurora.
 
-## Rejected: standing warm-pool architecture
+## Rejected: standing warm-pool architecture (kept for context)
 
 An earlier draft of this design ran session actors and sandboxes on a
 pool of long-lived, always-warm ECS Fargate Spot tasks — a two-tier model
@@ -101,41 +111,50 @@ session pays a real cold start (image pull + boot, likely 20-60s) instead
 of claiming a pre-warmed slot. Active sessions being actively viewed do
 not pay this cost repeatedly — see Tier 2 below, which is retained.
 
-## What vibe-platform already provides that we should reuse as-is
+## What vibesdk provisions for itself
 
-- VPC, private subnets, shared ALB with host-based routing, ACM/TLS —
-  `environments/core`. Under this design the ALB's job narrows to routing
-  sandbox preview traffic (host/path-based to whichever ECS task is
-  currently running a given session's dev server) — the control-plane
-  API/WS entrypoint moves off ECS/ALB entirely (see below), so ALB cost
-  for vibesdk is close to the existing shared-platform marginal cost, not
-  a new dedicated fleet.
-- ECS cluster (Fargate Spot) — used only for on-demand, no-floor sandbox
-  tasks (see Cost model). Not used for a standing worker/session-actor
-  pool anymore.
-- `modules/app-blue-green` — reserved for apps a user explicitly
-  "deploys" long-term (not ephemeral previews), where its ECR/CodeDeploy
-  canary/blue-green shape is still the right fit.
-- SSM Parameter Store for config/secrets, DynamoDB on-demand tables for
-  operational metadata, CodeArtifact for npm/pip package caching, WAF.
-- The governor/token-budget pattern (Phase 4) is a reusable template for
-  vibesdk's own per-user rate limiting, even though vibe-platform's
-  instance of it is scoped to the platform's own agent spend.
+Everything below is stood up by vibesdk's own Terraform
+(`aws/infra/` in this repo) — nothing here is shared with or sourced
+from another project's infrastructure or state:
 
-**Net new to vibe-platform's existing infra, not currently part of the
-Dark Factory stack:** API Gateway (HTTP + WebSocket APIs) and Lambda as
-the primary compute for the control plane and session actors — see
-Component mapping below. These need to be added to
-`environments/core` (or a vibesdk-specific stack) rather than assumed
-available.
+- Its own VPC, private subnets, and ALB with host-based routing, ACM/TLS.
+  The ALB's job is routing sandbox preview traffic (host/path-based to
+  whichever ECS task is currently running a given session's dev server)
+  — the control-plane API/WS entrypoint doesn't use it at all (see
+  below), so this is a small, purpose-built ALB, not a large shared
+  fleet.
+- A minimal egress path for sandbox tasks that need outbound internet
+  (npm/pip installs during code generation): the reference design's
+  pattern of a small Squid proxy on a public-subnet task with its own
+  public IP, in place of a NAT Gateway, is worth copying for the same
+  reason it was chosen there — it's meaningfully cheaper. Gateway VPC
+  endpoints for S3 and DynamoDB (no hourly charge) avoid routing that
+  traffic through the egress path at all.
+- Its own ECS cluster (Fargate Spot) — used only for on-demand, no-floor
+  sandbox tasks (see Cost model), not a standing worker/session-actor
+  pool.
+- A blue-green/canary Terraform module for apps a user explicitly
+  "deploys" long-term (not ephemeral previews) — built within this repo,
+  following the same ECR/CodeDeploy canary shape as the reference
+  design's pattern, not sourced from it as a remote module.
+- SSM Parameter Store for its own config/secrets, DynamoDB on-demand
+  tables for operational metadata, CodeArtifact for npm/pip package
+  caching if useful, WAF on its own ALB.
+- API Gateway (HTTP + WebSocket APIs) and Lambda as the primary compute
+  for the control plane and session actors — see Component mapping
+  below.
+- A DynamoDB-backed rate/budget-governor pattern for vibesdk's own
+  per-user rate limiting, built independently (the reference design's
+  instance of this pattern governs a different platform's agent spend,
+  not something vibesdk reads from or writes to).
 
-What vibe-platform does **not** provide, and vibesdk needs new: a fast,
-programmatic per-generated-app provisioning path. vibe-platform's model
-is "onboarding a new app = a human/agent commits
-`environments/apps/<name>/main.tf` and runs `terraform apply`" — fine for
-a handful of long-lived platform apps, not for vibesdk's per-session
-preview flow. Under this design that path is: an `ecs:RunTask` call from
-the provisioning/routing Lambda, launching a sandbox task fresh, on
+**Per-generated-app provisioning speed** was the reference design's model
+that didn't fit: "onboarding a new app = commit
+`environments/apps/<name>/main.tf`, run `terraform apply`" is fine for a
+handful of long-lived platform apps, not for vibesdk's per-session
+preview flow where a new "app" (or preview) is created on the order of
+every user session. This design's answer instead: an `ecs:RunTask` call
+from the provisioning/routing Lambda, launching a sandbox task fresh, on
 demand — no Terraform apply per session, no standing pool to claim from
 either.
 
@@ -147,10 +166,10 @@ either.
 | D1 + Drizzle | DynamoDB on-demand, single-table design keyed by entity access patterns | Medium-High — no relational engine, so this is a query-layer rewrite, not a dialect swap (see decision above) |
 | R2 | S3 | Low |
 | KV | DynamoDB on-demand | Low |
-| `DORateLimitStore` | DynamoDB conditional-update token bucket (same pattern as vibe-platform's governor) | Low-Medium |
+| `DORateLimitStore` | DynamoDB conditional-update token bucket (own implementation of the governor pattern) | Low-Medium |
 | `UserSecretsStore` | Same crypto (VMK/SK hierarchy, AES-GCM/XChaCha20-Poly1305) unchanged; storage moves to DynamoDB. See decision 4 below — the Lambda model actually simplifies this. | Medium — crypto logic ports directly |
 | CF Sandbox / Containers (`UserAppSandboxService`) | On-demand ECS Fargate Spot tasks, launched fresh per session via `RunTask`, no standing pool, reachable via ALB path/host routing for preview URLs | Medium-High — CF's sandbox SDK handles port exposure/proxying/token validation for free; on ECS this needs to be built (a thin router mapping session ID → task IP:port). See Cost model for sizing. |
-| Deployer (`wrangler.jsonc` + Workers-for-Platforms dispatch) | Programmatic provisioning: `RunTask` for ephemeral previews, `app-blue-green` module for apps a user explicitly deploys long-term | High — biggest divergence from how vibe-platform currently onboards apps |
+| Deployer (`wrangler.jsonc` + Workers-for-Platforms dispatch) | Programmatic provisioning: `RunTask` for ephemeral previews, vibesdk's own blue-green Terraform module for apps a user explicitly deploys long-term | High — biggest architectural change from how vibesdk deploys today |
 | `CodeGeneratorAgent` (Durable Object actor + state machine) | Lambda, invoked per WebSocket message, no standing worker process. See dedicated section below. | **High — this is the critical-path risk for the whole migration** |
 | Git-per-session (isomorphic-git on DO SQLite) | Isomorphic-git unchanged; filesystem adapter re-targeted at S3 only (chunked objects + manifest, no DynamoDB) | Medium — must reach full feature parity with today (see decision 3) |
 | `BROWSER` binding (`@cloudflare/puppeteer`) | Headless Chromium via Playwright/Puppeteer, invoked the same way as the session-actor Lambda (per-capture invocation, e.g. a Lambda with a Chromium layer such as `@sparticuz/chromium`, or an on-demand ECS `RunTask` if a capture needs more memory/time than Lambda's limits allow) | Medium — no reserved capacity either way, matches the Lambda-first billing model rather than a standing browser-rendering service |
@@ -303,12 +322,14 @@ ap-southeast-2 runs ~10-20% higher; reprice before committing) and an
 | DynamoDB (control-plane data + session state + connection table + rate limiting) | On-demand, low request volume | $1-5 |
 | S3 (git objects, blobs) | Low storage + request volume at this scale | $1-2 |
 | Sandbox compute (Fargate Spot, on-demand `RunTask`, 0.5 vCPU/1 GB — down-sized from the 4 vCPU/8 GB CF spec, see note below) | ~$0.0086/active-hour; even 1,000 active preview-hours/month across all users is ~$8.60 | $2-10 |
-| CloudWatch Logs | Short retention (7 days, matching `app-blue-green`'s default), volume-tuned logging | $2-5 |
-| ALB | Shared with other vibe-platform apps already running — marginal cost for vibesdk's sandbox-preview routing is close to $0 incremental; ~$16-20/month if costed as a standalone dedicated ALB | $0-20 |
+| CloudWatch Logs | Short retention (7 days), volume-tuned logging | $2-5 |
+| ALB (own, dedicated — no shared platform to amortize against) | Base hourly charge + LCU usage at low traffic | $16-20 |
+| Egress path for sandbox outbound installs (small Spot task replacing a NAT Gateway, plus free gateway VPC endpoints for S3/DynamoDB) | ~0.25 vCPU/0.5 GB, roughly the smallest useful Fargate size, run continuously since sandboxes can need it at any time | $3-6 |
 
-**Total: realistically $10-45/month** at low-to-moderate usage — comfortably
-under the $100 budget, with the range depending mainly on whether ALB is
-counted as shared-platform overhead or a dedicated cost. Unlike the
+**Total: realistically $25-65/month** at low-to-moderate usage — still
+comfortably under the $100 budget, but a meaningfully tighter range than
+an earlier draft assumed, now that ALB and the egress path are vibesdk's
+own dedicated cost rather than shared-platform overhead. Unlike the
 rejected warm-pool draft (~$1,300+/month baseline regardless of traffic),
 this total scales with actual usage: near-$0 at near-$0 traffic, growing
 roughly linearly as real concurrent sessions increase.
@@ -347,9 +368,10 @@ guess. These are starting points, not final tuning:
 - **Sandbox task sizing** — 0.5 vCPU/1 GB per the Cost model, to start.
   If MVP usage shows this can't handle real build/install workloads, move
   to the tiered small/heavy split discussed there.
-- **ALB cost accounting** — treat as shared-platform overhead for now
-  ($0 incremental); revisit only if cross-app cost allocation becomes a
-  real need.
+- **ALB and egress-path sizing** — smallest viable dedicated setup per
+  the Cost model (single ALB, single small Spot egress task). Revisit
+  only if real traffic shows the egress task needs to scale beyond one
+  instance.
 
 ## Data that still needs to come from outside this repo (not a build blocker)
 
@@ -366,12 +388,12 @@ guess. These are starting points, not final tuning:
 
 1. **Design doc (this document)** — reviewed and agreed before any
    infra or code changes.
-2. **Infra scaffolding** — add API Gateway (HTTP + WebSocket) and the
-   Lambda execution role/scaffolding to vibe-platform (new to the
-   platform, see above), plus `environments/apps/vibesdk` for the
-   ECS/ALB pieces still needed (on-demand sandbox tasks, preview
-   routing). Provisions the hosting shell only: no vibesdk-specific
-   compute or data yet.
+2. **Infra scaffolding** — stand up vibesdk's own AWS foundation in
+   `aws/infra/` in this repo: VPC, the minimal egress path, ALB, ECS
+   cluster, API Gateway (HTTP + WebSocket), Lambda execution role. All
+   independent, provisioned and owned by this repo's own Terraform state.
+   Provisions the hosting shell only: no vibesdk-specific compute or data
+   yet.
 3. **Actor-model spike** — prototype the Lambda-per-message replacement
    for `CodeGeneratorAgent` (connection routing, locking, DynamoDB/S3-backed
    state, rehydration-on-every-message) in isolation, before porting the
@@ -382,12 +404,12 @@ guess. These are starting points, not final tuning:
    period tuning, sandbox sizing validation) replace the defaults set
    above with real numbers.
 
-   First cut exists: `aws/actor-spike/` in this repo (Lambda handler —
-   connection routing, optimistic per-session lock, state round trip,
-   latency logging) and `environments/apps/vibesdk/` in `vibe-platform`
-   (its Terraform — WebSocket API, the Lambda, the two DynamoDB tables).
-   Not yet applied to real AWS; see that directory's README for what's
-   still needed before it can be.
+   First cut exists, both within this repo: `aws/actor-spike/` (Lambda
+   handler — connection routing, optimistic per-session lock, state
+   round trip, latency logging) and `aws/infra/` (its Terraform —
+   WebSocket API, the Lambda, the two DynamoDB tables). Not yet applied
+   to real AWS; see each directory's README for what's still needed
+   before it can be.
 4. **Stateless surface port** — D1→DynamoDB (query-layer rewrite, 10
    migrations' worth of schema to re-derive as access patterns), R2→S3,
    KV→DynamoDB, port the Worker entrypoint to API Gateway + Lambda.

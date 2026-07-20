@@ -46,10 +46,10 @@ runtime ships the AWS SDK v3 already, no need to bundle it.
 
 ## Infra
 
-Terraform lives in `vibe-platform`'s
-`platform/infra/environments/apps/vibesdk/` — see that directory's
-README for status (not yet applied, needs `terraform validate` and human
-review). It expects this package uploaded to S3 and wired via
+Terraform lives in this same repo, in
+[`../infra/`](../infra/) — see that directory's README for status (not
+yet applied, needs `terraform validate` and human review). It expects
+this package uploaded to S3 and wired via
 `lambda_package_s3_bucket`/`lambda_package_s3_key` — no CI pipeline
 exists yet to automate that upload.
 
