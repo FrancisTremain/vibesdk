@@ -256,8 +256,43 @@ plan (see Phase 3 below).
    pool, but the architecture-level question — no always-on relational
    database, no always-on compute fleet — is settled.
 
+   **On-demand-floor cost, quantified.** Using the sandbox spec vibesdk
+   already runs today (4 vCPU / 8 GB, per `wrangler.jsonc`'s `containers`
+   block) against Fargate list pricing (Linux/x86, us-east-1 reference —
+   ap-southeast-2 runs ~10-20% higher, reprice before committing):
+   a sandbox-class task costs roughly $144/task-month on-demand vs. $50
+   on Spot (~65% off) — about $94/task-month delta, or ~$187-$937/month
+   for a 2-10 task floor. Lighter session-worker tasks (1 vCPU / 2 GB)
+   are proportionally cheaper (~$36 vs. ~$13/task-month). This is why
+   Spot-only was chosen over adding a floor: on-demand costs ~3x Spot for
+   the same reserved capacity.
+
+   **The more important structural point:** this on-demand-vs-Spot delta
+   is *secondary* to a bigger difference between the two platforms.
+   Cloudflare bills Durable Objects and Containers by active duration —
+   a hibernating DO or an idle-but-provisioned Container costs ~nothing.
+   Fargate has no equivalent: a task (Spot or on-demand) bills its full
+   vCPU/GB rate for every second it's provisioned and warm, whether or
+   not it's handling a request that second. So the real cost lever in
+   this design isn't the Spot/on-demand choice — it's **minimizing
+   aggregate warm-task-hours** across both tiers (a tight Tier-2
+   idle-eviction grace period, a small Tier-1 floor, genuine scale-to-zero
+   when nothing's active). A generous grace period or an oversized Tier-1
+   pool could plausibly cost more in aggregate than the Spot/on-demand
+   choice ever would. Getting a real head-to-head number against current
+   spend requires pulling vibesdk's actual Cloudflare usage (DO
+   duration-GB-s, D1 reads/writes, Containers vCPU-seconds, R2
+   storage/egress) from the account's Analytics & Billing — not available
+   from this repo alone, and needed before Phase 2 cost sign-off.
+
 ## Remaining open questions
 
+- **Current Cloudflare spend baseline** (decision 5) — pull actual usage
+  from the vibesdk Cloudflare account (DO duration-GB-s, D1 reads/writes,
+  Containers vCPU-seconds, R2 storage/egress) to get a real head-to-head
+  cost comparison against the AWS estimate above. This is the single
+  highest-value missing input for the whole cost model and isn't
+  obtainable from the codebase — needs dashboard/billing access.
 - Instance-type/AZ diversification plan for the Spot fleet (decision 5)
   — needed to make the "decorrelate interruptions" mitigation concrete;
   should come from historical Spot interruption rates for candidate
