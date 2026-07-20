@@ -442,16 +442,22 @@ guess. These are starting points, not final tuning:
    [docs/aws-dynamodb-schema.md](aws-dynamodb-schema.md), all six
    tables now ported and tested), R2→S3 (`aws/git-storage/`),
    KV→DynamoDB (`aws/rate-limit/`), port the Worker entrypoint to API
-   Gateway + Lambda. The auth slice of the entrypoint is done:
-   [`aws/auth-api-lambda/`](../aws/auth-api-lambda/) is an API Gateway
-   HTTP API (v2) Lambda handler porting
+   Gateway + Lambda. Two slices of the entrypoint are done, both
+   API Gateway HTTP API (v2) Lambda handlers routing by
+   `event.routeKey`'s exact `(method, path)` match instead of a router
+   library: [`aws/auth-api-lambda/`](../aws/auth-api-lambda/) ports
    `worker/api/routes/authRoutes.ts` + its controller's HTTP-adapter
    behavior, wired to `aws/auth-orchestration` (11 tests, a full mocked
-   GitHub OAuth login round trip included). The rest of
-   `worker/index.ts` (apps, analytics, model-config, deployments, and
-   everything not auth) is not yet ported to a Lambda entrypoint —
-   substantially more surface area, but every database primitive it
-   would need is already built (`aws/db-apps`, `aws/db-analytics`,
+   GitHub OAuth login round trip included), and
+   [`aws/apps-api-lambda/`](../aws/apps-api-lambda/) ports
+   `worker/api/routes/appRoutes.ts`'s listing/detail/favorite/star/
+   visibility/delete routes, wired to `aws/db-apps` for storage and
+   `aws/auth-orchestration` for token validation only (7 tests). Both
+   have matching Terraform in `aws/infra/` (`auth-api.tf`,
+   `apps-api.tf`), not applied. The rest of `worker/index.ts`
+   (analytics, model-config, deployments, and everything else) is not
+   yet ported to a Lambda entrypoint — every database primitive those
+   would need is already built (`aws/db-analytics`,
    `aws/db-model-config`).
 5. **Sandbox + deploy port** — replace `UserAppSandboxService` with
    on-demand `RunTask`-launched sandboxes plus Tier-2 keep-warm (decision

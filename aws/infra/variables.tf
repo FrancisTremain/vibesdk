@@ -72,3 +72,15 @@ variable "google_oauth_client_secret" {
   default   = ""
   sensitive = true
 }
+
+# --- aws/apps-api-lambda ---
+
+variable "apps_api_lambda_package_s3_bucket" {
+  description = "S3 bucket holding the built aws/apps-api-lambda deployment package. No default: no build pipeline exists yet."
+  type        = string
+}
+
+variable "apps_api_lambda_package_s3_key" {
+  description = "S3 key for the built aws/apps-api-lambda deployment package."
+  type        = string
+}

@@ -54,13 +54,18 @@ directly, so there's no networking dependency to stand up first.
   unmatched request 404s at API Gateway instead of reaching the
   Lambda. `$default`-stage, `auto_deploy = true`, matching the
   actor-spike API's shape.
+- `apps-api.tf` — same shape for `aws/apps-api-lambda`'s app listing/
+  detail/favorite/star/visibility/delete routes. Its IAM role gets
+  read/write on the apps table but read-only on identity/auth-flows,
+  since this Lambda only validates tokens, never mutates a session.
 - `variables.tf` / `outputs.tf`.
 
 Lambda source for the actor-spike lives in
 [`../actor-spike/`](../actor-spike/); for the auth API, in
-[`../auth-api-lambda/`](../auth-api-lambda/). Both packages'
+[`../auth-api-lambda/`](../auth-api-lambda/); for the apps API, in
+[`../apps-api-lambda/`](../apps-api-lambda/). All three packages'
 `*_package_s3_bucket`/`*_package_s3_key` variables have no defaults —
-there's no CI pipeline yet to build and upload either package; set them
+there's no CI pipeline yet to build and upload any of them; set them
 once one exists. `jwt_secret` also has no default and is marked
 `sensitive` — see its description in `variables.tf` for why it
 shouldn't be passed as a literal Terraform variable in a real apply
@@ -73,10 +78,9 @@ Not applied. Not run through `terraform validate`/`fmt` — no `terraform`
 binary was available in the environment this was written in. Needs both,
 plus human review of the IAM/network-facing pieces (especially
 `jwt_secret` sourcing), before any apply. Nothing in this directory yet
-stands up a Lambda/API Gateway surface for the apps/analytics/model-config
-tables' real callers (`aws/db-apps`, `aws/db-analytics`,
-`aws/db-model-config`) — those don't have a Lambda handler ported yet
-either, only the auth slice does.
+stands up a Lambda/API Gateway surface for the analytics/model-config
+tables' real callers (`aws/db-analytics`, `aws/db-model-config`) — those
+don't have a Lambda handler ported yet, only auth and apps do.
 
 ## What this measures
 
