@@ -3,15 +3,24 @@
 # (Phase 5) decisions: Fargate Spot, launched fresh per session via
 # ecs:RunTask, no standing pool -- replacing CF's UserAppSandboxService
 # (@cloudflare/sandbox against the `cloudflare/sandbox` container
-# image, see ../../SandboxDockerfile).
+# image, see ../../../SandboxDockerfile).
 #
 # INFRASTRUCTURE SHAPE ONLY. This provisions the hosting shell a
 # control-plane implementation would run on -- it does not include any
 # actual sandbox control-plane server, because none exists yet (see
-# aws/sandbox-contract's README for why that's a real design task, not
+# ../../sandbox-contract's README for why that's a real design task, not
 # a port). The task definition below references a placeholder image;
 # nothing here can serve real sandbox traffic until that control plane
 # is designed and built.
+#
+# A SEPARATE ROOT MODULE from the rest of aws/infra, deliberately --
+# see this directory's own README for why: in short, this stack's two
+# variables with no possible default (sandbox_task_image,
+# sandbox_alb_certificate_arn) would otherwise block terraform plan/apply
+# on the entire aws/infra stack, including the parts that ARE ready to
+# deploy today (the DynamoDB tables, S3 bucket, and the auth/apps/user
+# Lambda APIs). Split out so "first deployable cut" doesn't require
+# placeholder values for infrastructure nothing can use yet.
 #
 # NOT APPLIED. Same status as the rest of this directory.
 #
@@ -31,6 +40,56 @@
 # The tradeoff is a public IP per running sandbox task, mitigated by
 # the security group only permitting inbound from the ALB.
 
+terraform {
+  required_version = ">= 1.5"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+
+  # Separate state file from the root stack -- this module's resources
+  # are independent of (and, per above, deliberately decoupled from)
+  # the root stack's apply lifecycle.
+  backend "s3" {
+    bucket       = "vibesdk-terraform-state"
+    key          = "aws-migration/sandbox/terraform.tfstate"
+    region       = "ap-southeast-2"
+    use_lockfile = true
+    encrypt      = true
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+
+  default_tags {
+    tags = {
+      Project = "vibesdk"
+    }
+  }
+}
+
+# Reads the root stack's outputs (git_storage_bucket_arn) instead of
+# requiring the operator to copy a value between applies. Assumes the
+# root stack has already been applied at least once -- true for any
+# real deployment sequence, since the root stack is the "first
+# deployable cut" and this module always comes after it.
+data "terraform_remote_state" "root" {
+  backend = "s3"
+  config = {
+    bucket = "vibesdk-terraform-state"
+    key    = "aws-migration/root/terraform.tfstate"
+    region = "ap-southeast-2"
+  }
+}
+
+locals {
+  git_storage_bucket_arn = data.terraform_remote_state.root.outputs.git_storage_bucket_arn
+}
+
 resource "aws_vpc" "sandbox" {
   cidr_block           = "10.42.0.0/16"
   enable_dns_support   = true
@@ -45,14 +104,14 @@ resource "aws_internet_gateway" "sandbox" {
 
 resource "aws_subnet" "sandbox_a" {
   vpc_id                  = aws_vpc.sandbox.id
-  cidr_block               = "10.42.1.0/24"
+  cidr_block              = "10.42.1.0/24"
   availability_zone       = "${var.aws_region}a"
   map_public_ip_on_launch = true
 }
 
 resource "aws_subnet" "sandbox_b" {
   vpc_id                  = aws_vpc.sandbox.id
-  cidr_block               = "10.42.2.0/24"
+  cidr_block              = "10.42.2.0/24"
   availability_zone       = "${var.aws_region}b"
   map_public_ip_on_launch = true
 }
@@ -242,7 +301,7 @@ resource "aws_iam_role_policy" "sandbox_task_git_storage" {
     Statement = [{
       Effect   = "Allow"
       Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
-      Resource = [aws_s3_bucket.git_storage.arn, "${aws_s3_bucket.git_storage.arn}/*"]
+      Resource = [local.git_storage_bucket_arn, "${local.git_storage_bucket_arn}/*"]
     }]
   })
 }
@@ -263,7 +322,7 @@ resource "aws_ecs_task_definition" "sandbox" {
   cpu                      = "512"  # 0.5 vCPU
   memory                   = "1024" # 1 GB
   execution_role_arn       = aws_iam_role.sandbox_task_execution.arn
-  task_role_arn             = aws_iam_role.sandbox_task.arn
+  task_role_arn            = aws_iam_role.sandbox_task.arn
 
   container_definitions = jsonencode([
     {

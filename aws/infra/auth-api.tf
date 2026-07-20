@@ -70,8 +70,13 @@ resource "aws_lambda_function" "auth_api" {
   memory_size   = var.lambda_memory_mb
   timeout       = var.lambda_timeout_seconds
 
-  s3_bucket = var.auth_api_lambda_package_s3_bucket
-  s3_key    = var.auth_api_lambda_package_s3_key
+  # Direct local-file deployment, not S3 -- the built zip is ~110KB,
+  # comfortably under Lambda's 50MB direct-upload limit, so there's no
+  # need for an upload-to-S3-first step for a package this small.
+  # source_code_hash drives redeploy-on-change (Terraform diffs it,
+  # not the file's mtime).
+  filename         = "${path.module}/../auth-api-lambda/auth-api-lambda.zip"
+  source_code_hash = filebase64sha256("${path.module}/../auth-api-lambda/auth-api-lambda.zip")
 
   environment {
     variables = {
@@ -153,10 +158,10 @@ resource "aws_apigatewayv2_stage" "auth_api" {
   access_log_settings {
     destination_arn = aws_cloudwatch_log_group.auth_http_access_logs.arn
     format = jsonencode({
-      requestId      = "$context.requestId"
-      routeKey       = "$context.routeKey"
-      status         = "$context.status"
-      responseLength = "$context.responseLength"
+      requestId          = "$context.requestId"
+      routeKey           = "$context.routeKey"
+      status             = "$context.status"
+      responseLength     = "$context.responseLength"
       integrationLatency = "$context.integrationLatency"
     })
   }

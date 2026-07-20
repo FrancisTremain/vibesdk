@@ -73,16 +73,17 @@ resource "aws_lambda_function" "user_api" {
   memory_size   = var.lambda_memory_mb
   timeout       = var.lambda_timeout_seconds
 
-  s3_bucket = var.user_api_lambda_package_s3_bucket
-  s3_key    = var.user_api_lambda_package_s3_key
+  # Direct local-file deployment -- see auth-api.tf's comment for why.
+  filename         = "${path.module}/../user-api-lambda/user-api-lambda.zip"
+  source_code_hash = filebase64sha256("${path.module}/../user-api-lambda/user-api-lambda.zip")
 
   environment {
     variables = {
-      APPS_TABLE               = aws_dynamodb_table.apps.name
-      MODEL_CONFIG_TABLE       = aws_dynamodb_table.model_config.name
-      IDENTITY_TABLE           = aws_dynamodb_table.identity.name
-      AUTH_FLOWS_TABLE         = aws_dynamodb_table.auth_flows.name
-      JWT_SECRET               = var.jwt_secret
+      APPS_TABLE         = aws_dynamodb_table.apps.name
+      MODEL_CONFIG_TABLE = aws_dynamodb_table.model_config.name
+      IDENTITY_TABLE     = aws_dynamodb_table.identity.name
+      AUTH_FLOWS_TABLE   = aws_dynamodb_table.auth_flows.name
+      JWT_SECRET         = var.jwt_secret
       # Read by vibesdk-model-config-defaults (AGENT_CONFIG selection,
       # BYOK-platform-key check) -- see that package's README.
       PLATFORM_MODEL_PROVIDERS = var.platform_model_providers

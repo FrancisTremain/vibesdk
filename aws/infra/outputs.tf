@@ -39,6 +39,11 @@ output "git_storage_bucket_name" {
   value = aws_s3_bucket.git_storage.bucket
 }
 
+output "git_storage_bucket_arn" {
+  description = "Consumed by aws/infra/sandbox's separate root module via terraform_remote_state, for the sandbox task role's S3 policy."
+  value       = aws_s3_bucket.git_storage.arn
+}
+
 output "auth_api_endpoint" {
   description = "https:// base URL for the auth API (invoke_url already includes the $default stage)."
   value       = aws_apigatewayv2_stage.auth_api.invoke_url
@@ -52,13 +57,4 @@ output "apps_api_endpoint" {
 output "user_api_endpoint" {
   description = "https:// base URL for the user (stats/providers) API (invoke_url already includes the $default stage)."
   value       = aws_apigatewayv2_stage.user_api.invoke_url
-}
-
-output "sandbox_alb_dns_name" {
-  description = "DNS name of the sandbox preview ALB. Point the preview subdomain's CNAME/ALIAS here once a real certificate and control-plane implementation exist."
-  value       = aws_lb.sandbox.dns_name
-}
-
-output "sandbox_ecs_cluster_name" {
-  value = aws_ecs_cluster.sandbox.name
 }

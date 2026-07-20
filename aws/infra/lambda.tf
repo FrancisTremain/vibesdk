@@ -67,8 +67,9 @@ resource "aws_lambda_function" "actor" {
   memory_size   = var.lambda_memory_mb
   timeout       = var.lambda_timeout_seconds
 
-  s3_bucket = var.lambda_package_s3_bucket
-  s3_key    = var.lambda_package_s3_key
+  # Direct local-file deployment -- see auth-api.tf's comment for why.
+  filename         = "${path.module}/../actor-spike/actor-spike.zip"
+  source_code_hash = filebase64sha256("${path.module}/../actor-spike/actor-spike.zip")
 
   environment {
     variables = {

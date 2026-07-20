@@ -75,8 +75,9 @@ resource "aws_lambda_function" "apps_api" {
   memory_size   = var.lambda_memory_mb
   timeout       = var.lambda_timeout_seconds
 
-  s3_bucket = var.apps_api_lambda_package_s3_bucket
-  s3_key    = var.apps_api_lambda_package_s3_key
+  # Direct local-file deployment -- see auth-api.tf's comment for why.
+  filename         = "${path.module}/../apps-api-lambda/apps-api-lambda.zip"
+  source_code_hash = filebase64sha256("${path.module}/../apps-api-lambda/apps-api-lambda.zip")
 
   environment {
     variables = {
@@ -144,11 +145,11 @@ resource "aws_apigatewayv2_stage" "apps_api" {
   access_log_settings {
     destination_arn = aws_cloudwatch_log_group.apps_http_access_logs.arn
     format = jsonencode({
-      requestId           = "$context.requestId"
-      routeKey            = "$context.routeKey"
-      status              = "$context.status"
-      responseLength      = "$context.responseLength"
-      integrationLatency  = "$context.integrationLatency"
+      requestId          = "$context.requestId"
+      routeKey           = "$context.routeKey"
+      status             = "$context.status"
+      responseLength     = "$context.responseLength"
+      integrationLatency = "$context.integrationLatency"
     })
   }
 }

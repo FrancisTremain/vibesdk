@@ -491,8 +491,10 @@ guess. These are starting points, not final tuning:
    `cloudflare/sandbox` base container image (see `SandboxDockerfile`),
    a control-plane protocol with no public specification to port
    against, so an AWS replacement means *designing* an equivalent
-   protocol, not porting one. `aws/infra/sandbox.tf` provisions the ECS
-   hosting shell that design would run on (VPC, ALB, Fargate Spot
+   protocol, not porting one. `aws/infra/sandbox/` (a separate Terraform
+   root module from the rest of `aws/infra`, split off because its
+   variables have no default value) provisions the ECS hosting shell
+   that design would run on (VPC, ALB, Fargate Spot
    cluster/capacity provider, IAM roles, a task definition with a
    placeholder image) — ahead of and independent from that protocol
    design, same relationship `aws/infra`'s other Terraform has to the

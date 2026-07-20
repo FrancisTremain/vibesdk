@@ -46,11 +46,11 @@ resource "aws_apigatewayv2_stage" "spike" {
   access_log_settings {
     destination_arn = aws_cloudwatch_log_group.actor_ws_access_logs.arn
     format = jsonencode({
-      requestId       = "$context.requestId"
-      connectionId    = "$context.connectionId"
-      eventType       = "$context.eventType"
-      routeKey        = "$context.routeKey"
-      status          = "$context.status"
+      requestId          = "$context.requestId"
+      connectionId       = "$context.connectionId"
+      eventType          = "$context.eventType"
+      routeKey           = "$context.routeKey"
+      status             = "$context.status"
       integrationLatency = "$context.integrationLatency"
     })
   }

@@ -4,16 +4,6 @@ variable "aws_region" {
   default     = "ap-southeast-2"
 }
 
-variable "lambda_package_s3_bucket" {
-  description = "S3 bucket holding the built actor-spike Lambda deployment package (from vibesdk's aws/actor-spike/, built and uploaded by CI — not built by this Terraform). No default: must be supplied by the caller once a build pipeline exists."
-  type        = string
-}
-
-variable "lambda_package_s3_key" {
-  description = "S3 key for the built actor-spike Lambda deployment package."
-  type        = string
-}
-
 variable "lambda_memory_mb" {
   description = "Default per docs/aws-migration-design.md's 'Defaults chosen to unblock building' section — tune from real Phase 3 latency measurements, not a guess."
   type        = number
@@ -27,16 +17,7 @@ variable "lambda_timeout_seconds" {
 }
 
 # --- aws/auth-api-lambda ---
-
-variable "auth_api_lambda_package_s3_bucket" {
-  description = "S3 bucket holding the built aws/auth-api-lambda deployment package. No default: no build pipeline exists yet."
-  type        = string
-}
-
-variable "auth_api_lambda_package_s3_key" {
-  description = "S3 key for the built aws/auth-api-lambda deployment package."
-  type        = string
-}
+# (deployment package is a local file -- see auth-api.tf -- no S3 bucket/key variables needed)
 
 variable "public_base_url" {
   description = "Origin the auth Lambda treats as its own -- used for OAuth redirect_uri construction and validateRedirectUrl's same-origin check. E.g. https://app.vibesdk.example.com. No default: environment-specific."
@@ -80,40 +61,10 @@ variable "google_oauth_client_secret" {
 }
 
 # --- aws/apps-api-lambda ---
-
-variable "apps_api_lambda_package_s3_bucket" {
-  description = "S3 bucket holding the built aws/apps-api-lambda deployment package. No default: no build pipeline exists yet."
-  type        = string
-}
-
-variable "apps_api_lambda_package_s3_key" {
-  description = "S3 key for the built aws/apps-api-lambda deployment package."
-  type        = string
-}
+# (deployment package is a local file -- see apps-api.tf -- no S3 bucket/key variables needed)
 
 # --- aws/user-api-lambda ---
-
-variable "user_api_lambda_package_s3_bucket" {
-  description = "S3 bucket holding the built aws/user-api-lambda deployment package. No default: no build pipeline exists yet."
-  type        = string
-}
-
-variable "user_api_lambda_package_s3_key" {
-  description = "S3 key for the built aws/user-api-lambda deployment package."
-  type        = string
-}
-
-# --- sandbox.tf ---
-
-variable "sandbox_task_image" {
-  description = "Container image URI for the sandbox task (ECR image tag or similar). No default and no real image exists yet -- aws/sandbox-contract's README explains why (the control-plane server this image needs to run hasn't been designed). Placeholder required to make the task definition syntactically valid."
-  type        = string
-}
-
-variable "sandbox_alb_certificate_arn" {
-  description = "ACM certificate ARN for the sandbox preview ALB's HTTPS listener (wildcard cert for the preview subdomain). No default -- provision the certificate and its DNS validation separately, outside this stack, before applying."
-  type        = string
-}
+# (deployment package is a local file -- see user-api.tf -- no S3 bucket/key variables needed)
 
 variable "platform_model_providers" {
   description = "Optional comma-separated provider list for vibesdk-model-config-defaults' AGENT_CONFIG selection and BYOK platform-key check (matches the original's env.PLATFORM_MODEL_PROVIDERS). Empty disables it -- falls back to per-provider *_api_key variables below."
