@@ -10,3 +10,31 @@ output "actor_state_table_name" {
 output "ws_connections_table_name" {
   value = aws_dynamodb_table.ws_connections.name
 }
+
+output "identity_table_name" {
+  value = aws_dynamodb_table.identity.name
+}
+
+output "apps_table_name" {
+  value = aws_dynamodb_table.apps.name
+}
+
+output "auth_flows_table_name" {
+  value = aws_dynamodb_table.auth_flows.name
+}
+
+output "model_config_table_name" {
+  value = aws_dynamodb_table.model_config.name
+}
+
+output "audit_log_table_name" {
+  value = aws_dynamodb_table.audit_log.name
+}
+
+output "system_settings_table_name" {
+  value = aws_dynamodb_table.system_settings.name
+}
+
+output "git_storage_bucket_name" {
+  value = aws_s3_bucket.git_storage.bucket
+}
