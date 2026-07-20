@@ -5,7 +5,7 @@
   "description": "DynamoDB port of the feasible part of AnalyticsService, reading the vibesdk-apps table designed in aws/db-apps. Not part of the main vibesdk build.",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --external:@aws-sdk/*",
+    "build": "tsc --emitDeclarationOnly --outDir dist && esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --external:@aws-sdk/*",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts --root ."
   },
@@ -18,5 +18,7 @@
     "esbuild": "^0.21.0",
     "typescript": "^5.5.0",
     "vitest": "^4.1.10"
-  }
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts"
 }

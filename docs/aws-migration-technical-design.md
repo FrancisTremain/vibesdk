@@ -442,23 +442,37 @@ guess. These are starting points, not final tuning:
    [docs/aws-dynamodb-schema.md](aws-dynamodb-schema.md), all six
    tables now ported and tested), R2→S3 (`aws/git-storage/`),
    KV→DynamoDB (`aws/rate-limit/`), port the Worker entrypoint to API
-   Gateway + Lambda. Two slices of the entrypoint are done, both
+   Gateway + Lambda. Three slices of the entrypoint are done, all
    API Gateway HTTP API (v2) Lambda handlers routing by
    `event.routeKey`'s exact `(method, path)` match instead of a router
    library: [`aws/auth-api-lambda/`](../aws/auth-api-lambda/) ports
    `worker/api/routes/authRoutes.ts` + its controller's HTTP-adapter
    behavior, wired to `aws/auth-orchestration` (11 tests, a full mocked
-   GitHub OAuth login round trip included), and
+   GitHub OAuth login round trip included);
    [`aws/apps-api-lambda/`](../aws/apps-api-lambda/) ports
    `worker/api/routes/appRoutes.ts`'s listing/detail/favorite/star/
    visibility/delete routes, wired to `aws/db-apps` for storage and
-   `aws/auth-orchestration` for token validation only (7 tests). Both
-   have matching Terraform in `aws/infra/` (`auth-api.tf`,
-   `apps-api.tf`), not applied. The rest of `worker/index.ts`
-   (analytics, model-config, deployments, and everything else) is not
-   yet ported to a Lambda entrypoint — every database primitive those
-   would need is already built (`aws/db-analytics`,
-   `aws/db-model-config`).
+   `aws/auth-orchestration` for token validation only (7 tests); and
+   [`aws/user-api-lambda/`](../aws/user-api-lambda/) ports user stats
+   (`worker/api/routes/statsRoutes.ts`, wired to `aws/db-analytics`)
+   and custom-model-provider listing
+   (`worker/api/routes/modelProviderRoutes.ts`, wired to
+   `aws/db-model-config`) — 6 tests, including the create/update/delete
+   provider routes mirroring their current *disabled* status in the
+   live product (they 503 upstream too) rather than reviving a
+   feature that's off. All three have matching Terraform in
+   `aws/infra/` (`auth-api.tf`, `apps-api.tf`, `user-api.tf`), not
+   applied. Deliberately not ported: the model-config CRUD routes
+   themselves (`worker/api/routes/modelConfigRoutes.ts`) — they
+   validate every request against `AGENT_CONFIG`
+   (`worker/agents/inferutils/config.ts`), a large product-specific
+   static config `aws/db-model-config` never ported either (storage
+   only, by design — see that package's README); porting the HTTP
+   routes faithfully would mean also porting or duplicating that
+   config, a materially larger and different task than every other
+   handler in this migration. `worker/index.ts`'s remaining surface
+   (deployments and everything else not auth/apps/stats/providers) is
+   also not yet ported.
 5. **Sandbox + deploy port** — replace `UserAppSandboxService` with
    on-demand `RunTask`-launched sandboxes plus Tier-2 keep-warm (decision
    1), replace the wrangler/dispatch deployer with the AWS provisioning

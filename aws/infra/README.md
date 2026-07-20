@@ -58,12 +58,19 @@ directly, so there's no networking dependency to stand up first.
   detail/favorite/star/visibility/delete routes. Its IAM role gets
   read/write on the apps table but read-only on identity/auth-flows,
   since this Lambda only validates tokens, never mutates a session.
+- `user-api.tf` — same shape for `aws/user-api-lambda`'s stats and
+  model-provider-listing routes. Read-only on apps (stats never
+  writes), read/write on model-config (provider listing only reads
+  today, but the role isn't narrowed further since `ModelProviderStore`'s
+  write methods exist and may get wired in if the upstream product
+  re-enables custom providers), read-only on identity/auth-flows.
 - `variables.tf` / `outputs.tf`.
 
 Lambda source for the actor-spike lives in
 [`../actor-spike/`](../actor-spike/); for the auth API, in
 [`../auth-api-lambda/`](../auth-api-lambda/); for the apps API, in
-[`../apps-api-lambda/`](../apps-api-lambda/). All three packages'
+[`../apps-api-lambda/`](../apps-api-lambda/); for the user API, in
+[`../user-api-lambda/`](../user-api-lambda/). All four packages'
 `*_package_s3_bucket`/`*_package_s3_key` variables have no defaults —
 there's no CI pipeline yet to build and upload any of them; set them
 once one exists. `jwt_secret` also has no default and is marked
@@ -77,10 +84,12 @@ pipeline exists instead).
 Not applied. Not run through `terraform validate`/`fmt` — no `terraform`
 binary was available in the environment this was written in. Needs both,
 plus human review of the IAM/network-facing pieces (especially
-`jwt_secret` sourcing), before any apply. Nothing in this directory yet
-stands up a Lambda/API Gateway surface for the analytics/model-config
-tables' real callers (`aws/db-analytics`, `aws/db-model-config`) — those
-don't have a Lambda handler ported yet, only auth and apps do.
+`jwt_secret` sourcing), before any apply. Every one of the six
+application DynamoDB tables now has at least one real Lambda caller
+(auth, apps, user/stats/model-provider) except the audit-log table's
+security-event path, which is wired into the auth Lambda already, and
+the model-config table's CRUD surface, which is deliberately unported
+(see `aws/user-api-lambda`'s README for why).
 
 ## What this measures
 

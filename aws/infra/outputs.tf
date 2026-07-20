@@ -48,3 +48,8 @@ output "apps_api_endpoint" {
   description = "https:// base URL for the apps API (invoke_url already includes the $default stage)."
   value       = aws_apigatewayv2_stage.apps_api.invoke_url
 }
+
+output "user_api_endpoint" {
+  description = "https:// base URL for the user (stats/providers) API (invoke_url already includes the $default stage)."
+  value       = aws_apigatewayv2_stage.user_api.invoke_url
+}
