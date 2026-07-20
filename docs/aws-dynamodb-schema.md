@@ -204,6 +204,13 @@ audit volume grows — not needed for MVP.
 SETTING#<key>`. No SK, no GSI. Barely worth calling a "table" but kept
 separate rather than folding into another domain's table for no reason.
 
+**Status:** both tables are ported and tested (7 tests) in
+[`aws/db-audit/`](../aws/db-audit/). `system_settings` has no real
+caller anywhere in `worker/database/services/` beyond a health-check
+probe, so `SystemSettingsStore` stays a minimal get/set rather than an
+invented CRUD API. All six tables in this document are now backed by
+real, tested code.
+
 ## What this doesn't cover yet
 
 - Exact attribute-level types/validation (carries over directly from

@@ -54,6 +54,7 @@ import {
 	type AttemptType,
 } from 'vibesdk-db-auth-flows';
 import { PasswordCrypto, validatePassword as validatePasswordStrength } from 'vibesdk-auth-crypto';
+import { AuditLogStore } from 'vibesdk-db-audit';
 import {
 	BaseOAuthProvider,
 	GitHubOAuthProvider,
@@ -76,6 +77,11 @@ export interface AuthOrchestratorConfig {
 	ddb: DynamoDBDocumentClient;
 	identityTable: string;
 	authFlowsTable: string;
+	/** Table 5 (`vibesdk-audit-log`). Optional: security-event logging
+	 *  and `getUserSecurityStatus` are skipped (log calls become no-ops,
+	 *  status reports zero events) if omitted, so existing callers that
+	 *  don't care about audit logging aren't forced to provision it. */
+	auditTable?: string;
 	jwtSecret: string;
 	allowedEmail?: string;
 	oauth?: {
@@ -84,6 +90,9 @@ export interface AuthOrchestratorConfig {
 	};
 	logger?: Logger;
 }
+
+/** Matches SessionService.config.maxConcurrentDevices from the original. */
+const MAX_CONCURRENT_DEVICES = 3;
 
 function generateSecureToken(length = 32): string {
 	const array = new Uint8Array(length);
@@ -99,6 +108,7 @@ export class AuthOrchestrator {
 	private readonly oauthStates: OAuthStateStore;
 	private readonly attempts: AuthAttemptStore;
 	private readonly otps: VerificationOtpStore;
+	private readonly auditLog: AuditLogStore | null;
 	private readonly passwordCrypto: PasswordCrypto;
 	private readonly jwt: JWTUtils;
 	private readonly allowedEmail?: string;
@@ -113,6 +123,7 @@ export class AuthOrchestrator {
 		this.oauthStates = new OAuthStateStore(config.ddb, config.authFlowsTable);
 		this.attempts = new AuthAttemptStore(config.ddb, config.authFlowsTable);
 		this.otps = new VerificationOtpStore(config.ddb, config.authFlowsTable);
+		this.auditLog = config.auditTable ? new AuditLogStore(config.ddb, config.auditTable) : null;
 		this.passwordCrypto = new PasswordCrypto();
 		this.jwt = JWTUtils.getInstance(config.jwtSecret);
 		this.allowedEmail = config.allowedEmail;
@@ -551,6 +562,102 @@ export class AuthOrchestrator {
 			this.logger.error('Resend verification OTP error', error);
 			throw new SecurityError(SecurityErrorType.INVALID_INPUT, 'Failed to resend verification code', 500);
 		}
+	}
+
+	// ========================================
+	// SECURITY EVENTS (SessionService.logSecurityEvent / getUserSecurityStatus)
+	// ========================================
+
+	/**
+	 * Port of `SessionService.logSecurityEvent` -- writes to the
+	 * `audit_logs` table (Table 5, `aws/db-audit`), not ported alongside
+	 * the rest of `SessionService`'s storage layer in `aws/db-identity`
+	 * because that table didn't exist yet. Never throws: a failure to
+	 * log a security event shouldn't fail the request that triggered it,
+	 * matching the original's catch-and-log-only behavior. No-ops if
+	 * this orchestrator was constructed without `auditTable`.
+	 */
+	async logSecurityEvent(
+		userId: string,
+		sessionId: string,
+		eventType: 'session_hijacking' | 'suspicious_activity' | 'device_change' | 'location_change',
+		details: Record<string, unknown>,
+		request?: Request,
+	): Promise<void> {
+		if (!this.auditLog) return;
+		try {
+			const metadata = request ? extractRequestMetadata(request) : { ipAddress: 'unknown', userAgent: 'unknown' };
+			await this.auditLog.record({
+				userId,
+				entityType: 'session',
+				entityId: sessionId,
+				action: eventType,
+				oldValues: null,
+				newValues: details,
+				ipAddress: metadata.ipAddress,
+				userAgent: metadata.userAgent,
+			});
+		} catch (error) {
+			this.logger.error('Failed to log security event', error);
+		}
+	}
+
+	/**
+	 * Port of `SessionService.getUserSecurityStatus`. Unchanged
+	 * risk-scoring logic: active-session count above
+	 * `MAX_CONCURRENT_DEVICES` bumps to medium risk, more than 5 recent
+	 * (last 24h) security events bumps to high, more than 2 bumps to
+	 * medium, and any `session_hijacking` event forces high regardless
+	 * of count. Returns zeroed-out "low risk" status if this
+	 * orchestrator was constructed without `auditTable` -- there's
+	 * nothing to report on, not a real "everything is fine" signal.
+	 */
+	async getUserSecurityStatus(userId: string): Promise<{
+		activeSessions: number;
+		recentSecurityEvents: number;
+		lastSecurityEvent?: Date;
+		riskLevel: 'low' | 'medium' | 'high';
+		recommendations: string[];
+	}> {
+		const activeSessionCount = (await this.sessions.getUserSessions(userId)).length;
+
+		let recentEvents: Array<{ action: string; createdAt: number }> = [];
+		if (this.auditLog) {
+			const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+			recentEvents = (await this.auditLog.listForUser(userId, oneDayAgo)).filter(
+				(e) => e.entityType === 'session',
+			);
+		}
+
+		const recentSecurityEvents = recentEvents.length;
+		const lastSecurityEvent = recentEvents[0] ? new Date(recentEvents[0].createdAt) : undefined;
+
+		let riskLevel: 'low' | 'medium' | 'high' = 'low';
+		const recommendations: string[] = [];
+
+		if (activeSessionCount > MAX_CONCURRENT_DEVICES) {
+			riskLevel = 'medium';
+			recommendations.push('Consider revoking old sessions - you have many active sessions');
+		}
+
+		if (recentSecurityEvents > 5) {
+			riskLevel = 'high';
+			recommendations.push('Multiple security events detected - review your account activity');
+		} else if (recentSecurityEvents > 2) {
+			riskLevel = 'medium';
+			recommendations.push('Some suspicious activity detected - monitor your account');
+		}
+
+		if (recentEvents.some((e) => e.action === 'session_hijacking')) {
+			riskLevel = 'high';
+			recommendations.push('Session hijacking attempts detected - change your password immediately');
+		}
+
+		if (recommendations.length === 0) {
+			recommendations.push('Your account security looks good');
+		}
+
+		return { activeSessions: activeSessionCount, recentSecurityEvents, lastSecurityEvent, riskLevel, recommendations };
 	}
 
 	// ========================================

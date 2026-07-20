@@ -7,13 +7,14 @@ import { SecurityError } from './errors';
 
 const JWT_SECRET = 'Test-Jwt-Secret-For-AuthOrchestrator-2024!';
 
-function makeOrchestrator(overrides: { allowedEmail?: string } = {}): AuthOrchestrator {
+function makeOrchestrator(overrides: { allowedEmail?: string; withAuditTable?: boolean } = {}): AuthOrchestrator {
 	JWTUtils.resetInstanceForTests();
 	const ddb = new FakeDynamoDocumentClient() as unknown as DynamoDBDocumentClient;
 	return new AuthOrchestrator({
 		ddb,
 		identityTable: 'test-identity',
 		authFlowsTable: 'test-auth-flows',
+		auditTable: overrides.withAuditTable === false ? undefined : 'test-audit',
 		jwtSecret: JWT_SECRET,
 		allowedEmail: overrides.allowedEmail,
 		oauth: {
@@ -312,5 +313,58 @@ describe('email verification via OTP', () => {
 		const registered = await auth.register({ email: 'verified@example.com', password: 'Str0ngPassw0rd!' }, req());
 		expect(registered.user.emailVerified).toBe(true);
 		await expect(auth.resendVerificationOtp('verified@example.com')).rejects.toThrow(/already verified/);
+	});
+});
+
+describe('security events', () => {
+	it('reports low risk and no events for a fresh account', async () => {
+		const auth = makeOrchestrator();
+		const registered = await auth.register({ email: 'fresh@example.com', password: 'Str0ngPassw0rd!' }, req());
+
+		const status = await auth.getUserSecurityStatus(registered.user.id);
+		expect(status.riskLevel).toBe('low');
+		expect(status.recentSecurityEvents).toBe(0);
+		expect(status.activeSessions).toBe(1);
+		expect(status.recommendations).toEqual(['Your account security looks good']);
+	});
+
+	it('escalates to high risk on a session_hijacking event', async () => {
+		const auth = makeOrchestrator();
+		const registered = await auth.register({ email: 'hijacked@example.com', password: 'Str0ngPassw0rd!' }, req());
+
+		await auth.logSecurityEvent(registered.user.id, registered.sessionId, 'session_hijacking', { ip: '1.2.3.4' });
+
+		const status = await auth.getUserSecurityStatus(registered.user.id);
+		expect(status.riskLevel).toBe('high');
+		expect(status.recentSecurityEvents).toBe(1);
+		expect(status.recommendations).toContain('Session hijacking attempts detected - change your password immediately');
+	});
+
+	it('escalates to medium risk after a few suspicious events, high after several more', async () => {
+		const auth = makeOrchestrator();
+		const registered = await auth.register({ email: 'suspicious@example.com', password: 'Str0ngPassw0rd!' }, req());
+
+		for (let i = 0; i < 3; i++) {
+			await auth.logSecurityEvent(registered.user.id, registered.sessionId, 'suspicious_activity', {});
+		}
+		expect((await auth.getUserSecurityStatus(registered.user.id)).riskLevel).toBe('medium');
+
+		for (let i = 0; i < 3; i++) {
+			await auth.logSecurityEvent(registered.user.id, registered.sessionId, 'suspicious_activity', {});
+		}
+		expect((await auth.getUserSecurityStatus(registered.user.id)).riskLevel).toBe('high');
+	});
+
+	it('never throws when logging fails to find a table, and reports zeroed status without an audit table', async () => {
+		const auth = makeOrchestrator({ withAuditTable: false });
+		const registered = await auth.register({ email: 'noaudit@example.com', password: 'Str0ngPassw0rd!' }, req());
+
+		await expect(
+			auth.logSecurityEvent(registered.user.id, registered.sessionId, 'device_change', {}),
+		).resolves.toBeUndefined();
+
+		const status = await auth.getUserSecurityStatus(registered.user.id);
+		expect(status.recentSecurityEvents).toBe(0);
+		expect(status.riskLevel).toBe('low');
 	});
 });

@@ -2,15 +2,19 @@
 
 Port of `AuthService` (`worker/database/services/AuthService.ts`, 1178
 lines) — register/login/logout, OAuth login, OAuth account linking,
-email verification by OTP, and token validation. This is the
-orchestration layer every other `aws/auth-*`/`aws/db-*`/`aws/oauth-*`
-package in this migration was built toward: it assembles
-[`vibesdk-db-identity`](../db-identity/) (users, sessions, API keys),
+email verification by OTP, and token validation — plus
+`SessionService.logSecurityEvent`/`getUserSecurityStatus`, the two
+`SessionService` methods `aws/db-identity` deliberately left unported
+pending an audit-log table. This is the orchestration layer every
+other `aws/auth-*`/`aws/db-*`/`aws/oauth-*` package in this migration
+was built toward: it assembles [`vibesdk-db-identity`](../db-identity/)
+(users, sessions, API keys, OAuth identities),
 [`vibesdk-db-auth-flows`](../db-auth-flows/) (OAuth CSRF state,
 auth-attempt log, verification OTPs), [`vibesdk-auth-crypto`](../auth-crypto/)
-(password hashing + strength validation), and
+(password hashing + strength validation),
 [`vibesdk-oauth-clients`](../oauth-clients/) (GitHub/Google HTTP
-clients) into `AuthOrchestrator`, a single class with the same
+clients), and [`vibesdk-db-audit`](../db-audit/) (audit log, optional)
+into `AuthOrchestrator`, a single class with the same
 register/login/OAuth-callback surface as the original.
 
 ## Composition, not duplication
@@ -19,27 +23,37 @@ Every other `aws/*` package in this migration is fully self-contained
 (no cross-package imports), including duplicating small shared pieces
 like `fake-dynamo.ts` rather than reusing another package's copy. This
 package breaks that pattern deliberately: assembling the real
-`AuthService` orchestration on top of four already-built, already-tested
-packages by re-implementing all of them inline would mean ~2500 lines of
-copy-pasted stores, crypto, and OAuth clients with no way to keep them
-in sync. Instead, the four dependencies are real `file:` npm
+`AuthService` orchestration on top of five already-built, already-tested
+packages by re-implementing all of them inline would mean thousands of
+lines of copy-pasted stores, crypto, and OAuth clients with no way to
+keep them in sync. Instead, the dependencies are real `file:` npm
 dependencies (`"vibesdk-db-identity": "file:../db-identity"`, etc.), and
-each of those four packages' `package.json` gained `main`/`types`
-fields plus a `tsc --emitDeclarationOnly` build step (in addition to
-their existing esbuild bundle) so this package can import their real
-classes with real type declarations — nothing about their own behavior,
-tests, or exports changed.
+each of those packages' `package.json` gained `main`/`types` fields
+plus a `tsc --emitDeclarationOnly` build step (in addition to their
+existing esbuild bundle) so this package can import their real classes
+with real type declarations — nothing about their own behavior, tests,
+or exports changed.
 
-One consequence worth calling out: the in-memory `fake-dynamo.ts` used
-for testing matches commands by `constructor.name`, not `instanceof`.
-Commands built inside a sibling package's bundled `dist/index.js` come
-from *that package's own* `node_modules` copy of `@aws-sdk/lib-dynamodb`
--- a different module instance than the one this package's fake
-imports, even at the identical version. `instanceof` fails silently
-across that boundary (throws "unhandled command" for every operation);
-`constructor.name` doesn't care which module instance built the class.
-Every other package's fake still uses `instanceof`, since none of them
-drive commands built outside their own module graph.
+Two consequences worth calling out:
+
+1. The in-memory `fake-dynamo.ts` used for testing matches commands by
+   `constructor.name`, not `instanceof`. Commands built inside a
+   sibling package's bundled `dist/index.js` come from *that package's
+   own* `node_modules` copy of `@aws-sdk/lib-dynamodb` -- a different
+   module instance than the one this package's fake imports, even at
+   the identical version. `instanceof` fails silently across that
+   boundary (throws "unhandled command" for every operation);
+   `constructor.name` doesn't care which module instance built the
+   class. Every other package's fake still uses `instanceof`, since
+   none of them drive commands built outside their own module graph.
+2. The fake also needed GSI query support (`IndexName`), copied from
+   `aws/db-apps`'s more capable fake -- `aws/db-identity`'s copy
+   (this package's starting point) never needed one, but
+   `vibesdk-db-audit`'s `AuditLogStore.listForUser` queries a `by-user`
+   GSI. Caught by a test that silently returned zero events instead of
+   erroring — the fake's base `QueryCommand` handler ignored
+   `IndexName` entirely rather than failing loudly, so the gap surfaced
+   as a wrong answer, not a thrown error worth noticing immediately.
 
 ## Two real gaps this port surfaced
 
@@ -100,7 +114,16 @@ the original's comments call out), `completeOAuthLink`,
 last login method), `getUserIdentities`, `verifyEmailWithOtp`,
 `resendVerificationOtp`, `getUserForAuth`, `validateTokenAndGetUser`
 (cross-checks every token against its live session or API key, so
-logout/revoke take effect immediately rather than at JWT `exp`).
+logout/revoke take effect immediately rather than at JWT `exp`), and
+`SessionService.logSecurityEvent`/`getUserSecurityStatus` (unchanged
+risk-scoring logic: session count over the concurrent-device limit or
+more than 2/5 recent events bumps risk to medium/high, any
+`session_hijacking` event forces high regardless of count). The
+security-event methods depend on `vibesdk-db-audit`, wired in as an
+*optional* constructor dependency (`auditTable`) -- omit it and
+`logSecurityEvent` becomes a no-op while `getUserSecurityStatus`
+reports a zeroed-out low-risk status, so a caller that doesn't want to
+provision Table 5 isn't forced to.
 
 Not ported:
 - Cloudflare OAuth (`CloudflareConnectOAuthProvider`) -- out of scope,
@@ -122,7 +145,7 @@ Not ported:
 
 ## Testing
 
-39 tests, no real AWS or network access:
+43 tests, no real AWS or network access:
 
 - `jwt.test.ts` (9): secret-strength validation (short/weak/low-entropy/
   repetitive all rejected), sign/verify round trip, tampered- and
@@ -130,17 +153,19 @@ Not ported:
 - `auth-utils.test.ts` (10): `validateEmail`, the `ALLOWED_EMAIL` gate,
   and `validateRedirectUrl`'s three rejection cases (cross-origin,
   forbidden path, nested redirect parameter).
-- `auth-orchestrator.test.ts` (20): full register/login/logout round
+- `auth-orchestrator.test.ts` (24): full register/login/logout round
   trips, duplicate-email and weak-password rejection, the allowlist gate
   on both register and login, session revocation invalidating a live
   token, OAuth login creating a user vs. resolving an existing identity
   vs. refusing to take over an existing email account, OAuth CSRF nonce
   mismatch and state-replay rejection, account linking including
   "already linked to a different user" and "can't unlink your last
-  login method," and the OTP resend guard paths. GitHub responses are
-  mocked via `vi.stubGlobal('fetch', ...)`, same pattern as
-  `oauth-clients`'s own tests; password hashing, JWT signing, and OAuth
-  CSRF token generation all run for real (no crypto mocking).
+  login method," the OTP resend guard paths, and security-event risk
+  scoring (low/medium/high escalation, immediate high on a hijacking
+  event, zeroed status when constructed without `auditTable`). GitHub
+  responses are mocked via `vi.stubGlobal('fetch', ...)`, same pattern
+  as `oauth-clients`'s own tests; password hashing, JWT signing, and
+  OAuth CSRF token generation all run for real (no crypto mocking).
 
 ## Build
 
