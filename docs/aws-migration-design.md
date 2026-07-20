@@ -15,6 +15,23 @@ ECS Fargate blue/green, the `app-blue-green` Terraform module, DynamoDB,
 SSM, WAF, CodeArtifact) as the hosting substrate rather than building new
 AWS infrastructure from scratch.
 
+## Cost budget (hard constraint)
+
+Target: **under $100/month**, lower if achievable, at low-to-moderate
+usage. This is a hard constraint on the architecture, not a tuning target
+applied after the fact — it ruled out an earlier draft of this design (see
+"Rejected: standing warm-pool architecture" below) and is why the compute
+model below is Lambda-first rather than reserved-capacity-first.
+
+The one thing this budget cannot promise: cost that's flat regardless of
+traffic. No architecture can serve real concurrent usage for a fixed fee —
+cost fundamentally scales with concurrent active compute-seconds. What
+this design *can* promise is that cost tracks usage closely (near-$0 at
+near-$0 traffic, growing roughly linearly with it) instead of carrying a
+fixed reserved-capacity floor that costs the same whether one person or
+zero people are using the product. See the Cost model section below for
+the worked numbers.
+
 ## What vibesdk actually uses today
 
 | Concern | Cloudflare primitive | Where |
@@ -47,11 +64,11 @@ Two persistence layers matter, and they are **not** the same thing:
    transaction boundary. This is the part with no AWS equivalent and is
    the actual crux of the migration.
 
-**Decision: no Aurora.** Given vibe-platform's "cost is king" constraint,
-this design does not introduce a relational database. Control-plane data
-goes to DynamoDB on-demand (same table class vibe-platform already uses
-for `governor`/`parked_tasks`); git objects and other large blobs go to
-S3. The tradeoff is explicit: anything join-shaped (admin reporting,
+**Decision: no Aurora.** Given the cost budget above, this design does
+not introduce a relational database. Control-plane data goes to DynamoDB
+on-demand (same table class vibe-platform already uses for
+`governor`/`parked_tasks`); git objects and other large blobs go to S3.
+The tradeoff is explicit: anything join-shaped (admin reporting,
 cross-entity analytics) needs either an access pattern designed into the
 table up front (GSIs) or a separate export path (e.g. periodic S3 export
 queried via Athena) — there is no ad hoc query escape hatch once this is
@@ -59,44 +76,79 @@ built. If a genuine join-heavy requirement shows up during Phase 4 that
 can't be reasonably served by DynamoDB access patterns, that's the
 trigger to revisit this decision, not a default fallback to Aurora.
 
+## Rejected: standing warm-pool architecture
+
+An earlier draft of this design ran session actors and sandboxes on a
+pool of long-lived, always-warm ECS Fargate Spot tasks — a two-tier model
+(a small generic warm pool for new sessions, plus per-session
+UI-activity-driven keep-warm) intended to give instant preview claims
+with no cold start. It's rejected under the cost budget above: even one
+always-warm sandbox-class Fargate task (4 vCPU/8 GB, matching vibesdk's
+current CF Container spec) costs ~$50/month on Spot — half the entire
+budget for a single task, before any session-worker, control-plane, or
+storage cost is counted. **Fargate bills reserved capacity by the second,
+regardless of activity** — there is no Fargate equivalent of a Durable
+Object's free hibernation between messages, so any architecture built on
+standing warm Fargate capacity is structurally incompatible with this
+budget once there's more than a couple of concurrent users.
+
+**Accepted tradeoff:** replacing it means giving up instant preview
+claims for brand-new or long-evicted sessions. A new or reconnecting
+session pays a real cold start (image pull + boot, likely 20-60s) instead
+of claiming a pre-warmed slot. Active sessions being actively viewed do
+not pay this cost repeatedly — see Tier 2 below, which is retained.
+
 ## What vibe-platform already provides that we should reuse as-is
 
 - VPC, private subnets, shared ALB with host-based routing, ACM/TLS —
-  `environments/core`.
-- ECS cluster (Fargate + Fargate Spot).
-- `modules/app-blue-green` — ECR + ECS service + task def + blue/green
-  target groups + CodeDeploy canary + ABAC task role. This is the right
-  shape for vibesdk's own control-plane service (the ported Worker) and,
-  separately, is *already the right shape* for hosting each user-generated
-  app.
+  `environments/core`. Under this design the ALB's job narrows to routing
+  sandbox preview traffic (host/path-based to whichever ECS task is
+  currently running a given session's dev server) — the control-plane
+  API/WS entrypoint moves off ECS/ALB entirely (see below), so ALB cost
+  for vibesdk is close to the existing shared-platform marginal cost, not
+  a new dedicated fleet.
+- ECS cluster (Fargate Spot) — used only for on-demand, no-floor sandbox
+  tasks (see Cost model). Not used for a standing worker/session-actor
+  pool anymore.
+- `modules/app-blue-green` — reserved for apps a user explicitly
+  "deploys" long-term (not ephemeral previews), where its ECR/CodeDeploy
+  canary/blue-green shape is still the right fit.
 - SSM Parameter Store for config/secrets, DynamoDB on-demand tables for
   operational metadata, CodeArtifact for npm/pip package caching, WAF.
 - The governor/token-budget pattern (Phase 4) is a reusable template for
   vibesdk's own per-user rate limiting, even though vibe-platform's
   instance of it is scoped to the platform's own agent spend.
 
+**Net new to vibe-platform's existing infra, not currently part of the
+Dark Factory stack:** API Gateway (HTTP + WebSocket APIs) and Lambda as
+the primary compute for the control plane and session actors — see
+Component mapping below. These need to be added to
+`environments/core` (or a vibesdk-specific stack) rather than assumed
+available.
+
 What vibe-platform does **not** provide, and vibesdk needs new: a fast,
 programmatic per-generated-app provisioning path. vibe-platform's model
 is "onboarding a new app = a human/agent commits
-`environments/apps/<name>/main.tf` and runs `terraform apply`" — that's
-fine for a handful of long-lived platform apps, but vibesdk creates and
-tears down a new "app" (or previews one) on the order of every user
-session. A Terraform apply per user click is not viable. This is called
-out explicitly as an open design question below.
+`environments/apps/<name>/main.tf` and runs `terraform apply`" — fine for
+a handful of long-lived platform apps, not for vibesdk's per-session
+preview flow. Under this design that path is: an `ecs:RunTask` call from
+the provisioning/routing Lambda, launching a sandbox task fresh, on
+demand — no Terraform apply per session, no standing pool to claim from
+either.
 
 ## Component mapping and migration plan
 
 | vibesdk component | AWS target | Effort/risk |
 |---|---|---|
-| Worker entrypoint | Containerize (Node/Hono or similar), run as an ECS Fargate (Spot) service behind the shared ALB via `app-blue-green` | Medium — mechanical, ALB supports WebSocket passthrough natively |
+| Worker entrypoint (HTTP + WS) | API Gateway (HTTP API + WebSocket API) + Lambda | Medium — no reserved capacity, near-$0 at low traffic; WS push replies go through `apigatewaymanagementapi:PostToConnection` |
 | D1 + Drizzle | DynamoDB on-demand, single-table design keyed by entity access patterns | Medium-High — no relational engine, so this is a query-layer rewrite, not a dialect swap (see decision above) |
 | R2 | S3 | Low |
 | KV | DynamoDB on-demand | Low |
 | `DORateLimitStore` | DynamoDB conditional-update token bucket (same pattern as vibe-platform's governor) | Low-Medium |
-| `UserSecretsStore` | Same crypto (VMK/SK hierarchy, AES-GCM/XChaCha20-Poly1305) unchanged; storage moves to DynamoDB; consider KMS-wrapping the top-level key | Medium — crypto logic ports directly; piggybacks on the session-worker pinning boundary (see decision in actor-model section) rather than a separate stateful service |
-| CF Sandbox / Containers (`UserAppSandboxService`) | Ephemeral ECS Fargate (Spot) tasks drawn from the two-tier warm pool, reachable via ALB path/host routing for preview URLs | Medium-High — CF's sandbox SDK handles port exposure/proxying/token validation for free; on ECS this needs to be built (a thin router service mapping session ID → task IP:port, or an ALB rule per active preview). See warm-pool decision below. |
-| Deployer (`wrangler.jsonc` + Workers-for-Platforms dispatch) | Programmatic per-app provisioning against the `app-blue-green` module — **not** literal `terraform apply` per app (see open question below) | High — biggest divergence from how vibe-platform currently onboards apps |
-| `CodeGeneratorAgent` (Durable Object actor + state machine) | No direct analog. See dedicated section below. | **High — this is the critical-path risk for the whole migration** |
+| `UserSecretsStore` | Same crypto (VMK/SK hierarchy, AES-GCM/XChaCha20-Poly1305) unchanged; storage moves to DynamoDB. See decision 4 below — the Lambda model actually simplifies this. | Medium — crypto logic ports directly |
+| CF Sandbox / Containers (`UserAppSandboxService`) | On-demand ECS Fargate Spot tasks, launched fresh per session via `RunTask`, no standing pool, reachable via ALB path/host routing for preview URLs | Medium-High — CF's sandbox SDK handles port exposure/proxying/token validation for free; on ECS this needs to be built (a thin router mapping session ID → task IP:port). See Cost model for sizing. |
+| Deployer (`wrangler.jsonc` + Workers-for-Platforms dispatch) | Programmatic provisioning: `RunTask` for ephemeral previews, `app-blue-green` module for apps a user explicitly deploys long-term | High — biggest divergence from how vibe-platform currently onboards apps |
+| `CodeGeneratorAgent` (Durable Object actor + state machine) | Lambda, invoked per WebSocket message, no standing worker process. See dedicated section below. | **High — this is the critical-path risk for the whole migration** |
 | Git-per-session (isomorphic-git on DO SQLite) | Isomorphic-git unchanged; filesystem adapter re-targeted at S3 only (chunked objects + manifest, no DynamoDB) | Medium — must reach full feature parity with today (see decision 3) |
 
 ## The actor-model gap (critical path)
@@ -114,116 +166,90 @@ into `CodeGeneratorAgent`:
    messages and come back with `state` restored, at effectively no cost,
    and CF's `agents` SDK handles WS reconnect/state-resync on top.
 
-None of these exist natively in ECS/Lambda. Proposed replacement:
+None of these exist natively in Lambda or ECS. Proposed replacement,
+**Lambda-first**:
 
-- **Compute**: a pool of long-lived ECS Fargate Spot tasks ("session
-  workers"), each capable of holding N active sessions in memory
-  (similar to how a Node process can hold many objects). A lightweight
-  router (could live in the ALB-fronted control-plane service) maps
-  `sessionId → workerTaskId` via an explicit routing table (DynamoDB),
-  not ALB sticky sessions — see decision below.
+- **Compute**: a Lambda function invoked once per inbound WebSocket
+  message (via API Gateway WebSocket's `$connect`/`$default`/`$disconnect`
+  routes) or per HTTP request. No standing worker process, no pool to
+  size — this is the direct AWS analog of a DO's hibernate-between-
+  messages behavior, since Lambda has zero idle cost between invocations
+  by construction, unlike a Fargate task.
+- **Connection routing**: API Gateway assigns each WebSocket connection a
+  `connectionId`; a DynamoDB table maps `connectionId → sessionId` (set
+  on `$connect`, cleaned up on `$disconnect`). This replaces the earlier
+  "pin a session to a worker task" concept entirely — there's no task to
+  pin to anymore. The Lambda handling a given message looks up the
+  session, processes it, and pushes any response back via
+  `PostToConnection` using the stored `connectionId`.
 - **Serialization**: per-session mutation lock via a DynamoDB conditional
   write (`sessionId` as key, optimistic lock) — enforces the DO's
-  single-threaded guarantee explicitly instead of getting it for free.
+  single-threaded guarantee explicitly, same as before, just now guarding
+  against concurrent Lambda invocations for the same session instead of
+  concurrent access to a shared task.
 - **Durability**: state blob persisted to DynamoDB, git object chunks to
-  S3, on every mutation — same shape as today's DO-SQLite writes, just an
-  explicit write instead of an implicit one.
-- **Rehydration**: on task restart, session migration, or Spot
-  interruption, reload state from DynamoDB/S3 before accepting the next
-  message — this replaces DO hibernation. Reconnect-and-resync WS logic
-  (currently handled by the CF `agents` SDK) needs to be reimplemented;
-  this is a real chunk of new code, not a config change.
-
-**Decision: Fargate Spot, 100% — no on-demand baseline.** This matches
-vibe-platform's own stated constraint ("Fargate Spot over EC2") and is
-close to free correctness-wise: the design above already externalizes
-all session state to DynamoDB/S3 so a worker can rehydrate on any node,
-which is exactly what's needed to survive a Spot interruption (2-minute
-reclaim notice) — on notice, stop accepting new messages for the
-sessions on that task, let in-flight mutations finish and persist, and
-let the router reassign those sessions to another warm worker.
-
-Accepted downsides of skipping an on-demand floor, since they're real and
-worth stating rather than glossing over:
-- Spot capacity shortages can be *correlated* across an AZ/instance
-  family during a demand crunch — replacement tasks can fail to launch
-  fleet-wide, not just one at a time, which with zero on-demand floor
-  means a window where no warm slot is obtainable at all, not just a
-  slower one.
-- Interruptions cluster in practice; a simultaneous wave of reclaims can
-  produce a rehydration stampede against DynamoDB/S3 and the router at
-  once.
-- No AWS SLA on Spot availability, and shortages tend to correlate with
-  high-demand periods — which may coincide with peak product usage.
-
-Mitigations adopted instead of an on-demand floor: diversify the Spot
-request across multiple instance types/AZs (capacity-optimized
-allocation strategy) to decorrelate interruptions, and act on Fargate's
-rebalance-recommendation signal proactively (it fires before the hard
-2-minute reclaim notice, giving the router a head start on reassignment).
-Treat "add a small on-demand floor" as the reactive fix if production
-monitoring shows real user-facing incidents from this — not something to
-pre-build speculatively.
+  S3, on every mutation — same shape as today's DO-SQLite writes.
+- **Rehydration**: happens on *every* invocation now, not just after an
+  eviction or interruption — each Lambda invocation loads session state
+  fresh (Lambda execution-environment reuse may opportunistically keep a
+  warm in-memory cache between back-to-back messages on the same
+  session, but this is best-effort, never assumed). This is a real
+  latency concern for large sessions (big state blob, deep git history)
+  and needs the Phase 3 spike to establish actual per-message latency
+  with realistic state sizes — mitigations include keeping the
+  DynamoDB-resident state blob small/incremental and only pulling large
+  git objects from S3 on operations that actually need them, rather than
+  eagerly on every message.
 
 This is the single highest-risk, highest-effort piece of the whole
 migration and should be prototyped before committing to the rest of the
-plan (see Phase 3 below).
+plan (see Phase 3 below) — the Lambda-per-message latency profile in
+particular needs real measurement, not an estimate.
 
 ## Design decisions (resolved)
 
-1. **Per-generated-app provisioning speed — warm blue/green pool, kept
-   warm by UI activity, not blind capacity.** vibe-platform's onboarding
-   flow (commit Terraform, `apply`) is too slow for vibesdk's per-session
-   deploy/preview flow, and sizing a generic always-warm pool for
-   anticipated concurrency wastes capacity that sits idle. Decision
-   is two tiers:
-   - **Tier 1 — generic warm pool.** A small pool of pre-warmed, generic
-     sandbox/session-worker tasks running on Spot capacity ("blue" and
-     "green"), sized only for brand-new or cold-evicted sessions to claim
-     instantly — no image pull, no cold boot. Replenished asynchronously
-     in the background to maintain a target warm count. The blue/green
-     split does double duty as the base-image rollout mechanism (drain
-     and repoint new claims to the freshly warmed pool, retire the old
-     one) without disrupting live sessions — same conceptual pattern as
-     `app-blue-green`'s canary deploys, applied to a warm capacity pool
-     instead of a versioned service swap.
-   - **Tier 2 — activity-based keep-warm for live sessions.** Once a
-     session claims a slot (e.g. the user clicks "preview"), the client
-     sends a lightweight heartbeat — driven by the Page Visibility API,
-     so it only fires while the preview UI is actually visible/focused —
-     that resets an idle-eviction timer on that session's task. As long
-     as the UI stays active, the task stays warm and pinned, no
-     reprovisioning needed on reconnect. When the tab is backgrounded or
-     closed, the heartbeat stops; after a grace period with no heartbeat,
-     the task is released back to Tier 1 (or torn down) since state is
-     already durable in DynamoDB/S3. Re-establishing a session after
-     eviction is the same rehydration path as a Spot reclaim (see
-     actor-model section) — just triggered by inactivity instead of
-     infrastructure churn.
+1. **Per-generated-app provisioning speed — on-demand only, no standing
+   pool.** Superseded from the earlier warm-pool draft (see "Rejected"
+   above) by the cost budget. Decision is now a single tier:
+   - **Sandbox launch.** A session's sandbox task is launched fresh via
+     `ecs:RunTask` (Fargate Spot, smallest viable size — see Cost model)
+     the moment it's needed, with no pre-warmed pool to claim from. This
+     accepts a real cold start (~20-60s) for new/reconnecting sessions.
+   - **Tier 2 — activity-based keep-warm for live sessions, retained.**
+     Once a session's sandbox task is running (e.g. the user clicks
+     "preview"), the client sends a lightweight heartbeat — driven by the
+     Page Visibility API, so it only fires while the preview UI is
+     actually visible/focused — that resets an idle-eviction timer on
+     that task. As long as the UI stays active, the task stays warm and
+     pinned, no re-launch needed on reconnect within the same active
+     session. When the tab is backgrounded or closed, the heartbeat
+     stops; after a grace period with no heartbeat, the task is torn down
+     (not returned to a pool — there isn't one) since state is already
+     durable in DynamoDB/S3. Re-establishing after teardown pays the same
+     cold start as a brand-new session.
 
-   Terraform still only describes the shared scaffolding (cluster, ALB,
-   IAM roles, warm-pool ASG/capacity provider config); claiming a slot,
-   heartbeat handling, and eviction are runtime AWS SDK calls from the
-   provisioning/routing service, not a Terraform apply. The full
-   `app-blue-green` module (ECR, CodeDeploy canary, ALB listener rules)
-   is reserved for apps a user explicitly "deploys" long-term, not
-   ephemeral previews.
-2. **WebSocket session pinning — explicit router, not ALB stickiness.**
-   ALB sticky sessions are cookie-based and don't give the connection-
-   level pinning a long-lived WS needs. Decision: a `sessionId →
-   workerTaskId` lookup table in DynamoDB, consulted by the routing layer
-   on every new connection and updated on rebalance/Spot reclaim.
-3. **Git storage medium — S3 only, no DynamoDB in the git path.** The
-   original two-store split (S3 for blobs, DynamoDB for refs) isn't
-   needed: S3 alone already gives strong read-after-write consistency on
-   both puts and overwrites, and prefix-delimited `ListObjectsV2` covers
-   `readdir` — the two things a DynamoDB refs table would otherwise be
-   there for. The filesystem adapter isomorphic-git needs is re-targeted
-   entirely at S3, mirroring today's design: each file's chunks (same
-   1.8MB chunking scheme) as S3 objects under a path prefix, with a small
-   manifest object per path holding what chunk_index 0 holds today
-   (parent_path, is_dir, size, mtime). This is a straight port of the
-   existing adapter's storage backend, not a redesign of its logic.
+   Base-image rollout (previously the blue/green pool's second job) is
+   now just an ECR image tag selected at `RunTask` launch time, with a
+   canary-style percentage of new launches pointed at the new tag —
+   no CodeDeploy needed since these are ephemeral tasks, not a long-running
+   service.
+2. **WebSocket session routing — API Gateway connection table, not
+   worker pinning.** Superseded from "ALB sticky sessions vs. custom
+   router" by the Lambda-first compute model: there's no worker task to
+   pin a session to anymore. Routing reduces to the standard API Gateway
+   WebSocket pattern — a `connectionId → sessionId` DynamoDB table,
+   consulted on each message and used for `PostToConnection` pushes.
+3. **Git storage medium — S3 only, no DynamoDB in the git path.**
+   Unchanged from the earlier decision. S3 alone already gives strong
+   read-after-write consistency on both puts and overwrites, and
+   prefix-delimited `ListObjectsV2` covers `readdir` — the two things a
+   DynamoDB refs table would otherwise be there for. The filesystem
+   adapter isomorphic-git needs is re-targeted entirely at S3, mirroring
+   today's design: each file's chunks (same 1.8MB chunking scheme) as S3
+   objects under a path prefix, with a small manifest object per path
+   holding what chunk_index 0 holds today (parent_path, is_dir, size,
+   mtime). This is a straight port of the existing adapter's storage
+   backend, not a redesign of its logic.
 
    Feature parity with today is a hard requirement, not a nice-to-have:
    full commit history, `GitVersionControl.commit()/reset()/log()/show()`,
@@ -232,107 +258,133 @@ plan (see Phase 3 below).
 
    Known tradeoff: isomorphic-git does many small reads during tree
    walks, and S3 request latency/cost per object is higher than a local
-   DO-SQLite row read. Mitigation: since Tier 2 of decision 1 already
-   keeps an active session's task warm and pinned in memory for the
-   duration of UI activity, that same task can hold an in-memory LRU
-   cache of recently read git objects — S3 round-trips only happen on a
-   cold read or on rehydration after eviction, not on every git
-   operation during an active session.
-4. **Secrets vault session-affinity — piggyback on session-worker
-   pinning.** `UserSecretsStore`'s in-memory `VaultSession` (SK,
-   encrypted VMK) needs the same connection-level pinning as the main
-   agent for the life of a session. Decision: reuse the session-worker
-   router from #2 rather than standing up a separate stateful service —
-   one fewer moving part, and the trust boundary (in-memory-only key
-   material, never persisted) is preserved either way since it rides on
-   the same worker process, not a shared store.
-5. **Cost model — Spot only, no on-demand floor, no Aurora.** Resolved
-   in favor of 100% Fargate Spot for session workers/sandboxes (see
-   actor-model section, including the accepted downsides and mitigations
-   written out there) and DynamoDB/S3 over Aurora for all persistence
-   (see decision above). A concrete cost estimate (expected concurrent
-   sessions × Tier-1 warm-pool size × Spot task-hours × DynamoDB/S3
-   usage) should still be run before Phase 2 starts to size the Tier-1
-   pool, but the architecture-level question — no always-on relational
-   database, no always-on compute fleet — is settled.
+   DO-SQLite row read. Mitigation: while a sandbox task is warm and
+   pinned under Tier 2, it can hold an in-memory LRU cache of recently
+   read git objects — S3 round-trips only happen on a cold read or after
+   teardown, not on every git operation during an active session. The
+   Lambda-based session actor (decision above) does not get this same
+   mitigation for free, since it has no persistent process between
+   messages — worth watching during the Phase 3 latency spike.
+4. **Secrets vault — no session-affinity requirement under the Lambda
+   model.** The original DO-based `UserSecretsStore` relies on holding
+   `encryptedVMK` in one process's memory for a session's lifetime,
+   which needed pinning under the earlier Fargate-pool design. Under the
+   Lambda model, that requirement goes away entirely, and arguably
+   improves on the original: store `encryptedVMK` (ciphertext, safe to
+   persist) in DynamoDB with a TTL matching today's `SESSION_TIMEOUT_MS`;
+   require the client to present its session key (SK) on each
+   secret-access request rather than expecting the server to remember it;
+   decrypt in-memory for the duration of that single Lambda invocation
+   only, and never persist the decrypted VMK or the SK itself anywhere.
+   The "DB dump = useless encrypted blobs, server memory needs client SK"
+   property from the original design is fully preserved — the "server
+   memory" in that property just becomes "one Lambda invocation's memory"
+   instead of "one DO's memory for the session's duration," and no
+   pinned worker is needed to make that true.
 
-   **On-demand-floor cost, quantified.** Using the sandbox spec vibesdk
-   already runs today (4 vCPU / 8 GB, per `wrangler.jsonc`'s `containers`
-   block) against Fargate list pricing (Linux/x86, us-east-1 reference —
-   ap-southeast-2 runs ~10-20% higher, reprice before committing):
-   a sandbox-class task costs roughly $144/task-month on-demand vs. $50
-   on Spot (~65% off) — about $94/task-month delta, or ~$187-$937/month
-   for a 2-10 task floor. Lighter session-worker tasks (1 vCPU / 2 GB)
-   are proportionally cheaper (~$36 vs. ~$13/task-month). This is why
-   Spot-only was chosen over adding a floor: on-demand costs ~3x Spot for
-   the same reserved capacity.
+## Cost model
 
-   **The more important structural point:** this on-demand-vs-Spot delta
-   is *secondary* to a bigger difference between the two platforms.
-   Cloudflare bills Durable Objects and Containers by active duration —
-   a hibernating DO or an idle-but-provisioned Container costs ~nothing.
-   Fargate has no equivalent: a task (Spot or on-demand) bills its full
-   vCPU/GB rate for every second it's provisioned and warm, whether or
-   not it's handling a request that second. So the real cost lever in
-   this design isn't the Spot/on-demand choice — it's **minimizing
-   aggregate warm-task-hours** across both tiers (a tight Tier-2
-   idle-eviction grace period, a small Tier-1 floor, genuine scale-to-zero
-   when nothing's active). A generous grace period or an oversized Tier-1
-   pool could plausibly cost more in aggregate than the Spot/on-demand
-   choice ever would. Getting a real head-to-head number against current
-   spend requires pulling vibesdk's actual Cloudflare usage (DO
-   duration-GB-s, D1 reads/writes, Containers vCPU-seconds, R2
-   storage/egress) from the account's Analytics & Billing — not available
-   from this repo alone, and needed before Phase 2 cost sign-off.
+Numbers below use AWS list pricing (Linux/x86, us-east-1 reference —
+ap-southeast-2 runs ~10-20% higher; reprice before committing) and an
+**illustrative low-to-moderate usage scenario**, not real vibesdk traffic
+— that's still a missing input (see Remaining open questions).
+
+| Component | Basis | Estimated $/month |
+|---|---|---|
+| Control-plane compute (API Gateway + Lambda) | Perpetual Lambda free tier (1M requests + 400,000 GB-s/month, forever) likely absorbs most traffic at this scale; API Gateway is ~$1/million HTTP requests, ~$1/million WS messages + connection-minutes | $0-5 |
+| Session-actor compute (Lambda, per WS message) | Same free-tier logic as above; this replaced the entire session-worker Fargate pool from the rejected draft | $0-5 |
+| DynamoDB (control-plane data + session state + connection table + rate limiting) | On-demand, low request volume | $1-5 |
+| S3 (git objects, blobs) | Low storage + request volume at this scale | $1-2 |
+| Sandbox compute (Fargate Spot, on-demand `RunTask`, 0.5 vCPU/1 GB — down-sized from the 4 vCPU/8 GB CF spec, see note below) | ~$0.0086/active-hour; even 1,000 active preview-hours/month across all users is ~$8.60 | $2-10 |
+| CloudWatch Logs | Short retention (7 days, matching `app-blue-green`'s default), volume-tuned logging | $2-5 |
+| ALB | Shared with other vibe-platform apps already running — marginal cost for vibesdk's sandbox-preview routing is close to $0 incremental; ~$16-20/month if costed as a standalone dedicated ALB | $0-20 |
+
+**Total: realistically $10-45/month** at low-to-moderate usage — comfortably
+under the $100 budget, with the range depending mainly on whether ALB is
+counted as shared-platform overhead or a dedicated cost. Unlike the
+rejected warm-pool draft (~$1,300+/month baseline regardless of traffic),
+this total scales with actual usage: near-$0 at near-$0 traffic, growing
+roughly linearly as real concurrent sessions increase.
+
+**Sandbox sizing note:** 0.5 vCPU/1 GB is a placeholder smaller than
+vibesdk's current CF Container spec (4 vCPU/8 GB). Whether that's enough
+to run a real dev server (`npm run dev`, install, build) needs validation
+during Phase 3/5 — if the smaller size can't handle build-heavy moments,
+the design may need the tiered approach discussed earlier (small default
+footprint, a separate short-lived heavier task only for actual
+build/install operations) rather than a single fixed size.
+
+**Not adopted, and why:** two ideas from the earlier cost-reduction
+brainstorm are superseded by this redesign rather than layered on top of
+it. Bin-packing multiple sessions onto one Fargate task doesn't apply
+once there's no standing session-worker task at all. A Spot-with-overflow
+capacity-provider strategy for a near-zero-cost resilience floor is still
+architecturally available for the sandbox tier if Phase 3 finds Spot
+availability to be a real problem, but isn't part of the baseline design
+below the $100 target.
 
 ## Remaining open questions
 
-- **Current Cloudflare spend baseline** (decision 5) — pull actual usage
-  from the vibesdk Cloudflare account (DO duration-GB-s, D1 reads/writes,
-  Containers vCPU-seconds, R2 storage/egress) to get a real head-to-head
-  cost comparison against the AWS estimate above. This is the single
-  highest-value missing input for the whole cost model and isn't
-  obtainable from the codebase — needs dashboard/billing access.
-- Instance-type/AZ diversification plan for the Spot fleet (decision 5)
-  — needed to make the "decorrelate interruptions" mitigation concrete;
-  should come from historical Spot interruption rates for candidate
-  instance families, gathered during Phase 3.
-- Idle-eviction grace period for Tier 2 keep-warm (decision 1) — how
-  long to hold a session's task warm after the UI heartbeat stops before
-  releasing it back to Tier 1. Too short defeats the point (users
-  briefly switching tabs trigger cold rehydration); too long wastes Spot
-  capacity on abandoned tabs. Needs a real number from usage data or a
-  Phase 3 trial, not a guess.
-- Target size for the Tier-1 generic warm pool (decision 1) — depends on
-  the rate of brand-new/cold-evicted session arrivals, which should come
-  from current vibesdk production metrics rather than a guess.
+- **Current Cloudflare spend baseline** — pull actual usage from the
+  vibesdk Cloudflare account (DO duration-GB-s, D1 reads/writes,
+  Containers vCPU-seconds, R2 storage/egress) for a real head-to-head
+  comparison against the AWS estimate above. Still the single
+  highest-value missing input, and still not obtainable from the
+  codebase — needs dashboard/billing access.
+- **Real vibesdk traffic/concurrency numbers** — the cost model above is
+  illustrative. Actual concurrent session counts and active-preview-hours
+  are needed to replace the illustrative range with a real projection,
+  and to size Lambda memory/timeout and sandbox task sizing correctly.
+- **Lambda-per-message latency with realistic state sizes** — the actor
+  model's biggest open risk. Needs the Phase 3 spike to measure actual
+  latency for sessions with large state blobs / deep git history, since
+  every message now pays a rehydration cost that used to be free (DO
+  in-memory state).
+- **Cold-start UX tolerance** — is a 20-60s cold start acceptable for new
+  or long-evicted sessions, or does it need client-side mitigation (a
+  "waking up" state, optimistic UI, pre-emptive launch on an earlier
+  signal like "user started typing a prompt")? This is a product decision
+  as much as an infra one.
+- **Idle-eviction grace period for sandbox Tier 2** — how long to hold a
+  session's sandbox task warm after the UI heartbeat stops before tearing
+  it down. Too short defeats the point (brief tab switches trigger a full
+  cold start); too long wastes Spot capacity on abandoned tabs. Needs a
+  real number from usage data or a Phase 3 trial.
+- **Sandbox task sizing** — whether 0.5 vCPU/1 GB is sufficient for real
+  dev-server/build workloads, or whether a tiered small/heavy split is
+  needed (see Cost model note above).
+- **ALB cost accounting** — whether to treat it as fully shared-platform
+  overhead ($0 incremental) or partially attribute its cost to vibesdk,
+  relevant mainly for cross-app cost allocation, not the architecture
+  itself.
 
 ## Phased plan
 
 1. **Design doc (this document)** — reviewed and agreed before any
    infra or code changes.
-2. **Infra scaffolding** — add `environments/apps/vibesdk` in
-   vibe-platform, reusing `environments/core`'s VPC/ALB/ECS
-   cluster/`app-blue-green` module. Provisions the hosting shell only:
-   no vibesdk-specific compute or data yet.
-3. **Actor-model spike** — prototype the session-worker replacement for
-   `CodeGeneratorAgent` (routing, locking, DynamoDB/S3-backed state,
-   Spot-interruption handling, reconnect/resync) in isolation, before
-   porting the full agent. This is the de-risking step; if it doesn't
-   work well, it changes the rest of the plan. Also where the remaining
-   open questions (Spot diversification plan, idle-eviction grace
-   period, Tier-1 pool sizing) get real numbers.
+2. **Infra scaffolding** — add API Gateway (HTTP + WebSocket) and the
+   Lambda execution role/scaffolding to vibe-platform (new to the
+   platform, see above), plus `environments/apps/vibesdk` for the
+   ECS/ALB pieces still needed (on-demand sandbox tasks, preview
+   routing). Provisions the hosting shell only: no vibesdk-specific
+   compute or data yet.
+3. **Actor-model spike** — prototype the Lambda-per-message replacement
+   for `CodeGeneratorAgent` (connection routing, locking, DynamoDB/S3-backed
+   state, rehydration-on-every-message) in isolation, before porting the
+   full agent. This is the de-risking step; if Lambda-per-message latency
+   doesn't hold up under realistic state sizes, it changes the rest of
+   the plan. Also where the remaining open questions (latency, cold-start
+   UX tolerance, idle-eviction grace period, sandbox sizing) get real
+   answers.
 4. **Stateless surface port** — D1→DynamoDB (query-layer rewrite, 10
    migrations' worth of schema to re-derive as access patterns), R2→S3,
-   KV→DynamoDB, containerize the Worker entrypoint, deploy it as an ECS
-   Fargate Spot service via `app-blue-green`.
-5. **Sandbox + deploy port** — stand up the two-tier warm pool
-   (decision 1: generic Tier-1 pool plus UI-heartbeat-driven Tier-2
-   keep-warm), replace `UserAppSandboxService` with ECS-task-backed
-   sandboxes drawn from it, replace the wrangler/dispatch deployer with
-   the AWS provisioning path from decision 1, and port the git
-   fs-adapter to S3-only storage (decision 3) with parity verified
-   against today's `GitVersionControl` behavior.
+   KV→DynamoDB, port the Worker entrypoint to API Gateway + Lambda.
+5. **Sandbox + deploy port** — replace `UserAppSandboxService` with
+   on-demand `RunTask`-launched sandboxes plus Tier-2 keep-warm (decision
+   1), replace the wrangler/dispatch deployer with the AWS provisioning
+   path from decision 1, and port the git fs-adapter to S3-only storage
+   (decision 3) with parity verified against today's `GitVersionControl`
+   behavior.
 6. **Cutover** — once parity is verified end-to-end in a non-prod
    environment, plan the actual traffic cutover (DNS, data migration for
    existing D1/DO data if any needs to carry over).
