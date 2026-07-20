@@ -173,3 +173,11 @@ recent first:
 - **Current Cloudflare spend and real traffic/concurrency numbers** —
   both needed to validate the cost budget and success criteria against
   reality, not just the illustrative model. See technical doc.
+- **App search/discovery quality** — D1's title/description search index
+  has no direct DynamoDB equivalent (see
+  [DynamoDB schema doc](aws-dynamodb-schema.md)). A real search backend
+  (e.g. OpenSearch) likely breaks the cost budget; the alternative is
+  degraded search (prefix-match or client-side filtering) for the MVP.
+  Whether that degradation is acceptable to users, or whether app
+  discovery matters enough to justify the extra cost, is a product call
+  not yet made.

@@ -421,7 +421,9 @@ guess. These are starting points, not final tuning:
    to real AWS; see each directory's README for what's still needed
    before it can be.
 4. **Stateless surface port** — D1→DynamoDB (query-layer rewrite, 10
-   migrations' worth of schema to re-derive as access patterns), R2→S3,
+   migrations' worth of schema to re-derive as access patterns — target
+   schema designed in
+   [docs/aws-dynamodb-schema.md](aws-dynamodb-schema.md)), R2→S3,
    KV→DynamoDB, port the Worker entrypoint to API Gateway + Lambda.
 5. **Sandbox + deploy port** — replace `UserAppSandboxService` with
    on-demand `RunTask`-launched sandboxes plus Tier-2 keep-warm (decision
