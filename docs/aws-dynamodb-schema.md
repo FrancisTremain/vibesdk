@@ -126,13 +126,29 @@ indexes plus (implicitly) some cleanup job.
 | Item type | PK | SK | TTL source |
 |---|---|---|---|
 | OAuth state | `OAUTHSTATE#<state>` | `STATE` | `expires_at` |
-| Auth attempt | `AUTHATTEMPT#<identifier>` | `ATTEMPT#<attemptedAt>` | Short fixed TTL (e.g. 24h) — rate-limit/lockout logic reads a bounded recent window via `Query` with an SK range, not the full history. |
+| Auth attempt | `AUTHATTEMPT#<identifier>` | `ATTEMPT#<attemptedAt>#<randomId>` | Short fixed TTL (24h) — lockout logic queries the whole (TTL-bounded, naturally small) recent partition and filters by timestamp client-side, not an SK range condition. |
 | Password reset token | `PWRESET#<tokenHash>` | `TOKEN` | `expires_at` |
 | Email verification token | `EMAILVERIFY#<tokenHash>` | `TOKEN` | `expires_at` |
 | Verification OTP | `OTP#<email>` | `OTP#<createdAt>` | `expires_at` |
 
 No GSIs needed — every access pattern here is a direct key lookup or a
-bounded SK-range query.
+bounded partition query.
+
+**Corrected after building the actual port** (`aws/db-auth-flows/`):
+the auth-attempt SK gained a `#<randomId>` suffix — multiple attempts
+can land in the same millisecond, and the SK needs to stay unique per
+item. The originally proposed "read via an SK range" access pattern
+also turned out awkward against that suffix, so `AuthAttemptStore`
+queries the identifier's whole partition (already TTL-bounded to 24h,
+so never large) and filters by `attemptedAt` client-side instead —
+simpler than a real range condition and behaviorally identical.
+
+**Status:** all five item types above are ported and tested (17 tests)
+in [`aws/db-auth-flows/`](../aws/db-auth-flows/) — storage primitives
+only, not `AuthService` itself. See that package's README for why
+`AuthService`'s orchestration layer (register/login/OAuth callback
+flows, `PasswordService`, OAuth provider clients) is a separate, larger
+piece of work not attempted here.
 
 ## Table 4: `vibesdk-model-config`
 
