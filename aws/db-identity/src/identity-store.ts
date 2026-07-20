@@ -87,8 +87,14 @@ export class UserStore {
 	// USER MANAGEMENT
 	// ========================================
 
-	async createUser(userData: NewUser): Promise<User> {
-		const id = newId();
+	/**
+	 * `id` is normally generated internally. Callers may pass one
+	 * explicitly when they need it before the write completes -- e.g.
+	 * an email/password signup that self-references its own id as
+	 * `providerId` (matching AuthService.register's original behavior,
+	 * where `providerId: userId` is set at insert time).
+	 */
+	async createUser(userData: NewUser, id: string = newId()): Promise<User> {
 		const now = Date.now();
 		const user: User = {
 			...userData,
@@ -321,8 +327,15 @@ export class UserStore {
 	// SESSION MANAGEMENT
 	// ========================================
 
-	async createSession(sessionData: NewSession): Promise<Session> {
-		const id = newId();
+	/**
+	 * `id` is normally generated internally. Callers may pass one
+	 * explicitly when they need the session id before the write
+	 * completes -- e.g. to sign a JWT whose `sessionId` claim must match
+	 * the persisted session's own id (matching AuthService's original
+	 * behavior, where `SessionService.createSession` generates the id
+	 * once and uses it for both).
+	 */
+	async createSession(sessionData: NewSession, id: string = newId()): Promise<Session> {
 		const session: Session = {
 			...sessionData,
 			id,

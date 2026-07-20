@@ -4,8 +4,10 @@
   "version": "0.0.1",
   "description": "Port of PasswordService (worker/utils/passwordService.ts) -- password hashing/verification/strength validation. Pure crypto/logic, no AWS SDK dependency. Not part of the main vibesdk build.",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js",
+    "build": "tsc --emitDeclarationOnly --outDir dist && esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts --root ."
   },

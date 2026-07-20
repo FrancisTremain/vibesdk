@@ -53,16 +53,18 @@ several of these.
 | API key hash lookup | `APIKEYHASH#<keyHash>` | `LOOKUP` | `{ userId, apiKeyId }`. Same reasoning as session token lookup — this is the per-request auth check. |
 | API key ID lookup | `APIKEYID#<keyId>` | `LOOKUP` | `{ userId }`. Same gap, same fix as the session ID lookup above — `ApiKeyService.getApiKeyById(keyId)` needs it. |
 
-`UserService` and `ApiKeyService` are ported and tested against this
-table shape in [`aws/db-identity/`](../aws/db-identity/) (20 tests,
-including the `TransactWriteItems`-backed uniqueness guarantees for
+`UserService`, `ApiKeyService`, and the storage layer of
+`SessionService` are ported and tested against this table shape in
+[`aws/db-identity/`](../aws/db-identity/) (38 tests, including the
+`TransactWriteItems`-backed uniqueness guarantees for
 email/username/API-key-hash). The `user_oauth_identities` table (D1's
 separate multi-provider-linking table, SK `OAUTH#<provider>#<providerId>`
-nested under a user) is not part of that port — `UserService.findUser`'s
-provider lookup reads `provider`/`providerId` directly off the user
-record itself, not that table, so it wasn't needed for what's built so
-far. Still worth modeling for whenever multi-provider linking is
-ported, hence left in the table above.
+nested under a user) is now ported too, as `OAuthIdentityStore` — added
+once [`aws/auth-orchestration/`](../aws/auth-orchestration/)'s
+account-linking flows became the first real caller; `UserService.findUser`'s
+own provider lookup still reads `provider`/`providerId` directly off
+the user record, so this table is purely additive for multi-provider
+linking.
 
 GSI `by-provider` (GSI1PK=`provider`, GSI1SK=`created_at`) on the User
 item type only — supports admin-style "list users by OAuth provider,"
@@ -145,10 +147,11 @@ simpler than a real range condition and behaviorally identical.
 
 **Status:** all five item types above are ported and tested (17 tests)
 in [`aws/db-auth-flows/`](../aws/db-auth-flows/) — storage primitives
-only, not `AuthService` itself. See that package's README for why
-`AuthService`'s orchestration layer (register/login/OAuth callback
-flows, `PasswordService`, OAuth provider clients) is a separate, larger
-piece of work not attempted here.
+only. `AuthService`'s orchestration layer itself (register/login/OAuth
+callback flows, password crypto, OAuth provider clients) is ported
+separately in [`aws/auth-orchestration/`](../aws/auth-orchestration/),
+which assembles this package with `aws/db-identity`, `aws/auth-crypto`,
+and `aws/oauth-clients`.
 
 ## Table 4: `vibesdk-model-config`
 

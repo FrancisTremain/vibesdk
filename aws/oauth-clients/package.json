@@ -4,8 +4,10 @@
   "version": "0.0.1",
   "description": "Port of the OAuth provider HTTP clients (worker/services/oauth/base.ts, github.ts, google.ts) -- pure fetch-based OAuth 2.0 + PKCE flow, no AWS SDK dependency. Not part of the main vibesdk build.",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js",
+    "build": "tsc --emitDeclarationOnly --outDir dist && esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts --root ."
   },

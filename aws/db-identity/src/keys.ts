@@ -13,6 +13,8 @@ export const emailLookupPk = (email: string) => `EMAIL#${email}`;
 export const usernameLookupPk = (username: string) => `USERNAME#${username}`;
 export const oauthLookupPk = (provider: string, providerId: string) =>
 	`OAUTHLOOKUP#${provider}#${providerId}`;
+export const oauthIdentitySk = (provider: string, providerId: string) =>
+	`OAUTH#${provider}#${providerId}`;
 export const sessionIdLookupPk = (sessionId: string) => `SESSIONID#${sessionId}`;
 export const apiKeyIdLookupPk = (keyId: string) => `APIKEYID#${keyId}`;
 export const apiKeyHashLookupPk = (keyHash: string) => `APIKEYHASH#${keyHash}`;

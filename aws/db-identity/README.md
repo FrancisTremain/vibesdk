@@ -63,6 +63,40 @@ verify this directly.
   depend on the `audit_logs` table (Table 5 of the schema doc), which
   has no package built against it yet. Excluded rather than faked.
 
+## `OAuthIdentityStore` — the multi-provider-linking table
+
+`worker/database/schema.ts`'s `user_oauth_identities` table (D1's
+separate table for linking more than one OAuth provider to a user) was
+flagged in the schema doc as "still worth modeling for whenever
+multi-provider linking is ported" but not built, since nothing in the
+first four packages needed it. `aws/auth-orchestration`'s account-linking
+flows (`linkOAuthIdentity`/`unlinkOAuthIdentity`/`completeOAuthLink`,
+porting `AuthService`) are the first real caller — `oauth-identity-store.ts`
+adds `link`/`refreshEmail`/`findByProviderIdentity`/`listForUser`/`unlink`
+against the `OAUTH#<provider>#<providerId>` item type and
+`OAUTHLOOKUP#<provider>#<providerId>` lookup already designed in the
+schema doc. Deliberately storage-only, same split as everything else
+here: "is this identity already claimed, by whom" lives here; policy
+like "never implicitly bind by email" or "refuse to unlink a user's
+last login method" lives in the orchestration layer that calls it.
+
+## `createUser`/`createSession` accept an optional pre-generated `id`
+
+Found while building `aws/auth-orchestration`: the original
+`AuthService.register` generates its own `userId` and self-references
+it as `providerId` for email/password signups, and
+`SessionService.createSession` generates a session id once, using it
+both to sign the JWT's `sessionId` claim and to persist the session
+row so the two always match. `UserStore.createUser`/`createSession`
+generated ids purely internally with no way to influence them — fine
+for this package's own 32 tests, wrong for a caller with that
+requirement. Both now take an optional trailing `id` parameter
+(default: generate internally, so every existing call site is
+unaffected). Caught by a failing integration test in
+`auth-orchestration` (`validateTokenAndGetUser` returning `null`
+immediately after `register`) before being traced to the JWT's
+`sessionId` claim not matching the session actually persisted.
+
 ## Testing without real DynamoDB
 
 `src/fake-dynamo.ts` is an in-memory stand-in, same rationale as the
@@ -70,13 +104,15 @@ other `aws/*` packages' fakes — no local DynamoDB was available. This
 one is the most involved of the fakes so far, since it has to simulate
 real `TransactWriteItems` all-or-nothing semantics (check every
 condition first, only apply writes if none failed) rather than just
-single-item Put/Update/Delete. 32 tests total: 20 for user creation and
+single-item Put/Update/Delete. 38 tests total: 20 for user creation and
 lookup, username reassignment and its uniqueness guarantee, AI Gateway
 preference defaulting, session creation/lookup/expiry, and API key CRUD
-including hash-uniqueness enforcement; 12 more for session revocation
+including hash-uniqueness enforcement; 12 for session revocation
 (single, all, by-ID-only), active-session listing sorted by recency,
 the 5-session-per-user cleanup policy, and force-logout-all-other-
-sessions.
+sessions; 6 for `OAuthIdentityStore` — link/find/list/refresh/unlink,
+including that unlinking one identity leaves others (other providers,
+other users) untouched.
 
 ## Build
 

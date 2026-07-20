@@ -83,3 +83,17 @@ export interface CreateApiKeyData {
 	keyHash: string;
 	keyPreview: string;
 }
+
+export interface OAuthIdentity {
+	id: string;
+	userId: string;
+	provider: string;
+	providerId: string;
+	email: string | null;
+	emailVerified: boolean;
+	createdAt: number;
+	updatedAt: number;
+}
+
+export type NewOAuthIdentity = Omit<OAuthIdentity, 'id' | 'createdAt' | 'updatedAt'> &
+	Partial<Pick<OAuthIdentity, 'createdAt' | 'updatedAt'>>;
