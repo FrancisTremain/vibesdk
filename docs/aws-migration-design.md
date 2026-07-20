@@ -377,9 +377,17 @@ guess. These are starting points, not final tuning:
    state, rehydration-on-every-message) in isolation, before porting the
    full agent. This is the de-risking step; if Lambda-per-message latency
    doesn't hold up under realistic state sizes, it changes the rest of
-   the plan. Also where the remaining open questions (latency, cold-start
-   UX tolerance, idle-eviction grace period, sandbox sizing) get real
-   answers.
+   the plan. Also where the remaining data points (Lambda-per-message
+   latency, cold-start UX tolerance under real use, idle-eviction grace
+   period tuning, sandbox sizing validation) replace the defaults set
+   above with real numbers.
+
+   First cut exists: `aws/actor-spike/` in this repo (Lambda handler —
+   connection routing, optimistic per-session lock, state round trip,
+   latency logging) and `environments/apps/vibesdk/` in `vibe-platform`
+   (its Terraform — WebSocket API, the Lambda, the two DynamoDB tables).
+   Not yet applied to real AWS; see that directory's README for what's
+   still needed before it can be.
 4. **Stateless surface port** — D1→DynamoDB (query-layer rewrite, 10
    migrations' worth of schema to re-derive as access patterns), R2→S3,
    KV→DynamoDB, port the Worker entrypoint to API Gateway + Lambda.
