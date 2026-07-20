@@ -1,10 +1,20 @@
-# AWS Migration Design: vibesdk on AWS
+# Technical Design: vibesdk on AWS
 
 ## Status
 
 Design proposal. No infrastructure has been provisioned and no application
 code has been ported. This document exists to get the architecture agreed
 before any Terraform apply or code change.
+
+Companion to
+[docs/aws-migration-product-design.md](aws-migration-product-design.md),
+which covers the "what" and "why" from a product perspective (user-facing
+changes, scope decisions, success criteria). This document covers the
+"how" — architecture, AWS component mapping, data model, cost model, and
+the phased build plan. Where a decision here has product-facing
+consequences (a dropped feature, an accepted UX tradeoff), the product
+doc is the source of truth for that decision's rationale and status;
+this doc implements it.
 
 ## Goal
 
@@ -173,7 +183,7 @@ either.
 | `CodeGeneratorAgent` (Durable Object actor + state machine) | Lambda, invoked per WebSocket message, no standing worker process. See dedicated section below. | **High — this is the critical-path risk for the whole migration** |
 | Git-per-session (isomorphic-git on DO SQLite) | Isomorphic-git unchanged; filesystem adapter re-targeted at S3 only (chunked objects + manifest, no DynamoDB) | Medium — must reach full feature parity with today (see decision 3) |
 | `BROWSER` binding (`@cloudflare/puppeteer`) | Headless Chromium via Playwright/Puppeteer, invoked the same way as the session-actor Lambda (per-capture invocation, e.g. a Lambda with a Chromium layer such as `@sparticuz/chromium`, or an on-demand ECS `RunTask` if a capture needs more memory/time than Lambda's limits allow) | Medium — no reserved capacity either way, matches the Lambda-first billing model rather than a standing browser-rendering service |
-| AI Gateway (analytics + per-user OAuth-connect) | **Decision: drop the per-user "connect your own AI Gateway" OAuth flow — no AWS product to connect to, and it's a CF-specific gateway product, not a BYO-provider-key feature (that's `UserSecretsStore`, already mapped and kept).** Keep the underlying need (LLM usage analytics) by logging request metadata from each LLM call already passing through the ported code to CloudWatch/DynamoDB instead. Revisit only if usage data post-MVP shows this was load-bearing for users, not before. | Low — this is a scope cut, not a port |
+| AI Gateway (analytics + per-user OAuth-connect) | Feature dropped — no AWS product to connect to (product decision, see [product design doc](aws-migration-product-design.md#2-connect-your-cloudflare-ai-gateway-feature--dropped)). Underlying LLM usage analytics need is kept via CloudWatch/DynamoDB request-metadata logging instead of an external gateway connection. | Low — this is a scope cut, not a port |
 | `PartySocket` (frontend WS client) | Native browser `WebSocket` against the API Gateway WebSocket endpoint. `PartySocket`'s reconnect/backoff logic is CF-Agents-SDK-flavored and assumes a DO-style single addressable session endpoint; the AWS side is a standard WS API, so this is a rewrite of the client wrapper (`use-chat.ts`, `websocket-helpers.ts`), not a drop-in swap | Low-Medium — mechanical once the backend's connection/session-resume semantics are finalized (Phase 3) |
 | Deploy-to-CF-Workers-for-Platforms UI flow | Already covered by the Deployer row above — same `RunTask`/`app-blue-green` target, just called out separately since it's a second CF surface (`deployer/api/cloudflare-api.ts`) distinct from the AI Gateway OAuth connection | Covered above |
 
@@ -361,8 +371,8 @@ guess. These are starting points, not final tuning:
   function, to start. Revisit from real Phase 3 latency measurements.
 - **Cold-start UX** — accept the 20-60s sandbox cold start for MVP; add a
   simple client-side "waking up" loading state as the default mitigation
-  (cheap, no infra dependency) rather than blocking on a product decision
-  about pre-emptive launch triggers.
+  (cheap, no infra dependency). Confirmed as a product decision — see
+  [product design doc](aws-migration-product-design.md#1-preview-cold-start-accepted-tradeoff).
 - **Sandbox Tier-2 idle-eviction grace period** — default to 90 seconds.
   Tune once real session activity patterns are visible.
 - **Sandbox task sizing** — 0.5 vCPU/1 GB per the Cost model, to start.

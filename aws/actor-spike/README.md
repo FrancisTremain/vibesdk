@@ -1,6 +1,6 @@
 # actor-spike
 
-Phase 3 deliverable from `docs/aws-migration-design.md`: the smallest
+Phase 3 deliverable from `docs/aws-migration-technical-design.md`: the smallest
 possible test of the design's biggest open risk — can a Lambda invoked
 fresh per WebSocket message, with no standing worker process holding
 session state in memory, rehydrate state from DynamoDB, apply a
@@ -61,4 +61,4 @@ session state), to answer: is Lambda-per-message rehydration fast enough
 to be viable for the real agent, or does the design need to change
 (e.g. opportunistic execution-environment-reuse caching, a smaller
 per-message state footprint, or reconsidering Lambda for this tier)?
-That answer feeds back into `docs/aws-migration-design.md`.
+That answer feeds back into `docs/aws-migration-technical-design.md`.

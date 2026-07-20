@@ -1,7 +1,7 @@
 # aws/infra — Phase 3 actor-model spike infrastructure
 
 Terraform for the Phase 3 actor-model spike described in
-[docs/aws-migration-design.md](../../docs/aws-migration-design.md) — not
+[docs/aws-migration-technical-design.md](../../docs/aws-migration-technical-design.md) — not
 the full migration, just what's needed to test whether Lambda-per-message
 rehydration latency is viable before committing to porting the real
 `CodeGeneratorAgent` onto it.
