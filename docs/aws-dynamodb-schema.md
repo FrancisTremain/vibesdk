@@ -48,8 +48,21 @@ several of these.
 | OAuth provider-lookup | `OAUTHLOOKUP#<provider>#<providerId>` | `LOOKUP` | `{ userId }`. Strongly-consistent read at OAuth login — this is the one that most needs to not be a GSI, since a login racing a just-completed identity link is a real scenario. |
 | Session | `USER#<userId>` | `SESSION#<sessionId>` | All `sessions` fields. `expires_at` as a DynamoDB TTL attribute — replaces the `expiresAtIdx` cleanup pattern with automatic expiry instead of a cron sweep. |
 | Session token lookup | `SESSTOKEN#<accessTokenHash>` | `LOOKUP` | `{ userId, sessionId }`. Every authenticated request does this lookup — needs to be fast and strongly consistent, hence a dedicated item, not a GSI on the Session item. |
+| Session ID lookup | `SESSIONID#<sessionId>` | `LOOKUP` | `{ userId }`. **Added after building the actual port** (`aws/db-identity/`) — `UserService.findValidSession(sessionId)` looks up by the session's own ID directly, with no `userId` available to the caller at that point. The original design here only accounted for the access-token-hash lookup; this is a second, distinct lookup path the paper design missed until the code that needed it got written. |
 | API key | `USER#<userId>` | `APIKEY#<id>` | All `api_keys` fields. |
 | API key hash lookup | `APIKEYHASH#<keyHash>` | `LOOKUP` | `{ userId, apiKeyId }`. Same reasoning as session token lookup — this is the per-request auth check. |
+| API key ID lookup | `APIKEYID#<keyId>` | `LOOKUP` | `{ userId }`. Same gap, same fix as the session ID lookup above — `ApiKeyService.getApiKeyById(keyId)` needs it. |
+
+`UserService` and `ApiKeyService` are ported and tested against this
+table shape in [`aws/db-identity/`](../aws/db-identity/) (20 tests,
+including the `TransactWriteItems`-backed uniqueness guarantees for
+email/username/API-key-hash). The `user_oauth_identities` table (D1's
+separate multi-provider-linking table, SK `OAUTH#<provider>#<providerId>`
+nested under a user) is not part of that port — `UserService.findUser`'s
+provider lookup reads `provider`/`providerId` directly off the user
+record itself, not that table, so it wasn't needed for what's built so
+far. Still worth modeling for whenever multi-provider linking is
+ported, hence left in the table above.
 
 GSI `by-provider` (GSI1PK=`provider`, GSI1SK=`created_at`) on the User
 item type only — supports admin-style "list users by OAuth provider,"
