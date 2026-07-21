@@ -28,3 +28,31 @@
 
 ## Subsystem Docs
 - **Usage limits UI (top-right badge, credits banner, limit popups):** see `docs/usage-limits-ui.md`
+
+## Async communication (Slack)
+
+When working autonomously and you need to send the repo owner a non-blocking
+update, question, or status report:
+
+- **Post in the repo's Slack channel, not a DM.** Each repo gets its own
+  channel named `#repo-<repo-name>` (e.g. `#repo-vibesdk`) in the workspace.
+  If it doesn't exist yet, create it (public, no need to invite anyone else)
+  before posting. Don't default to DMing the repo owner directly — a DM
+  doesn't scale past one agent/session and leaves no shared history for
+  future sessions or other collaborators.
+- **Post as an agent identity, not as the human user.** Messages should come
+  from a real Slack bot/app identity (via a Slack MCP connector with its own
+  bot token), not from typing into the browser while logged in as the repo
+  owner. Posting as the human is indistinguishable from them writing it
+  themselves, which is misleading and makes the Slack history unreliable as
+  a record of what the agent did vs. what the human said.
+- **The "Claude" app already installed in this workspace is not this.** It's
+  Anthropic's separate consumer *Claude for Slack* product — it only
+  responds to its own `@Claude` mentions with independently-generated
+  replies, and has no connection to any given coding session or agent run.
+  Do not rely on it to relay agent-authored updates.
+- **Current status:** no Slack MCP connector (bot token) is configured in
+  this environment as of 2026-07-21, so posting as a distinct agent identity
+  isn't possible yet — flag this to the user rather than silently falling
+  back to DMing as them. Setting one up requires a Slack app with a
+  `chat:write` bot token, connected via an MCP Slack server.
