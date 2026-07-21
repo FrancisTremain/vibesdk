@@ -90,6 +90,11 @@ variable "google_ai_studio_api_key" {
   sensitive = true
 }
 
+variable "allowed_ips" {
+  description = "CIDR blocks allowed to reach the site/API through CloudFront -- enforced by aws_cloudfront_function.ip_allowlist (frontend.tf), not AWS WAF, to avoid WAF's flat per-month cost. E.g. [\"203.0.113.4/32\"] for a single home/office IP. No default: an empty allowlist would block everyone, which is never what you want on apply."
+  type        = list(string)
+}
+
 variable "cerebras_api_key" {
   type      = string
   default   = ""

@@ -31,6 +31,18 @@ function requireEnv(name: string): string {
 	return value;
 }
 
+const ORIGIN_VERIFY_SECRET = requireEnv('ORIGIN_VERIFY_SECRET');
+
+/** Rejects requests that didn't come through the CloudFront distribution
+ *  (which injects this header) -- closes the direct execute-api.*
+ *  bypass around the WAF IP allowlist on CloudFront. */
+function verifyOrigin(event: APIGatewayProxyEventV2): APIGatewayProxyResultV2 | null {
+	if (event.headers?.['x-origin-verify'] !== ORIGIN_VERIFY_SECRET) {
+		return errorResponse('Forbidden', 403);
+	}
+	return null;
+}
+
 let cachedApps: AppStore | null = null;
 let cachedAuth: AuthOrchestrator | null = null;
 let ddbClientOverride: DynamoDBDocumentClient | null = null;
@@ -80,6 +92,9 @@ async function getUser(event: APIGatewayProxyEventV2) {
 }
 
 export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> {
+	const originError = verifyOrigin(event);
+	if (originError) return originError;
+
 	const apps = getApps();
 	const routeKey = event.routeKey;
 	const appId = event.pathParameters?.id;

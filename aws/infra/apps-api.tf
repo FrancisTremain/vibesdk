@@ -81,10 +81,11 @@ resource "aws_lambda_function" "apps_api" {
 
   environment {
     variables = {
-      APPS_TABLE       = aws_dynamodb_table.apps.name
-      IDENTITY_TABLE   = aws_dynamodb_table.identity.name
-      AUTH_FLOWS_TABLE = aws_dynamodb_table.auth_flows.name
-      JWT_SECRET       = var.jwt_secret
+      APPS_TABLE           = aws_dynamodb_table.apps.name
+      IDENTITY_TABLE       = aws_dynamodb_table.identity.name
+      AUTH_FLOWS_TABLE     = aws_dynamodb_table.auth_flows.name
+      JWT_SECRET           = var.jwt_secret
+      ORIGIN_VERIFY_SECRET = random_password.origin_verify.result
     }
   }
 

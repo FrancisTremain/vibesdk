@@ -55,3 +55,11 @@ debug-tools/presentation-tester
 
 .test-data
 cli
+
+# Terraform local state/cache (aws/infra)
+aws/infra/.terraform/
+aws/infra/.terraform.lock.hcl
+aws/infra/*.zip
+aws/*/*.zip
+aws/infra/tfplan
+aws/infra/terraform.tfvars

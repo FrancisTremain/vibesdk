@@ -47,6 +47,18 @@ function requireEnv(name: string): string {
 	return value;
 }
 
+const ORIGIN_VERIFY_SECRET = requireEnv('ORIGIN_VERIFY_SECRET');
+
+/** Rejects requests that didn't come through the CloudFront distribution
+ *  (which injects this header) -- closes the direct execute-api.*
+ *  bypass around the WAF IP allowlist on CloudFront. */
+function verifyOrigin(event: APIGatewayProxyEventV2): APIGatewayProxyResultV2 | null {
+	if (event.headers?.['x-origin-verify'] !== ORIGIN_VERIFY_SECRET) {
+		return errorResponse('Forbidden', 403);
+	}
+	return null;
+}
+
 let cachedAnalytics: AnalyticsStore | null = null;
 let cachedProviders: ModelProviderStore | null = null;
 let cachedModelConfigs: ModelConfigStore | null = null;
@@ -126,6 +138,9 @@ function parseJsonBody(event: APIGatewayProxyEventV2): Record<string, unknown> |
 }
 
 export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> {
+	const originError = verifyOrigin(event);
+	if (originError) return originError;
+
 	const routeKey = event.routeKey;
 	const providerId = event.pathParameters?.id;
 	const agentAction = event.pathParameters?.agentAction;

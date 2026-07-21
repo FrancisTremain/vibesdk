@@ -44,6 +44,17 @@ function requireEnv(name: string): string {
 }
 
 const PUBLIC_BASE_URL = requireEnv('PUBLIC_BASE_URL');
+const ORIGIN_VERIFY_SECRET = requireEnv('ORIGIN_VERIFY_SECRET');
+
+/** Rejects requests that didn't come through the CloudFront distribution
+ *  (which injects this header) -- closes the direct execute-api.*
+ *  bypass around the WAF IP allowlist on CloudFront. */
+function verifyOrigin(event: APIGatewayProxyEventV2): APIGatewayProxyResultV2 | null {
+	if (event.headers?.['x-origin-verify'] !== ORIGIN_VERIFY_SECRET) {
+		return errorResponse('Forbidden', 403);
+	}
+	return null;
+}
 
 let cachedAuth: AuthOrchestrator | null = null;
 let ddbClientOverride: DynamoDBDocumentClient | null = null;
@@ -124,6 +135,9 @@ async function requireUser(event: APIGatewayProxyEventV2) {
 }
 
 export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> {
+	const originError = verifyOrigin(event);
+	if (originError) return originError;
+
 	const auth = getAuth();
 	const routeKey = event.routeKey;
 	const provider = event.pathParameters?.provider;

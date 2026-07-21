@@ -29,6 +29,20 @@ locals {
   site_domain = replace(replace(var.public_base_url, "https://", ""), "/", "")
 }
 
+# Shared secret CloudFront injects into every request it forwards to the
+# three API origins (see the `custom_header` block on each `origin` below).
+# Each Lambda handler rejects any request missing/mismatching this header,
+# so the only way in is through CloudFront -- which is what the IP
+# allowlist (aws_cloudfront_function.ip_allowlist, below) actually
+# protects. Without this, the allowlist would only cover
+# https://<domain>/api/*; the raw execute-api.*.amazonaws.com URLs would
+# stay directly reachable by anyone, bypassing it entirely (API Gateway
+# HTTP API v2 has no WAF/resource-policy support of its own).
+resource "random_password" "origin_verify" {
+  length  = 32
+  special = false
+}
+
 resource "aws_s3_bucket" "frontend" {
   bucket = "vibesdk-frontend-${data.aws_caller_identity.current.account_id}"
 }
@@ -124,6 +138,23 @@ resource "aws_cloudfront_origin_request_policy" "api_passthrough" {
   }
 }
 
+# IP pinhole at the edge. AWS WAF (aws_wafv2_web_acl) would do this too,
+# but WAF bills a flat ~$5/mo per Web ACL plus ~$1/mo per rule regardless
+# of traffic -- real money for a personal project with near-zero volume.
+# A CloudFront Function has no base fee (~$0.10 per *million*
+# invocations) and runs at the same point in the request path (before
+# origin fetch, before cache), so it blocks non-allowlisted IPs just as
+# effectively for this traffic profile.
+resource "aws_cloudfront_function" "ip_allowlist" {
+  name    = "vibesdk-ip-allowlist"
+  runtime = "cloudfront-js-2.0"
+  publish = true
+  comment = "Blocks everything except var.allowed_ips -- the network-level pinhole. ALLOWED_EMAIL in aws/auth-api-lambda is an application-level lock on top of this, not instead of it."
+  code = templatefile("${path.module}/cloudfront-functions/ip-allowlist.js.tftpl", {
+    allowed_ips_json = jsonencode(var.allowed_ips)
+  })
+}
+
 resource "aws_cloudfront_distribution" "site" {
   enabled             = true
   is_ipv6_enabled     = true
@@ -141,9 +172,13 @@ resource "aws_cloudfront_distribution" "site" {
     origin_id   = "auth-api"
     custom_origin_config {
       http_port              = 80
-      https_port              = 443
-      origin_protocol_policy  = "https-only"
-      origin_ssl_protocols    = ["TLSv1.2"]
+      https_port             = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+    custom_header {
+      name  = "X-Origin-Verify"
+      value = random_password.origin_verify.result
     }
   }
 
@@ -151,10 +186,14 @@ resource "aws_cloudfront_distribution" "site" {
     domain_name = replace(aws_apigatewayv2_api.apps_http.api_endpoint, "https://", "")
     origin_id   = "apps-api"
     custom_origin_config {
-      http_port               = 80
-      https_port               = 443
-      origin_protocol_policy   = "https-only"
-      origin_ssl_protocols     = ["TLSv1.2"]
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+    custom_header {
+      name  = "X-Origin-Verify"
+      value = random_password.origin_verify.result
     }
   }
 
@@ -162,80 +201,114 @@ resource "aws_cloudfront_distribution" "site" {
     domain_name = replace(aws_apigatewayv2_api.user_http.api_endpoint, "https://", "")
     origin_id   = "user-api"
     custom_origin_config {
-      http_port               = 80
-      https_port               = 443
-      origin_protocol_policy   = "https-only"
-      origin_ssl_protocols     = ["TLSv1.2"]
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+    custom_header {
+      name  = "X-Origin-Verify"
+      value = random_password.origin_verify.result
     }
   }
 
   default_cache_behavior {
     allowed_methods        = ["GET", "HEAD"]
-    cached_methods          = ["GET", "HEAD"]
-    target_origin_id        = "s3-frontend"
-    viewer_protocol_policy  = "redirect-to-https"
-    cache_policy_id          = "658327ea-f89d-4fab-a63d-7e88639e58f6" # AWS managed CachingOptimized
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "s3-frontend"
+    viewer_protocol_policy = "redirect-to-https"
+    cache_policy_id        = "658327ea-f89d-4fab-a63d-7e88639e58f6" # AWS managed CachingOptimized
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.ip_allowlist.arn
+    }
   }
 
   ordered_cache_behavior {
     path_pattern             = "/api/auth/*"
-    allowed_methods           = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
-    cached_methods             = ["GET", "HEAD"]
-    target_origin_id           = "auth-api"
-    viewer_protocol_policy     = "https-only"
-    cache_policy_id            = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # AWS managed CachingDisabled
-    origin_request_policy_id   = aws_cloudfront_origin_request_policy.api_passthrough.id
+    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods           = ["GET", "HEAD"]
+    target_origin_id         = "auth-api"
+    viewer_protocol_policy   = "https-only"
+    cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # AWS managed CachingDisabled
+    origin_request_policy_id = aws_cloudfront_origin_request_policy.api_passthrough.id
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.ip_allowlist.arn
+    }
   }
 
   ordered_cache_behavior {
     path_pattern             = "/api/apps/*"
-    allowed_methods           = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
-    cached_methods             = ["GET", "HEAD"]
-    target_origin_id           = "apps-api"
-    viewer_protocol_policy     = "https-only"
-    cache_policy_id            = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
-    origin_request_policy_id   = aws_cloudfront_origin_request_policy.api_passthrough.id
+    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods           = ["GET", "HEAD"]
+    target_origin_id         = "apps-api"
+    viewer_protocol_policy   = "https-only"
+    cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+    origin_request_policy_id = aws_cloudfront_origin_request_policy.api_passthrough.id
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.ip_allowlist.arn
+    }
   }
 
   ordered_cache_behavior {
     path_pattern             = "/api/stats*"
-    allowed_methods           = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
-    cached_methods             = ["GET", "HEAD"]
-    target_origin_id           = "user-api"
-    viewer_protocol_policy     = "https-only"
-    cache_policy_id            = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
-    origin_request_policy_id   = aws_cloudfront_origin_request_policy.api_passthrough.id
+    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods           = ["GET", "HEAD"]
+    target_origin_id         = "user-api"
+    viewer_protocol_policy   = "https-only"
+    cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+    origin_request_policy_id = aws_cloudfront_origin_request_policy.api_passthrough.id
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.ip_allowlist.arn
+    }
   }
 
   ordered_cache_behavior {
     path_pattern             = "/api/user/*"
-    allowed_methods           = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
-    cached_methods             = ["GET", "HEAD"]
-    target_origin_id           = "user-api"
-    viewer_protocol_policy     = "https-only"
-    cache_policy_id            = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
-    origin_request_policy_id   = aws_cloudfront_origin_request_policy.api_passthrough.id
+    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods           = ["GET", "HEAD"]
+    target_origin_id         = "user-api"
+    viewer_protocol_policy   = "https-only"
+    cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+    origin_request_policy_id = aws_cloudfront_origin_request_policy.api_passthrough.id
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.ip_allowlist.arn
+    }
   }
 
   ordered_cache_behavior {
     path_pattern             = "/api/model-configs*"
-    allowed_methods           = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
-    cached_methods             = ["GET", "HEAD"]
-    target_origin_id           = "user-api"
-    viewer_protocol_policy     = "https-only"
-    cache_policy_id            = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
-    origin_request_policy_id   = aws_cloudfront_origin_request_policy.api_passthrough.id
+    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods           = ["GET", "HEAD"]
+    target_origin_id         = "user-api"
+    viewer_protocol_policy   = "https-only"
+    cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+    origin_request_policy_id = aws_cloudfront_origin_request_policy.api_passthrough.id
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.ip_allowlist.arn
+    }
   }
 
   custom_error_response {
     error_code         = 403
-    response_code       = 200
-    response_page_path  = "/index.html"
+    response_code      = 200
+    response_page_path = "/index.html"
   }
   custom_error_response {
     error_code         = 404
-    response_code       = 200
-    response_page_path  = "/index.html"
+    response_code      = 200
+    response_page_path = "/index.html"
   }
 
   restrictions {

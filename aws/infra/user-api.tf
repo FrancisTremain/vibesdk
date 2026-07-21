@@ -92,6 +92,7 @@ resource "aws_lambda_function" "user_api" {
       GOOGLE_AI_STUDIO_API_KEY = var.google_ai_studio_api_key
       CEREBRAS_API_KEY         = var.cerebras_api_key
       GROQ_API_KEY             = var.groq_api_key
+      ORIGIN_VERIFY_SECRET     = random_password.origin_verify.result
     }
   }
 

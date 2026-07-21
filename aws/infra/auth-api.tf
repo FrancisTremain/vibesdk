@@ -90,6 +90,7 @@ resource "aws_lambda_function" "auth_api" {
       GITHUB_CLIENT_SECRET = var.github_oauth_client_secret
       GOOGLE_CLIENT_ID     = var.google_oauth_client_id
       GOOGLE_CLIENT_SECRET = var.google_oauth_client_secret
+      ORIGIN_VERIFY_SECRET = random_password.origin_verify.result
     }
   }
 
