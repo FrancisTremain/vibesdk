@@ -1,0 +1,26 @@
+{
+  "name": "vibesdk-sandbox-orchestrator-lambda",
+  "private": true,
+  "version": "0.0.1",
+  "description": "API Gateway HTTP API (v2) Lambda implementing aws/sandbox-contract's SandboxServiceClient by driving ECS RunTask/DescribeTasks/StopTask against aws/infra/sandbox's Fargate cluster, tracking instanceId -> task mapping in the vibesdk-sandbox-instances DynamoDB table, and proxying per-instance calls to the right container's aws/sandbox-controlplane server. Not part of the main vibesdk build.",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/handler.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/handler.js --external:@aws-sdk/*",
+    "package": "npm run build && echo '{\"type\":\"module\"}' > dist/package.json && cd dist && zip -r ../sandbox-orchestrator-lambda.zip handler.js package.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts --root ."
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-ec2": "^3.600.0",
+    "@aws-sdk/client-ecs": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.138",
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
+  }
+}
