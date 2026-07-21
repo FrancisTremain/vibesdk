@@ -23,6 +23,7 @@ import { execFile, exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdir, readFile, writeFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { timingSafeEqual } from 'node:crypto';
 
 const exec = promisify(execCb);
 const execFileAsync = promisify(execFile);
@@ -32,6 +33,21 @@ const INSTANCE_ID = process.env.INSTANCE_ID ?? 'unknown-instance';
 const DEV_PORT = process.env.DEV_PORT ?? '3000';
 const CONTROL_PORT = Number(process.env.CONTROL_PORT ?? '8080');
 const MONITOR_CLI = process.env.MONITOR_CLI ?? 'monitor-cli';
+// Control-plane port is reachable from 0.0.0.0/0 at the security-group
+// level (the orchestrator Lambda has no static egress IP without a NAT
+// Gateway, which this stack avoids for cost -- see aws/infra/sandbox/main.tf).
+// This shared secret is the actual authorization boundary. Required in
+// production; only unset in tests, which construct the server directly
+// without going through a real network boundary. Read from process.env on
+// every call (not frozen at module load) so tests can toggle it per case
+// without needing a fresh module instance.
+function isAuthorized(req: IncomingMessage): boolean {
+	const secret = process.env.CONTROLPLANE_SECRET;
+	if (!secret) return true; // test/dev mode, no secret configured
+	const provided = req.headers['x-controlplane-secret'];
+	if (typeof provided !== 'string' || provided.length !== secret.length) return false;
+	return timingSafeEqual(Buffer.from(provided), Buffer.from(secret));
+}
 
 let bootstrapped = false;
 let bootstrapError: string | undefined;
@@ -339,6 +355,10 @@ const routes: Record<string, (req: IncomingMessage, res: ServerResponse) => Prom
 
 export function createControlPlaneServer() {
 	return createServer((req, res) => {
+		if (!isAuthorized(req)) {
+			sendJson(res, 403, { success: false, error: 'Forbidden' });
+			return;
+		}
 		const url = new URL(req.url ?? '', 'http://localhost');
 		const key = `${req.method} ${url.pathname}`;
 		const handler = routes[key];

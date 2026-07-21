@@ -63,3 +63,7 @@ aws/infra/*.zip
 aws/*/*.zip
 aws/infra/tfplan
 aws/infra/terraform.tfvars
+aws/infra/sandbox/.terraform/
+aws/infra/sandbox/.terraform.lock.hcl
+aws/infra/sandbox/tfplan
+aws/infra/sandbox/terraform.tfvars

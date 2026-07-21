@@ -110,3 +110,30 @@ describe('sandbox control-plane server', () => {
 		expect(res.status).toBe(404);
 	});
 });
+
+describe('control-plane secret auth', () => {
+	// Reuses the server from the outer describe block -- isAuthorized()
+	// reads process.env.CONTROLPLANE_SECRET fresh on every request, so
+	// toggling it per-test doesn't need a separate server/module instance.
+	afterAll(() => {
+		delete process.env.CONTROLPLANE_SECRET;
+	});
+
+	it('rejects requests with no secret header once a secret is configured', async () => {
+		process.env.CONTROLPLANE_SECRET = 'test-secret-value';
+		const res = await fetch(`${baseUrl}/files`);
+		expect(res.status).toBe(403);
+	});
+
+	it('rejects requests with the wrong secret', async () => {
+		process.env.CONTROLPLANE_SECRET = 'test-secret-value';
+		const res = await fetch(`${baseUrl}/files`, { headers: { 'x-controlplane-secret': 'wrong' } });
+		expect(res.status).toBe(403);
+	});
+
+	it('accepts requests with the correct secret', async () => {
+		process.env.CONTROLPLANE_SECRET = 'test-secret-value';
+		const res = await fetch(`${baseUrl}/files`, { headers: { 'x-controlplane-secret': 'test-secret-value' } });
+		expect(res.status).toBe(200);
+	});
+});

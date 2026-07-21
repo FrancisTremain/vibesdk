@@ -5,40 +5,37 @@
 # (@cloudflare/sandbox against the `cloudflare/sandbox` container
 # image, see ../../../SandboxDockerfile).
 #
-# INFRASTRUCTURE SHAPE ONLY. This provisions the hosting shell a
-# control-plane implementation would run on -- it does not include any
-# actual sandbox control-plane server, because none exists yet (see
-# ../../sandbox-contract's README for why that's a real design task, not
-# a port). The task definition below references a placeholder image;
-# nothing here can serve real sandbox traffic until that control plane
-# is designed and built.
+# The control-plane server this image runs is now real:
+# aws/sandbox-controlplane (HTTP server, reuses container/cli-tools.ts
+# unmodified) built into aws/sandbox-container's Dockerfile. This stack
+# still needs a real pushed image URI (var.sandbox_task_image) before
+# apply -- see aws/sandbox-container/README.md for the build/push steps.
 #
 # A SEPARATE ROOT MODULE from the rest of aws/infra, deliberately --
-# see this directory's own README for why: in short, this stack's two
-# variables with no possible default (sandbox_task_image,
-# sandbox_alb_certificate_arn) would otherwise block terraform plan/apply
-# on the entire aws/infra stack, including the parts that ARE ready to
-# deploy today (the DynamoDB tables, S3 bucket, and the auth/apps/user
-# Lambda APIs). Split out so "first deployable cut" doesn't require
-# placeholder values for infrastructure nothing can use yet.
+# see this directory's own README for why: in short, var.sandbox_task_image
+# has no possible default (no image exists until built and pushed), which
+# would otherwise block terraform plan/apply on the entire aws/infra stack,
+# including the parts that don't depend on it. Split out so the root
+# stack's apply lifecycle stays independent.
 #
-# NOT APPLIED. Same status as the rest of this directory.
+# No ALB. An ALB has a flat ~$16-20/mo charge whether or not a sandbox
+# task is even running, which contradicts this migration's zero-idle-cost
+# philosophy (Lambda-first, DynamoDB on-demand, no NAT Gateway -- see
+# frontend.tf's CloudFront-Function-based IP allowlist for the same
+# reasoning applied to the main site). Sandbox tasks instead get a public
+# IP directly (`assign_public_ip = true`, ephemeral per task, looked up by
+# the orchestrator Lambda via ecs:DescribeTasks + ec2:DescribeNetworkInterfaces
+# once the task is running) and the preview URL is
+# `http://<task-public-ip>:3000` -- HTTP only, no per-task TLS cert being
+# practical here. Security is the same IP allowlist used everywhere else
+# in this migration (var.allowed_ips), enforced directly on the task's
+# security group instead of at a CloudFront/ALB edge, since there's no
+# edge in front of these tasks.
 #
-# One deliberate deviation from the design doc's literal cost-model
-# line ("small Spot task replacing a NAT Gateway" for sandbox egress):
-# a Fargate task's ENI is ephemeral and changes every task restart, so
-# it can't be a stable VPC route-table target the way a NAT Gateway or
-# NAT instance can -- there's no clean way to point private-subnet
-# routes at a "NAT task" that gets replaced on every launch. Simpler
-# and actually cheaper: run sandbox tasks directly in **public**
-# subnets with `assign_public_ip = true`, security-group-restricted to
-# only accept inbound from the ALB. Zero standing NAT cost (no NAT
-# Gateway's ~$32/mo floor, no hand-rolled NAT task to operate), which
-# fits this migration's hard <$100/mo budget better than either
-# alternative -- consistent with the zero-idle-cost philosophy used
-# everywhere else in this design (Lambda-first, DynamoDB on-demand).
-# The tradeoff is a public IP per running sandbox task, mitigated by
-# the security group only permitting inbound from the ALB.
+# A Fargate task's ENI is also ephemeral and changes every task restart,
+# so it can't be a stable VPC route-table target the way a NAT Gateway
+# can -- confirming there's no "NAT task" shortcut available even if an
+# ALB-free design didn't already avoid needing one.
 
 terraform {
   required_version = ">= 1.5"
@@ -47,6 +44,10 @@ terraform {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
     }
   }
 
@@ -153,38 +154,25 @@ resource "aws_vpc_endpoint" "sandbox_dynamodb" {
   route_table_ids   = [aws_route_table.sandbox_public.id]
 }
 
-resource "aws_security_group" "sandbox_alb" {
-  name        = "vibesdk-sandbox-alb"
-  description = "Sandbox preview ALB -- public HTTPS in, forwards to sandbox tasks only"
-  vpc_id      = aws_vpc.sandbox.id
-
-  ingress {
-    description = "HTTPS from anywhere (preview URLs)"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
 resource "aws_security_group" "sandbox_task" {
   name        = "vibesdk-sandbox-task"
-  description = "Sandbox Fargate tasks -- inbound only from the ALB, outbound open for package installs"
+  description = "Sandbox Fargate tasks -- dev server + control plane reachable only from var.allowed_ips, outbound open for package installs"
   vpc_id      = aws_vpc.sandbox.id
 
   ingress {
-    description     = "Dev server port, ALB only"
-    from_port       = 3000
-    to_port         = 3000
-    protocol        = "tcp"
-    security_groups = [aws_security_group.sandbox_alb.id]
+    description = "Dev server port (live preview) -- IP allowlist, same as the main site"
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_ips
+  }
+
+  ingress {
+    description = "Control-plane port (aws/sandbox-controlplane), reachable from the orchestrator Lambda's ENIs and the same IP allowlist for direct debugging"
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_ips
   }
 
   egress {
@@ -196,50 +184,23 @@ resource "aws_security_group" "sandbox_task" {
   }
 }
 
-resource "aws_lb" "sandbox" {
-  name               = "vibesdk-sandbox"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.sandbox_alb.id]
-  subnets            = [aws_subnet.sandbox_a.id, aws_subnet.sandbox_b.id]
-}
-
-# Placeholder default target group -- per-session routing (mapping a
-# session's preview URL to the specific ECS task launched for it) is
-# runtime behavior the provisioning/routing Lambda would perform via
-# elbv2:RegisterTargets at RunTask launch time, and elbv2:DeregisterTargets
-# on shutdown/idle-eviction. That Lambda doesn't exist yet -- it depends
-# on the same not-yet-designed control plane aws/sandbox-contract's
-# README describes. This target group and a catch-all listener rule
-# exist so the ALB itself has a valid default action; nothing routes
-# through the default in real use.
-resource "aws_lb_target_group" "sandbox_default" {
-  name        = "vibesdk-sandbox-default"
-  port        = 3000
-  protocol    = "HTTP"
-  vpc_id      = aws_vpc.sandbox.id
-  target_type = "ip" # Fargate awsvpc mode -- targets are task ENIs, not instances.
-
-  health_check {
-    path                = "/"
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-    interval            = 15
-    timeout             = 5
-  }
-}
-
-resource "aws_lb_listener" "sandbox_https" {
-  load_balancer_arn = aws_lb.sandbox.arn
-  port              = 443
-  protocol          = "HTTPS"
-  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  certificate_arn   = var.sandbox_alb_certificate_arn
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.sandbox_default.arn
-  }
+# The orchestrator Lambda (aws/sandbox-orchestrator-lambda) calls each
+# task's control-plane port from outside the VPC (Lambda not attached to
+# this VPC, to avoid ENI cold-start latency and keep the Lambda simple) --
+# so it needs its own inbound allowance. Its egress IPs aren't static
+# without a NAT Gateway (which this stack deliberately avoids), so instead
+# the Lambda authenticates control-plane calls with a shared secret header
+# (same X-Origin-Verify pattern as frontend.tf's CloudFront->Lambda calls),
+# and this rule stays scoped to var.allowed_ips only -- the orchestrator
+# path relies on the secret, not source-IP, for its own authorization.
+resource "aws_security_group_rule" "sandbox_task_control_plane_any_source" {
+  type              = "ingress"
+  from_port         = 8080
+  to_port           = 8080
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.sandbox_task.id
+  description       = "Orchestrator Lambda has no static egress IP without a NAT Gateway (avoided for cost) -- control-plane calls are authenticated by X-Origin-Verify secret instead of source IP"
 }
 
 resource "aws_ecs_cluster" "sandbox" {
@@ -311,6 +272,66 @@ resource "aws_cloudwatch_log_group" "sandbox_task" {
   retention_in_days = 7 # Sandbox task logs are high-volume and short-lived-relevant; shorter retention than the API Lambdas' 14 days.
 }
 
+# Where aws/sandbox-container's image gets pushed -- see that package's
+# README for the build/push commands. Scan-on-push is free and catches
+# obviously-bad base-image CVEs before a task ever launches from it.
+resource "aws_ecr_repository" "sandbox" {
+  name = "vibesdk-sandbox"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+# One lifecycle rule: untagged images (superseded by a new push under the
+# same "latest" tag pattern) are cleaned up automatically so ECR storage
+# doesn't grow unbounded -- the only real ongoing cost this repo has.
+resource "aws_ecr_lifecycle_policy" "sandbox" {
+  repository = aws_ecr_repository.sandbox.name
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Expire untagged images after 1 day"
+      selection = {
+        tagStatus   = "untagged"
+        countType   = "sinceImagePushed"
+        countUnit   = "days"
+        countNumber = 1
+      }
+      action = { type = "expire" }
+    }]
+  })
+}
+
+# Instance tracking for the orchestrator Lambda: instanceId -> ECS task
+# ARN + public IP + status. On-demand billing, same as every other table
+# in this migration -- near-zero cost at low session volume.
+resource "aws_dynamodb_table" "sandbox_instances" {
+  name         = "vibesdk-sandbox-instances"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "instanceId"
+
+  attribute {
+    name = "instanceId"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expiresAt"
+    enabled        = true
+  }
+}
+
+# Shared secret the orchestrator Lambda sends as X-Controlplane-Secret on
+# every call to a task's control-plane port -- see main.tf's security
+# group comment for why source-IP restriction alone isn't available for
+# that path. One secret for the whole cluster (not per-task) keeps the
+# orchestrator simple; rotating it just means a new apply + task restart.
+resource "random_password" "controlplane_secret" {
+  length  = 32
+  special = false
+}
+
 # Placeholder image and 0.5 vCPU / 1 GB sizing per the design doc's
 # cost model (down-sized from CF's 4 vCPU/8 GB spec). Real sizing needs
 # the Phase 3 latency spike's actual measurements against build-heavy
@@ -330,7 +351,14 @@ resource "aws_ecs_task_definition" "sandbox" {
       image     = var.sandbox_task_image
       essential = true
       portMappings = [
-        { containerPort = 3000, protocol = "tcp" }
+        { containerPort = 3000, protocol = "tcp" }, # dev server / live preview
+        { containerPort = 8080, protocol = "tcp" }, # control plane
+      ]
+      environment = [
+        { name = "CONTROL_PORT", value = "8080" },
+        { name = "DEV_PORT", value = "3000" },
+        { name = "WORKSPACE_DIR", value = "/workspace/app" },
+        { name = "CONTROLPLANE_SECRET", value = random_password.controlplane_secret.result },
       ]
       logConfiguration = {
         logDriver = "awslogs"
