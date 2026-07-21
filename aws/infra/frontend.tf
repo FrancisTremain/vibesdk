@@ -117,10 +117,7 @@ resource "aws_cloudfront_origin_request_policy" "api_passthrough" {
     cookie_behavior = "all"
   }
   headers_config {
-    header_behavior = "allViewerAndWhitelistCloudFront"
-    headers {
-      items = ["Authorization"]
-    }
+    header_behavior = "allViewer"
   }
   query_strings_config {
     query_string_behavior = "all"
