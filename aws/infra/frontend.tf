@@ -149,7 +149,7 @@ resource "aws_cloudfront_function" "ip_allowlist" {
   name    = "vibesdk-ip-allowlist"
   runtime = "cloudfront-js-2.0"
   publish = true
-  comment = "Blocks everything except var.allowed_ips -- the network-level pinhole. ALLOWED_EMAIL in aws/auth-api-lambda is an application-level lock on top of this, not instead of it."
+  comment = "Blocks everything except var.allowed_ips -- see frontend.tf"
   code = templatefile("${path.module}/cloudfront-functions/ip-allowlist.js.tftpl", {
     allowed_ips_json = jsonencode(var.allowed_ips)
   })
