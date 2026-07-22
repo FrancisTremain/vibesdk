@@ -25,6 +25,13 @@ export interface ConversationMessage {
 	created_at: string;
 }
 
+/** filePath -> file contents. Deliberately not a port of state.ts's
+ *  `FileState`/`FileOutputType` (diff tracking, purpose metadata) --
+ *  see ./generation.ts and this package's README for why the
+ *  generation this runtime does is a single-shot JSON-file-list
+ *  completion, not the original's phased/diffed file pipeline. */
+export type GeneratedFiles = Record<string, string>;
+
 export interface AgentSessionState {
 	session_id: string;
 	lock_version: number;
@@ -35,6 +42,9 @@ export interface AgentSessionState {
 	current_dev_state: CurrentDevState;
 	conversation_messages: ConversationMessage[];
 	pending_user_inputs: string[];
+	generated_files: GeneratedFiles;
+	sandbox_instance_id?: string;
+	preview_url?: string;
 	created_at: string;
 	updated_at: string;
 	expires_at: number;
@@ -58,6 +68,7 @@ export function newSessionState(sessionId: string, userId: string, ttlSeconds: n
 		current_dev_state: 'IDLE',
 		conversation_messages: [],
 		pending_user_inputs: [],
+		generated_files: {},
 		created_at: now,
 		updated_at: now,
 		expires_at: nowEpochSeconds() + ttlSeconds,

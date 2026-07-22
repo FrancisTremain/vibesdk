@@ -9,15 +9,28 @@
 # NOT APPLIED. Same status as the rest of this directory.
 
 variable "agent_runtime_lambda_timeout_seconds" {
-  description = "Longer than var.lambda_timeout_seconds's 30s default: user_suggestion's mutate step calls out to an LLM provider (aws/llm-client), including its own retry-with-backoff on 429/5xx, which can comfortably exceed 30s on a slow or rate-limited response."
+  description = "Longer than var.lambda_timeout_seconds's 30s default. user_suggestion's mutate step calls out to an LLM provider (aws/llm-client) -- comfortably over 30s under retry. generate_all's mutate step is the real driver: it blocks on aws/sandbox-orchestrator-lambda's own createInstance call (up to its own 180s timeout -- ECS RunTask + DescribeTasks polling for a public IP + bootstrap, see that Lambda's own timeout variable) on top of the generation LLM call. 300s gives headroom above that ceiling. Note API Gateway WebSocket's own integration invoke has a hard 29s wait before it stops listening for this Lambda's synchronous return value -- harmless here, since the actual message delivery to the client is the PostToConnection call inside the Lambda, not that return value; see aws/agent-runtime's README."
   type        = number
-  default     = 60
+  default     = 300
 }
 
 variable "agent_model_id" {
-  description = "aws/model-config-defaults's provider/model-name id (e.g. anthropic/claude-sonnet-4-5) used for aws/agent-runtime's user_suggestion single-turn completion. Independent of the real per-agent-action AGENT_CONFIG selection worker/agents/inferutils/config.ts does -- this runtime doesn't have that config wired in yet, see aws/agent-runtime's README."
+  description = "aws/model-config-defaults's provider/model-name id (e.g. anthropic/claude-sonnet-4-5) used for aws/agent-runtime's user_suggestion single-turn completion and generate_all's project-file generation. Independent of the real per-agent-action AGENT_CONFIG selection worker/agents/inferutils/config.ts does -- this runtime doesn't have that config wired in yet, see aws/agent-runtime's README."
   type        = string
   default     = "anthropic/claude-sonnet-4-5"
+}
+
+variable "sandbox_orchestrator_endpoint" {
+  description = "aws/infra/sandbox's sandbox_orchestrator_api_endpoint output (aws/infra/sandbox/orchestrator.tf). A plain variable, not a terraform_remote_state read, deliberately -- reading the sandbox module's state from here would invert this migration's established apply order (root stack first, aws/infra/sandbox second, reading the root stack's outputs). Empty until the sandbox module has been applied once and this value copied in; generate_all fails with a clear 'not configured' error until then, rather than this stack's apply blocking on it."
+  type        = string
+  default     = ""
+}
+
+variable "sandbox_orchestrator_secret" {
+  description = "aws/infra/sandbox's sandbox_orchestrator_secret output (the X-Orchestrator-Secret value aws/sandbox-orchestrator-lambda expects). Same plain-variable reasoning as var.sandbox_orchestrator_endpoint."
+  type        = string
+  default     = ""
+  sensitive   = true
 }
 
 resource "aws_dynamodb_table" "agent_sessions" {
@@ -181,6 +194,11 @@ resource "aws_lambda_function" "agent_runtime" {
       ANTHROPIC_API_KEY        = var.anthropic_api_key
       OPENAI_API_KEY           = var.openai_api_key
       GOOGLE_AI_STUDIO_API_KEY = var.google_ai_studio_api_key
+      # aws/agent-runtime's generation.ts -> sandbox-client.ts, calling
+      # aws/sandbox-orchestrator-lambda's createInstance. See the two
+      # variables above for why these are plain vars, not remote state.
+      SANDBOX_ORCHESTRATOR_ENDPOINT = var.sandbox_orchestrator_endpoint
+      SANDBOX_ORCHESTRATOR_SECRET   = var.sandbox_orchestrator_secret
     }
   }
 

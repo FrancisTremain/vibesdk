@@ -29,8 +29,17 @@ export type OutgoingMessage = { type: string } & Record<string, unknown>;
  * fetch-mocked) network call -- see handler.ts for the real
  * implementation (./llm.ts's `generateAssistantReply`).
  */
+export interface GenerationResult {
+	projectName: string;
+	files: { filePath: string; fileContents: string }[];
+	previewUrl?: string;
+	sandboxInstanceId?: string;
+	bootstrapMessage?: string;
+}
+
 export interface MessageDeps {
 	generateReply: (conversationHistory: ConversationMessage[], userMessage: string) => Promise<string>;
+	runGeneration: (description: string) => Promise<GenerationResult>;
 }
 
 export interface MessagePlan {
@@ -49,7 +58,7 @@ export interface MessagePlan {
 }
 
 const NOT_IMPLEMENTED_MESSAGE =
-	'This capability is not yet available on the AWS runtime -- the phase-generation pipeline, deployment manager, and screenshot capture have not been ported yet.';
+	'This capability is not yet available on the AWS runtime -- the deployment manager, screenshot capture, and resuming a partial generation have not been ported yet.';
 
 function notImplemented(): MessagePlan {
 	return {
@@ -140,7 +149,48 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 		case 'vault_locked':
 			return noResponse();
 
-		case 'generate_all':
+		case 'generate_all': {
+			// The description comes from this message if present, else the
+			// last user turn in conversation history, else state.query
+			// (set the first time a session was created with a query) --
+			// resolved inside `mutate` since state isn't loaded yet here.
+			const explicitDescription = incoming.message;
+			return {
+				// See ./generation.ts for exactly what this does and doesn't
+				// do (one LLM call for a small single-shot app, one call to
+				// aws/sandbox-orchestrator-lambda to run it) -- not
+				// worker/agents/operations/PhaseGeneration.ts's real phased
+				// pipeline. On failure (bad JSON from the model, sandbox
+				// launch failure, etc.) this throws and nothing is
+				// persisted, same error-handling shape as user_suggestion.
+				mutate: async (state) => {
+					const description = explicitDescription || lastUserMessage(state) || state.query;
+					if (!description) {
+						throw new Error('No project description available -- include a message with generate_all, or send a user_suggestion first.');
+					}
+					const result = await deps.runGeneration(description);
+					const now = new Date().toISOString();
+					return {
+						...state,
+						query: state.query || description,
+						project_name: result.projectName,
+						generated_files: Object.fromEntries(result.files.map((f) => [f.filePath, f.fileContents])),
+						sandbox_instance_id: result.sandboxInstanceId,
+						preview_url: result.previewUrl,
+						current_dev_state: 'REVIEWING',
+						should_be_generating: false,
+						updated_at: now,
+					};
+				},
+				buildResponse: (state) => ({
+					type: 'generation_complete',
+					projectName: state.project_name,
+					files: Object.entries(state.generated_files).map(([filePath, fileContents]) => ({ filePath, fileContents })),
+					previewUrl: state.preview_url,
+				}),
+			};
+		}
+
 		case 'resume_generation':
 		case 'deploy':
 		case 'preview':
@@ -164,4 +214,12 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 		default:
 			return { buildResponse: () => ({ type: 'error', error: `Unknown message type: ${incoming.type}` }) };
 	}
+}
+
+function lastUserMessage(state: AgentSessionState): string | undefined {
+	for (let i = state.conversation_messages.length - 1; i >= 0; i--) {
+		const message = state.conversation_messages[i];
+		if (message?.role === 'user') return message.content;
+	}
+	return undefined;
 }

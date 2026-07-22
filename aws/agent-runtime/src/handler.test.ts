@@ -7,12 +7,16 @@ import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk
 process.env.AGENT_SESSIONS_TABLE = 'vibesdk-agent-sessions';
 process.env.AGENT_CONNECTIONS_TABLE = 'vibesdk-agent-connections';
 
-// ./llm.ts makes a real HTTP call via vibesdk-llm-client -- mocked here so
-// user_suggestion tests exercise handler.ts's/messages.ts's own logic
-// (state mutation, error propagation) without a real network dependency.
-// vibesdk-llm-client itself is tested against a fake fetch in its own package.
+// ./llm.ts and ./generation.ts make real HTTP calls (vibesdk-llm-client,
+// aws/sandbox-orchestrator-lambda) -- mocked here so these tests exercise
+// handler.ts's/messages.ts's own logic (state mutation, error propagation)
+// without real network dependencies. Both are tested against a fake fetch
+// in their own packages / this package's generation.test.ts.
 const generateAssistantReplyMock = vi.fn<(history: unknown[], message: string) => Promise<string>>();
 vi.mock('./llm', () => ({ generateAssistantReply: (...args: [unknown[], string]) => generateAssistantReplyMock(...args) }));
+
+const runGenerationMock = vi.fn<(description: string) => Promise<import('./messages').GenerationResult>>();
+vi.mock('./generation', () => ({ runGeneration: (...args: [string]) => runGenerationMock(...args) }));
 
 const { handler } = await import('./handler');
 
@@ -62,6 +66,7 @@ beforeEach(() => {
 	apigwMock.on(PostToConnectionCommand).resolves({});
 	generateAssistantReplyMock.mockReset();
 	generateAssistantReplyMock.mockResolvedValue('a reply');
+	runGenerationMock.mockReset();
 });
 
 describe('$connect', () => {
@@ -146,6 +151,7 @@ describe('$default', () => {
 		current_dev_state: 'IDLE' as const,
 		conversation_messages: [],
 		pending_user_inputs: [],
+		generated_files: {},
 		created_at: 'x',
 		updated_at: 'x',
 		expires_at: 9999999999,
@@ -251,13 +257,80 @@ describe('$default', () => {
 		expect(response).toMatchObject({ type: 'conversation_state', state: { pendingUserInputs: ['queued'] } });
 	});
 
-	it('returns a not-implemented error for generate_all without mutating state', async () => {
+	it('runs generation from an explicit message and persists the result', async () => {
 		wireConnection();
 		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
+		ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
+		runGenerationMock.mockResolvedValue({
+			projectName: 'todo-app',
+			files: [{ filePath: 'index.html', fileContents: '<h1>todo</h1>' }],
+			previewUrl: 'http://203.0.113.5:3000',
+			sandboxInstanceId: 'inst-1',
+		});
+
+		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all', message: 'build me a todo app' }) }));
+
+		expect(runGenerationMock).toHaveBeenCalledWith('build me a todo app');
+		const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
+		expect(puts).toHaveLength(1);
+		expect(puts[0]!.args[0]!.input.Item).toMatchObject({
+			project_name: 'todo-app',
+			generated_files: { 'index.html': '<h1>todo</h1>' },
+			sandbox_instance_id: 'inst-1',
+			preview_url: 'http://203.0.113.5:3000',
+			current_dev_state: 'REVIEWING',
+			should_be_generating: false,
+		});
+		const [response] = responsesSent();
+		expect(response).toMatchObject({
+			type: 'generation_complete',
+			projectName: 'todo-app',
+			previewUrl: 'http://203.0.113.5:3000',
+			files: [{ filePath: 'index.html', fileContents: '<h1>todo</h1>' }],
+		});
+	});
+
+	it('falls back to the last user conversation turn when generate_all has no message', async () => {
+		wireConnection();
+		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({
+			Item: {
+				...baseSession,
+				conversation_messages: [
+					{ role: 'user', content: 'build a calculator', created_at: 'x' },
+					{ role: 'assistant', content: 'sure', created_at: 'x' },
+				],
+			},
+		});
+		ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
+		runGenerationMock.mockResolvedValue({ projectName: 'calc', files: [{ filePath: 'a.js', fileContents: '1' }] });
+
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all' }) }));
+
+		expect(runGenerationMock).toHaveBeenCalledWith('build a calculator');
+	});
+
+	it('errors without persisting when generate_all has no description available', async () => {
+		wireConnection();
+		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
+
+		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all' }) }));
+
+		expect(runGenerationMock).not.toHaveBeenCalled();
 		expect(ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' })).toHaveLength(0);
 		const [response] = responsesSent();
-		expect(response).toMatchObject({ type: 'error', error: expect.stringContaining('not yet available') });
+		expect(response).toMatchObject({ type: 'error', error: expect.stringContaining('No project description available') });
+	});
+
+	it('errors without persisting when generation fails', async () => {
+		wireConnection();
+		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
+		runGenerationMock.mockRejectedValue(new Error('Model did not return valid JSON: Unexpected token'));
+
+		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all', message: 'build me a todo app' }) }));
+
+		expect(ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' })).toHaveLength(0);
+		const [response] = responsesSent();
+		expect(response).toMatchObject({ type: 'error', error: expect.stringContaining('did not return valid JSON') });
 	});
 
 	it('returns an error for an unknown message type', async () => {
