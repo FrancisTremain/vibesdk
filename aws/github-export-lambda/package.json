@@ -1,0 +1,26 @@
+{
+  "name": "vibesdk-github-export-lambda",
+  "private": true,
+  "version": "0.0.1",
+  "description": "API Gateway HTTP API (v2) Lambda for exporting an aws/agent-runtime session's git history (aws/git-storage) to a real GitHub repository -- port of worker/api/controllers/githubExporter/controller.ts + worker/services/github/GitHubService.ts's push path, reduced in scope (no cached-token fast path, no remote-status diffing, no README deploy-button rewrite -- see this package's README). Not part of the main vibesdk build.",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/handler.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/handler.js --external:@aws-sdk/*",
+    "package": "npm run build && echo '{\"type\":\"module\"}' > dist/package.json && cd dist && zip -r ../github-export-lambda.zip handler.js package.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts --root ."
+  },
+  "dependencies": {
+    "isomorphic-git": "^1.27.0",
+    "jose": "^5.6.3",
+    "vibesdk-git-storage": "file:../git-storage",
+    "vibesdk-oauth-clients": "file:../oauth-clients"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.138",
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
+  }
+}
