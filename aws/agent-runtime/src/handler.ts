@@ -26,7 +26,10 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
 import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
 import { newSessionState, nowEpochSeconds, type AgentSessionState, type WsConnectionRecord } from './state';
-import { planMessage, type IncomingMessage, type OutgoingMessage } from './messages';
+import { planMessage, type IncomingMessage, type MessageDeps, type OutgoingMessage } from './messages';
+import { generateAssistantReply } from './llm';
+
+const messageDeps: MessageDeps = { generateReply: generateAssistantReply };
 
 const AGENT_SESSIONS_TABLE = requireEnv('AGENT_SESSIONS_TABLE');
 const AGENT_CONNECTIONS_TABLE = requireEnv('AGENT_CONNECTIONS_TABLE');
@@ -131,7 +134,7 @@ async function handleMessage(
 	}
 
 	const incoming = parseMessage(event.body);
-	const plan = planMessage(incoming);
+	const plan = planMessage(incoming, messageDeps);
 
 	if (plan.immediateError) {
 		await pushToConnection(event, connectionId, { type: 'error', error: plan.immediateError });
@@ -141,7 +144,16 @@ async function handleMessage(
 	let finalState: AgentSessionState;
 	if (plan.mutate) {
 		const current = await loadOrInitState(sessionId);
-		finalState = await persistWithOptimisticLock(current, plan.mutate);
+		try {
+			finalState = await persistWithOptimisticLock(current, plan.mutate);
+		} catch (err) {
+			// A mutate failure (e.g. the LLM call in user_suggestion's mutate)
+			// means nothing was persisted -- no PutCommand ever succeeded for
+			// this invocation. Respond with the failure instead of throwing,
+			// same as every other error path in this handler.
+			await pushToConnection(event, connectionId, { type: 'error', error: err instanceof Error ? err.message : String(err) });
+			return { statusCode: 200, body: 'ok' };
+		}
 	} else {
 		finalState = await loadOrInitState(sessionId);
 	}
@@ -177,13 +189,13 @@ async function loadOrInitState(sessionId: string): Promise<AgentSessionState> {
  */
 async function persistWithOptimisticLock(
 	readState: AgentSessionState,
-	mutate: (state: AgentSessionState) => AgentSessionState,
+	mutate: (state: AgentSessionState) => AgentSessionState | Promise<AgentSessionState>,
 ): Promise<AgentSessionState> {
 	let current = readState;
 
 	for (let attempt = 0; attempt < LOCK_RETRY_LIMIT; attempt++) {
 		const toWrite: AgentSessionState = {
-			...mutate(current),
+			...(await mutate(current)),
 			lock_version: current.lock_version + 1,
 		};
 

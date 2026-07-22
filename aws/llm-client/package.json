@@ -4,8 +4,10 @@
   "version": "0.0.1",
   "description": "Provider-agnostic LLM inference client -- direct HTTP calls to Anthropic/OpenAI/Google AI Studio (no vendor SDK dependency), keyed by aws/model-config-defaults's `provider/model-name` id convention. The foundational primitive worker/agents/inferutils/core.ts's executeInference plays for the CF build; not a port of that file (1150 lines of retry/fallback/schema-repair/tool-loop orchestration this package doesn't attempt), just the one real HTTP call underneath it. Not part of the main vibesdk build.",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js",
+    "build": "tsc --emitDeclarationOnly --outDir dist && esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts --root ."
   },

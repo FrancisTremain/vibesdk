@@ -8,6 +8,18 @@
 #
 # NOT APPLIED. Same status as the rest of this directory.
 
+variable "agent_runtime_lambda_timeout_seconds" {
+  description = "Longer than var.lambda_timeout_seconds's 30s default: user_suggestion's mutate step calls out to an LLM provider (aws/llm-client), including its own retry-with-backoff on 429/5xx, which can comfortably exceed 30s on a slow or rate-limited response."
+  type        = number
+  default     = 60
+}
+
+variable "agent_model_id" {
+  description = "aws/model-config-defaults's provider/model-name id (e.g. anthropic/claude-sonnet-4-5) used for aws/agent-runtime's user_suggestion single-turn completion. Independent of the real per-agent-action AGENT_CONFIG selection worker/agents/inferutils/config.ts does -- this runtime doesn't have that config wired in yet, see aws/agent-runtime's README."
+  type        = string
+  default     = "anthropic/claude-sonnet-4-5"
+}
+
 resource "aws_dynamodb_table" "agent_sessions" {
   name         = "vibesdk-agent-sessions"
   billing_mode = "PAY_PER_REQUEST"
@@ -151,7 +163,7 @@ resource "aws_lambda_function" "agent_runtime" {
   handler       = "handler.handler"
   runtime       = "nodejs20.x"
   memory_size   = var.lambda_memory_mb
-  timeout       = var.lambda_timeout_seconds
+  timeout       = var.agent_runtime_lambda_timeout_seconds
 
   # Direct local-file deployment -- see auth-api.tf's comment for why.
   filename         = "${path.module}/../agent-runtime/agent-runtime.zip"
@@ -161,6 +173,14 @@ resource "aws_lambda_function" "agent_runtime" {
     variables = {
       AGENT_SESSIONS_TABLE    = aws_dynamodb_table.agent_sessions.name
       AGENT_CONNECTIONS_TABLE = aws_dynamodb_table.agent_connections.name
+      # aws/llm-client provider dispatch -- see that package's README for
+      # the provider/model-name id convention and the apiKeyEnvVarFor()
+      # naming this must match (${PROVIDER}_API_KEY, matching
+      # aws/model-config-defaults's byok-helper.ts convention).
+      AGENT_MODEL_ID           = var.agent_model_id
+      ANTHROPIC_API_KEY        = var.anthropic_api_key
+      OPENAI_API_KEY           = var.openai_api_key
+      GOOGLE_AI_STUDIO_API_KEY = var.google_ai_studio_api_key
     }
   }
 

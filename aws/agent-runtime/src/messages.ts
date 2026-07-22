@@ -13,7 +13,7 @@
  * pre-mutation candidate.
  */
 
-import type { AgentSessionState } from './state';
+import type { AgentSessionState, ConversationMessage } from './state';
 
 export interface IncomingMessage {
 	type: string;
@@ -23,11 +23,27 @@ export interface IncomingMessage {
 
 export type OutgoingMessage = { type: string } & Record<string, unknown>;
 
+/**
+ * Injected rather than imported directly from vibesdk-llm-client, so
+ * this module's dispatch logic stays testable without a real (or
+ * fetch-mocked) network call -- see handler.ts for the real
+ * implementation (./llm.ts's `generateAssistantReply`).
+ */
+export interface MessageDeps {
+	generateReply: (conversationHistory: ConversationMessage[], userMessage: string) => Promise<string>;
+}
+
 export interface MessagePlan {
 	/** Validation/precondition failure -- short-circuits before any state load. */
 	immediateError?: string;
-	/** Present only for message types that mutate session state. */
-	mutate?: (state: AgentSessionState) => AgentSessionState;
+	/**
+	 * Present only for message types that mutate session state. May be
+	 * async (user_suggestion calls out to the LLM) -- on an optimistic-
+	 * lock conflict it is re-invoked against the freshly re-read state,
+	 * same requirement aws/actor-spike's `applyMutation` has, just now
+	 * allowed to await instead of being a pure sync function.
+	 */
+	mutate?: (state: AgentSessionState) => AgentSessionState | Promise<AgentSessionState>;
 	/** Response to push back over the connection, built from the final state. `null` = no response (matches the original's silent handling of a few message types). */
 	buildResponse: (state: AgentSessionState) => OutgoingMessage | null;
 }
@@ -45,7 +61,7 @@ function noResponse(): MessagePlan {
 	return { buildResponse: () => null };
 }
 
-export function planMessage(incoming: IncomingMessage): MessagePlan {
+export function planMessage(incoming: IncomingMessage, deps: MessageDeps): MessagePlan {
 	switch (incoming.type) {
 		// Disabled in the original too ("Disable for now") -- kept as a
 		// no-op for wire-protocol parity, not a stub for missing behavior.
@@ -58,20 +74,34 @@ export function planMessage(incoming: IncomingMessage): MessagePlan {
 			}
 			const content = incoming.message;
 			return {
-				mutate: (state) => ({
-					...state,
-					conversation_messages: [
-						...state.conversation_messages,
-						{ role: 'user', content, created_at: new Date().toISOString() },
-					],
-					pending_user_inputs: [...state.pending_user_inputs, content],
-					updated_at: new Date().toISOString(),
-				}),
-				// The real conversational-AI response (worker/agents/operations/
-				// UserConversationProcessor.ts) is not ported -- this only
-				// acknowledges receipt and persists the message, honestly
-				// short of a real assistant reply.
-				buildResponse: () => ({ type: 'user_suggestions_processing', message: 'Message received' }),
+				// Calls the LLM (via deps.generateReply) before returning the
+				// user+assistant turn to persist. This is NOT
+				// worker/agents/operations/UserConversationProcessor.ts's real
+				// conversational-AI handling (no tool calling, no blueprint/
+				// project-state awareness, no streaming) -- a single-turn
+				// completion over the conversation history, with a system
+				// prompt that's explicit about what this runtime can't do yet.
+				// See ./llm.ts. If the call fails (no API key configured, rate
+				// limited past retries, etc.) this throws and nothing is
+				// persisted -- handler.ts turns that into an `error` response.
+				mutate: async (state) => {
+					const reply = await deps.generateReply(state.conversation_messages, content);
+					const now = new Date().toISOString();
+					return {
+						...state,
+						conversation_messages: [
+							...state.conversation_messages,
+							{ role: 'user', content, created_at: now },
+							{ role: 'assistant', content: reply, created_at: now },
+						],
+						pending_user_inputs: [...state.pending_user_inputs, content],
+						updated_at: now,
+					};
+				},
+				buildResponse: (state) => {
+					const last = state.conversation_messages[state.conversation_messages.length - 1];
+					return { type: 'conversation_response', message: last?.content ?? '' };
+				},
 			};
 		}
 

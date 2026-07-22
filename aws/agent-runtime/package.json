@@ -13,7 +13,8 @@
   "dependencies": {
     "@aws-sdk/client-apigatewaymanagementapi": "^3.600.0",
     "@aws-sdk/client-dynamodb": "^3.600.0",
-    "@aws-sdk/lib-dynamodb": "^3.600.0"
+    "@aws-sdk/lib-dynamodb": "^3.600.0",
+    "vibesdk-llm-client": "file:../llm-client"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.138",

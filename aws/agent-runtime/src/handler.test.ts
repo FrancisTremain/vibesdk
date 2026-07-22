@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { APIGatewayProxyResultV2, APIGatewayProxyStructuredResultV2, APIGatewayProxyWebsocketEventV2 } from 'aws-lambda';
 import { mockClient } from 'aws-sdk-client-mock';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
@@ -6,6 +6,13 @@ import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk
 
 process.env.AGENT_SESSIONS_TABLE = 'vibesdk-agent-sessions';
 process.env.AGENT_CONNECTIONS_TABLE = 'vibesdk-agent-connections';
+
+// ./llm.ts makes a real HTTP call via vibesdk-llm-client -- mocked here so
+// user_suggestion tests exercise handler.ts's/messages.ts's own logic
+// (state mutation, error propagation) without a real network dependency.
+// vibesdk-llm-client itself is tested against a fake fetch in its own package.
+const generateAssistantReplyMock = vi.fn<(history: unknown[], message: string) => Promise<string>>();
+vi.mock('./llm', () => ({ generateAssistantReply: (...args: [unknown[], string]) => generateAssistantReplyMock(...args) }));
 
 const { handler } = await import('./handler');
 
@@ -53,6 +60,8 @@ beforeEach(() => {
 	ddbMock.reset();
 	apigwMock.reset();
 	apigwMock.on(PostToConnectionCommand).resolves({});
+	generateAssistantReplyMock.mockReset();
+	generateAssistantReplyMock.mockResolvedValue('a reply');
 });
 
 describe('$connect', () => {
@@ -146,30 +155,49 @@ describe('$default', () => {
 		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-connections' }).resolves({ Item: { connection_id: 'conn-1', session_id: 'session-1' } });
 	}
 
-	it('appends a user_suggestion to conversation history under the optimistic lock', async () => {
+	it('calls the LLM and appends both turns to conversation history under the optimistic lock', async () => {
 		wireConnection();
 		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
 		ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
+		generateAssistantReplyMock.mockResolvedValue('Sure, building that now.');
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'user_suggestion', message: 'build me a todo app' }) }));
+
+		expect(generateAssistantReplyMock).toHaveBeenCalledWith([], 'build me a todo app');
 
 		const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
 		expect(puts).toHaveLength(1);
 		expect(puts[0]!.args[0]!.input.Item).toMatchObject({
 			lock_version: 3,
 			pending_user_inputs: ['build me a todo app'],
-			conversation_messages: [{ role: 'user', content: 'build me a todo app' }],
+			conversation_messages: [
+				{ role: 'user', content: 'build me a todo app' },
+				{ role: 'assistant', content: 'Sure, building that now.' },
+			],
 		});
 		const [response] = responsesSent();
-		expect(response).toMatchObject({ type: 'user_suggestions_processing' });
+		expect(response).toMatchObject({ type: 'conversation_response', message: 'Sure, building that now.' });
 	});
 
 	it('rejects a user_suggestion with no message and persists nothing', async () => {
 		wireConnection();
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'user_suggestion' }) }));
 		expect(ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' })).toHaveLength(0);
+		expect(generateAssistantReplyMock).not.toHaveBeenCalled();
 		const [response] = responsesSent();
 		expect(response).toMatchObject({ type: 'error', error: expect.stringContaining('No message provided') });
+	});
+
+	it('responds with an error and persists nothing when the LLM call fails', async () => {
+		wireConnection();
+		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
+		generateAssistantReplyMock.mockRejectedValue(new Error('No API key configured for provider "anthropic"'));
+
+		await callHandler(wsEvent({ body: JSON.stringify({ type: 'user_suggestion', message: 'build me a todo app' }) }));
+
+		expect(ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' })).toHaveLength(0);
+		const [response] = responsesSent();
+		expect(response).toMatchObject({ type: 'error', error: expect.stringContaining('No API key configured') });
 	});
 
 	it('reapplies the mutation fresh from the re-read state on a lock conflict', async () => {
@@ -184,6 +212,8 @@ describe('$default', () => {
 			.resolves({});
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'user_suggestion', message: 'second message' }) }));
+
+		expect(generateAssistantReplyMock).toHaveBeenCalledTimes(2);
 
 		const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
 		expect(puts).toHaveLength(2);
