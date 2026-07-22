@@ -19,6 +19,11 @@ export interface IncomingMessage {
 	type: string;
 	message?: string;
 	images?: unknown[];
+	data?: {
+		url?: string;
+		viewport?: { width: number; height: number };
+		waitSeconds?: number;
+	};
 }
 
 export type OutgoingMessage = { type: string } & Record<string, unknown>;
@@ -31,6 +36,7 @@ export type OutgoingMessage = { type: string } & Record<string, unknown>;
  */
 export interface GenerationResult {
 	projectName: string;
+	initCommand: string;
 	files: { filePath: string; fileContents: string }[];
 	previewUrl?: string;
 	sandboxInstanceId?: string;
@@ -39,9 +45,26 @@ export interface GenerationResult {
 	gitCommitError?: string;
 }
 
+export interface DeployResult {
+	deployedUrl: string;
+	deploymentInstanceId: string;
+}
+
+export interface CaptureResult {
+	screenshotUrl: string;
+	consoleLogs: { type: string; text: string; timestamp: number }[];
+}
+
 export interface MessageDeps {
 	generateReply: (conversationHistory: ConversationMessage[], userMessage: string) => Promise<string>;
 	runGeneration: (description: string, sessionId: string) => Promise<GenerationResult>;
+	deployProject: (files: { filePath: string; fileContents: string }[], projectName: string, initCommand: string) => Promise<DeployResult>;
+	captureScreenshot: (
+		sessionId: string,
+		url: string,
+		viewport?: { width: number; height: number },
+		waitSeconds?: number,
+	) => Promise<CaptureResult>;
 }
 
 export interface MessagePlan {
@@ -55,12 +78,18 @@ export interface MessagePlan {
 	 * allowed to await instead of being a pure sync function.
 	 */
 	mutate?: (state: AgentSessionState) => AgentSessionState | Promise<AgentSessionState>;
-	/** Response to push back over the connection, built from the final state. `null` = no response (matches the original's silent handling of a few message types). */
-	buildResponse: (state: AgentSessionState) => OutgoingMessage | null;
+	/**
+	 * Response to push back over the connection, built from the final
+	 * state. `null` = no response (matches the original's silent
+	 * handling of a few message types). May be async (capture_screenshot
+	 * calls out to aws/browser-capture-lambda here rather than in
+	 * `mutate`, since a screenshot doesn't change session state).
+	 */
+	buildResponse: (state: AgentSessionState) => OutgoingMessage | null | Promise<OutgoingMessage | null>;
 }
 
 const NOT_IMPLEMENTED_MESSAGE =
-	'This capability is not yet available on the AWS runtime -- the deployment manager, screenshot capture, and resuming a partial generation have not been ported yet.';
+	'This capability is not yet available on the AWS runtime -- resuming a partial generation, live-preview refresh, and model-config listing have not been ported yet.';
 
 function notImplemented(): MessagePlan {
 	return {
@@ -176,6 +205,7 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 						...state,
 						query: state.query || description,
 						project_name: result.projectName,
+						init_command: result.initCommand,
 						generated_files: Object.fromEntries(result.files.map((f) => [f.filePath, f.fileContents])),
 						sandbox_instance_id: result.sandboxInstanceId,
 						preview_url: result.previewUrl,
@@ -197,10 +227,51 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 			};
 		}
 
-		case 'resume_generation':
 		case 'deploy':
+			return {
+				// See ./deploy.ts (in handler.ts's wiring) for what this
+				// really does: launches a second, independent sandbox
+				// instance from the files generate_all already produced --
+				// not the original's blue-green Workers-for-Platforms
+				// pipeline, see that file's module comment for why.
+				mutate: async (state) => {
+					const files = Object.entries(state.generated_files).map(([filePath, fileContents]) => ({ filePath, fileContents }));
+					if (files.length === 0) {
+						throw new Error('Nothing to deploy yet -- run generate_all first.');
+					}
+					const result = await deps.deployProject(files, state.project_name || 'deployed-app', state.init_command || 'bun run dev');
+					return {
+						...state,
+						deployed_url: result.deployedUrl,
+						deployment_instance_id: result.deploymentInstanceId,
+						updated_at: new Date().toISOString(),
+					};
+				},
+				buildResponse: (state) => ({ type: 'deployment_completed', deployedUrl: state.deployed_url }),
+			};
+
+		case 'capture_screenshot': {
+			const url = incoming.data?.url;
+			if (!url) return { immediateError: 'Missing url for screenshot capture', buildResponse: () => null };
+			const viewport = incoming.data?.viewport;
+			const waitSeconds = incoming.data?.waitSeconds;
+			return {
+				// No state mutation -- a screenshot doesn't change anything
+				// about the session, so this is fetched fresh in
+				// buildResponse rather than persisted like generate_all/deploy.
+				buildResponse: async (state) => {
+					try {
+						const result = await deps.captureScreenshot(state.session_id, url, viewport, waitSeconds);
+						return { type: 'screenshot_capture_success', screenshotUrl: result.screenshotUrl, consoleLogs: result.consoleLogs };
+					} catch (err) {
+						return { type: 'screenshot_capture_error', error: err instanceof Error ? err.message : String(err) };
+					}
+				},
+			};
+		}
+
+		case 'resume_generation':
 		case 'preview':
-		case 'capture_screenshot':
 		case 'get_model_configs':
 		case 'terminal_command':
 			return notImplemented();

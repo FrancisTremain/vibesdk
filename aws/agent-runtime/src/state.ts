@@ -43,11 +43,16 @@ export interface AgentSessionState {
 	conversation_messages: ConversationMessage[];
 	pending_user_inputs: string[];
 	generated_files: GeneratedFiles;
+	/** The shell command generate_all's model chose to start the dev server -- carried forward so deploy (./messages.ts's 'deploy' case) can launch an independent long-lived instance the same way, without asking the model again. */
+	init_command?: string;
 	sandbox_instance_id?: string;
 	preview_url?: string;
 	/** Set by generate_all's best-effort commit to aws/git-storage (./git-commit.ts) -- exactly one of the two is set after a successful generation. */
 	git_commit_sha?: string;
 	git_commit_error?: string;
+	/** Set by a successful 'deploy' message -- a second, independent sandbox instance from preview_url's, so regenerating/closing the live coding session doesn't take the deployed app down with it. */
+	deployed_url?: string;
+	deployment_instance_id?: string;
 	created_at: string;
 	updated_at: string;
 	expires_at: number;

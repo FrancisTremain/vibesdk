@@ -234,6 +234,12 @@ resource "aws_lambda_function" "agent_runtime" {
       # bucket (s3.tf). Real S3, not a GitHub-style service account --
       # see git-commit.ts's own module comment for why.
       GIT_STORAGE_BUCKET = aws_s3_bucket.git_storage.bucket
+      # aws/agent-runtime's browser-capture-client.ts -> aws/browser-
+      # capture-lambda. Same root stack as browser-capture.tf, so this
+      # is a direct resource reference, not a plain var like the
+      # sandbox orchestrator's (no cross-stack apply-order problem here).
+      BROWSER_CAPTURE_ENDPOINT = aws_apigatewayv2_api.browser_capture_http.api_endpoint
+      BROWSER_CAPTURE_SECRET   = random_password.browser_capture_secret.result
     }
   }
 

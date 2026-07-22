@@ -1,0 +1,27 @@
+{
+  "name": "vibesdk-browser-capture-lambda",
+  "private": true,
+  "version": "0.0.1",
+  "description": "API Gateway HTTP API (v2) Lambda: headless-Chromium screenshot + console-log capture of a URL (a sandbox preview, typically), via real Playwright -- not an agentic computer-use loop, which is the wrong shape for a deterministic navigate-and-capture task. Replaces the CF BROWSER binding (@cloudflare/puppeteer) used by worker/agents/core/codingAgent.ts's captureScreenshot/captureBrowserConsoleLogs. Not part of the main vibesdk build.",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/handler.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/handler.js --external:@aws-sdk/* --external:@sparticuz/chromium --external:playwright-core",
+    "package": "npm run build && echo '{\"type\":\"module\"}' > dist/package.json && cd dist && zip -r ../browser-capture-lambda.zip handler.js package.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts --root ."
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/s3-request-presigner": "^3.600.0",
+    "@sparticuz/chromium": "^123.0.1",
+    "playwright-core": "^1.42.1"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.138",
+    "@types/node": "^20.14.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
+  }
+}

@@ -61,6 +61,23 @@ This is **not** a full port of `worker/agents/core/codingAgent.ts` +
   returns an `error` response; a failure in the git commit specifically
   does **not** fail the whole operation — see "Why git storage is best-
   effort" below.
+- `deploy` — launches a **second, independent** sandbox instance
+  (`./deploy.ts`, via the same `aws/sandbox-orchestrator-lambda` call
+  `generate_all` uses) from the files already persisted on state — no
+  new LLM call. Persists `deployed_url`/`deployment_instance_id`,
+  responds `deployment_completed`. Errors (nothing persisted) if
+  `generate_all` hasn't produced anything yet. **Not** the original's
+  blue-green Workers-for-Platforms deployment manager — see
+  `./deploy.ts`'s module comment and "Why deploy is a second sandbox
+  instance, not a real deployment pipeline" below.
+- `capture_screenshot` — navigates to `data.url` via
+  [`aws/browser-capture-lambda`](../browser-capture-lambda/)
+  (`./browser-capture-client.ts`), a real headless-Chromium Playwright
+  capture (not an agentic computer-use loop — see that package's
+  README for why), and responds `screenshot_capture_success` with a
+  presigned screenshot URL and captured console output, or
+  `screenshot_capture_error` on failure. Doesn't mutate session state
+  — a screenshot doesn't change anything about the generation.
 - `session_init`, `vault_unlocked`, `vault_locked` — no-ops, matching
   the original (the first is disabled upstream too; the latter two
   target a companion secrets-vault connection this slice doesn't have).
@@ -68,16 +85,16 @@ This is **not** a full port of `worker/agents/core/codingAgent.ts` +
 
 Deliberately returned as an honest "not implemented" `error` response
 (same pattern as `aws/sandbox-controlplane`'s `handleDeploy` 501)
-rather than fabricated behavior: `resume_generation`, `deploy`,
-`preview`, `capture_screenshot`, `get_model_configs`,
-`terminal_command`. Each depends on a piece that doesn't exist on AWS
-yet — resuming a *partial* multi-phase generation (there are no phases
-here to resume), the deployment manager (deploying a finished app to
-its own long-term hosting, distinct from the sandbox preview
-`generate_all` already gives you), or screenshot capture.
+rather than fabricated behavior: `resume_generation` (there are no
+phases here to resume — nothing to be "partial"), `preview` (a
+live-preview force-refresh signal with no separate refresh mechanism
+to trigger here), `get_model_configs` (needs `aws/model-config-defaults`
+wired in — see "LLM and sandbox configuration" below), `terminal_command`.
 `github_export` returns the same deprecation message the original
 already returns (that feature moved to an OAuth redirect flow
-upstream, independent of this migration).
+upstream, independent of this migration — see
+[`aws/github-export-lambda`](../github-export-lambda/) for the real
+HTTP-triggered flow).
 
 ## Why generation is a single-shot JSON call
 
@@ -98,6 +115,25 @@ testable path from a chat message to a running previewable app today,
 instead of another contract-only package waiting on the full pipeline.
 Replacing this with the real phased pipeline is future work, not a
 correction of a bug in this one.
+
+## Why deploy is a second sandbox instance, not a real deployment pipeline
+
+`docs/aws-migration-technical-design.md` scopes the real replacement
+for the original's deployment manager (`wrangler.jsonc` +
+Workers-for-Platforms dispatch) as "vibesdk's own blue-green Terraform
+module for apps a user explicitly deploys long-term" — and calls that
+out explicitly as "the biggest architectural change from how vibesdk
+deploys today." That pipeline doesn't exist yet: no custom domains, no
+blue-green cutover, no separate hosting tier from the sandbox tier.
+`./deploy.ts` does the next most honest thing instead: launch a second
+Fargate task through the exact same `aws/sandbox-orchestrator-lambda`
+path `generate_all` already uses, so a "deployed" app has a URL that
+outlives the live coding session (regenerating or closing the session
+only touches `sandbox_instance_id`, not `deployment_instance_id`).
+Whether that lifecycle independence holds up over time depends on
+nothing else in this migration ever building idle-eviction for
+sandbox tasks either — today *every* sandbox task, preview or deploy,
+just runs until something explicitly calls `shutdownInstance` on it.
 
 ## Why git storage is S3, not a real git host
 
@@ -184,6 +220,15 @@ copy-in step: it's the same root stack's own resource. Missing this
 doesn't fail `generate_all` — see "Why git storage is best-effort"
 above.
 
+`./browser-capture-client.ts` reads `BROWSER_CAPTURE_ENDPOINT` and
+`BROWSER_CAPTURE_SECRET` — also same-root-stack resource references
+(`aws/infra/browser-capture.tf`, wired directly in `agent-runtime.tf`,
+no manual copy-in needed), *unlike* the sandbox orchestrator variables.
+Even fully wired, `capture_screenshot` won't actually capture anything
+until the Chromium Lambda Layer that package's README describes is
+built and published — a real AWS step, same category as
+`aws/sandbox-container`'s Docker image push.
+
 ## A note on API Gateway's 29-second WebSocket integration timeout
 
 `generate_all` can legitimately run for minutes (LLM completion, then
@@ -205,15 +250,18 @@ migration has tested.
 
 ## Testing
 
-29 tests across five files, no real AWS (`aws-sdk-client-mock`, same
+39 tests across seven files, no real AWS (`aws-sdk-client-mock`, same
 convention as `aws/actor-spike`) and no real LLM, sandbox-orchestrator,
-or S3 calls in `handler.test.ts` (`./llm.ts` and `./generation.ts` are
-mocked at the module level; each dependency has its own real-logic
-tests instead — `generation.test.ts` covers `parseGeneratedProject`'s
-JSON validation/error paths directly, `sandbox-client.test.ts` covers
-the orchestrator HTTP call against a fake `fetch`, `git-commit.test.ts`
-runs real `isomorphic-git` `init`/`add`/`commit`/`log`/`readBlob` calls
-against `aws/git-storage`'s `createFakeS3FS` in-memory backend, and
+S3, or browser-capture calls in `handler.test.ts` (`./llm.ts`,
+`./generation.ts`, `./deploy.ts`, and `./browser-capture-client.ts`
+are all mocked at the module level; each has its own real-logic tests
+instead — `generation.test.ts` covers `parseGeneratedProject`'s JSON
+validation/error paths directly, `sandbox-client.test.ts` and
+`deploy.test.ts` cover their respective orchestrator HTTP calls
+against a fake `fetch`, `browser-capture-client.test.ts` covers the
+capture-Lambda HTTP call the same way, `git-commit.test.ts` runs real
+`isomorphic-git` `init`/`add`/`commit`/`log`/`readBlob` calls against
+`aws/git-storage`'s `createFakeS3FS` in-memory backend, and
 `llm-client` itself is tested against a fake `fetch` in its own
 package).
 
@@ -231,8 +279,13 @@ resets and acks; `get_conversation_state` reads without persisting;
 `generate_all` runs generation from an explicit message and persists
 the result; falls back to the last user conversation turn when no
 message is given; errors without persisting when no description is
-available at all; errors without persisting when generation fails; an
-unknown message type errors.
+available at all; errors without persisting when generation fails;
+`deploy` launches an independent instance from already-generated files
+and persists the result; errors without persisting when there's
+nothing to deploy yet; `capture_screenshot` captures without mutating
+state, rejects a missing `url` before ever calling the capture Lambda,
+and turns a capture failure into a `screenshot_capture_error` response
+rather than a raw `error`; an unknown message type errors.
 
 ## Build
 
@@ -250,7 +303,9 @@ Not deployed. Terraform (its own DynamoDB tables, WebSocket API,
 Lambda, IAM role) is in
 [`../infra/agent-runtime.tf`](../infra/agent-runtime.tf) — separate
 resources from `aws/actor-spike`'s (that stays as the throwaway
-latency-measurement artifact it was built as, not repurposed). Depends
-on `aws/infra/sandbox` having been applied and its orchestrator
-endpoint/secret copied into this stack's variables (see above) for
-`generate_all` to work; every other message type works without it.
+latency-measurement artifact it was built as, not repurposed).
+`generate_all` and `deploy` both depend on `aws/infra/sandbox` having
+been applied and its orchestrator endpoint/secret copied into this
+stack's variables (see above); `capture_screenshot` depends on
+`aws/browser-capture-lambda`'s Chromium Lambda Layer having been built
+and published. Every other message type works without either.

@@ -16,9 +16,7 @@
  *
  * See this package's README for exactly which
  * worker/agents/core/websocket.ts message types are really
- * implemented here vs. deliberately stubbed as "not implemented" --
- * the phase-generation pipeline, deployment manager, and screenshot
- * capture are not ported.
+ * implemented here vs. deliberately stubbed as "not implemented".
  */
 
 import type { APIGatewayProxyWebsocketEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
@@ -29,8 +27,10 @@ import { newSessionState, nowEpochSeconds, type AgentSessionState, type WsConnec
 import { planMessage, type IncomingMessage, type MessageDeps, type OutgoingMessage } from './messages';
 import { generateAssistantReply } from './llm';
 import { runGeneration } from './generation';
+import { deployProject } from './deploy';
+import { captureScreenshot } from './browser-capture-client';
 
-const messageDeps: MessageDeps = { generateReply: generateAssistantReply, runGeneration };
+const messageDeps: MessageDeps = { generateReply: generateAssistantReply, runGeneration, deployProject, captureScreenshot };
 
 const AGENT_SESSIONS_TABLE = requireEnv('AGENT_SESSIONS_TABLE');
 const AGENT_CONNECTIONS_TABLE = requireEnv('AGENT_CONNECTIONS_TABLE');
@@ -159,7 +159,7 @@ async function handleMessage(
 		finalState = await loadOrInitState(sessionId);
 	}
 
-	const response = plan.buildResponse(finalState);
+	const response = await plan.buildResponse(finalState);
 	if (response) {
 		await pushToConnection(event, connectionId, response);
 	}

@@ -18,6 +18,16 @@ vi.mock('./llm', () => ({ generateAssistantReply: (...args: [unknown[], string])
 const runGenerationMock = vi.fn<(description: string, sessionId: string) => Promise<import('./messages').GenerationResult>>();
 vi.mock('./generation', () => ({ runGeneration: (...args: [string, string]) => runGenerationMock(...args) }));
 
+const deployProjectMock = vi.fn<(files: unknown[], projectName: string, initCommand: string) => Promise<import('./messages').DeployResult>>();
+vi.mock('./deploy', () => ({ deployProject: (...args: [unknown[], string, string]) => deployProjectMock(...args) }));
+
+const captureScreenshotMock = vi.fn<
+	(sessionId: string, url: string, viewport?: unknown, waitSeconds?: number) => Promise<import('./messages').CaptureResult>
+>();
+vi.mock('./browser-capture-client', () => ({
+	captureScreenshot: (...args: [string, string, unknown, number]) => captureScreenshotMock(...args),
+}));
+
 const { handler } = await import('./handler');
 
 function asStructured(result: APIGatewayProxyResultV2): APIGatewayProxyStructuredResultV2 {
@@ -67,6 +77,8 @@ beforeEach(() => {
 	generateAssistantReplyMock.mockReset();
 	generateAssistantReplyMock.mockResolvedValue('a reply');
 	runGenerationMock.mockReset();
+	deployProjectMock.mockReset();
+	captureScreenshotMock.mockReset();
 });
 
 describe('$connect', () => {
@@ -263,6 +275,7 @@ describe('$default', () => {
 		ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
 		runGenerationMock.mockResolvedValue({
 			projectName: 'todo-app',
+			initCommand: 'bun run dev',
 			files: [{ filePath: 'index.html', fileContents: '<h1>todo</h1>' }],
 			previewUrl: 'http://203.0.113.5:3000',
 			sandboxInstanceId: 'inst-1',
@@ -302,7 +315,7 @@ describe('$default', () => {
 			},
 		});
 		ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
-		runGenerationMock.mockResolvedValue({ projectName: 'calc', files: [{ filePath: 'a.js', fileContents: '1' }] });
+		runGenerationMock.mockResolvedValue({ projectName: 'calc', initCommand: 'bun run dev', files: [{ filePath: 'a.js', fileContents: '1' }] });
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all' }) }));
 
@@ -339,5 +352,70 @@ describe('$default', () => {
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'made_up_type' }) }));
 		const [response] = responsesSent();
 		expect(response).toMatchObject({ type: 'error', error: expect.stringContaining('Unknown message type') });
+	});
+
+	it('deploys the already-generated files as an independent instance', async () => {
+		wireConnection();
+		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({
+			Item: { ...baseSession, project_name: 'todo-app', init_command: 'bun run dev', generated_files: { 'a.txt': 'x' } },
+		});
+		ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
+		deployProjectMock.mockResolvedValue({ deployedUrl: 'http://9.9.9.9:3000', deploymentInstanceId: 'deploy-1' });
+
+		await callHandler(wsEvent({ body: JSON.stringify({ type: 'deploy' }) }));
+
+		expect(deployProjectMock).toHaveBeenCalledWith([{ filePath: 'a.txt', fileContents: 'x' }], 'todo-app', 'bun run dev');
+		const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
+		expect(puts[0]!.args[0]!.input.Item).toMatchObject({ deployed_url: 'http://9.9.9.9:3000', deployment_instance_id: 'deploy-1' });
+		const [response] = responsesSent();
+		expect(response).toMatchObject({ type: 'deployment_completed', deployedUrl: 'http://9.9.9.9:3000' });
+	});
+
+	it('errors without persisting when deploying with nothing generated yet', async () => {
+		wireConnection();
+		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
+
+		await callHandler(wsEvent({ body: JSON.stringify({ type: 'deploy' }) }));
+
+		expect(deployProjectMock).not.toHaveBeenCalled();
+		expect(ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' })).toHaveLength(0);
+		const [response] = responsesSent();
+		expect(response).toMatchObject({ type: 'error', error: expect.stringContaining('Nothing to deploy yet') });
+	});
+
+	it('captures a screenshot without mutating state', async () => {
+		wireConnection();
+		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
+		captureScreenshotMock.mockResolvedValue({ screenshotUrl: 'https://s3.example/x.png', consoleLogs: [{ type: 'error', text: 'boom', timestamp: 1 }] });
+
+		await callHandler(wsEvent({ body: JSON.stringify({ type: 'capture_screenshot', data: { url: 'http://1.2.3.4:3000' } }) }));
+
+		expect(captureScreenshotMock).toHaveBeenCalledWith('session-1', 'http://1.2.3.4:3000', undefined, undefined);
+		expect(ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' })).toHaveLength(0);
+		const [response] = responsesSent();
+		expect(response).toMatchObject({
+			type: 'screenshot_capture_success',
+			screenshotUrl: 'https://s3.example/x.png',
+			consoleLogs: [{ type: 'error', text: 'boom', timestamp: 1 }],
+		});
+	});
+
+	it('rejects capture_screenshot with no url before calling the capture Lambda', async () => {
+		wireConnection();
+		await callHandler(wsEvent({ body: JSON.stringify({ type: 'capture_screenshot' }) }));
+		expect(captureScreenshotMock).not.toHaveBeenCalled();
+		const [response] = responsesSent();
+		expect(response).toMatchObject({ type: 'error', error: expect.stringContaining('Missing url') });
+	});
+
+	it('returns a screenshot_capture_error response when the capture Lambda call fails', async () => {
+		wireConnection();
+		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
+		captureScreenshotMock.mockRejectedValue(new Error('navigation timeout'));
+
+		await callHandler(wsEvent({ body: JSON.stringify({ type: 'capture_screenshot', data: { url: 'http://1.2.3.4:3000' } }) }));
+
+		const [response] = responsesSent();
+		expect(response).toMatchObject({ type: 'screenshot_capture_error', error: 'navigation timeout' });
 	});
 });
