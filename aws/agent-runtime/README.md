@@ -47,16 +47,20 @@ This is **not** a full port of `worker/agents/core/codingAgent.ts` +
   app as a single JSON file list, then calls
   [`aws/sandbox-orchestrator-lambda`](../sandbox-orchestrator-lambda/)
   (`./sandbox-client.ts`) to actually launch a Fargate task, write
-  those files, and start the dev server. On success, persists
-  `generated_files`, `sandbox_instance_id`, and `preview_url` and
-  responds `generation_complete` with a real, browsable preview URL.
-  **This is a deliberate simplification, not a port** of
-  `worker/agents/operations/PhaseGeneration.ts` +
+  those files, and start the dev server, then (`./git-commit.ts`)
+  commits the same files to this session's real git history in S3 via
+  [`aws/git-storage`](../git-storage/) + `isomorphic-git`. On success,
+  persists `generated_files`, `sandbox_instance_id`, `preview_url`, and
+  `git_commit_sha`, and responds `generation_complete` with a real,
+  browsable preview URL. **This is a deliberate simplification, not a
+  port** of `worker/agents/operations/PhaseGeneration.ts` +
   `PhaseImplementation.ts` (multi-phase planning, per-phase streaming
   diffs via the SCOF format, static analysis and fix-up loops between
   phases) — see "Why generation is a single-shot JSON call" below. A
-  failure anywhere in the chain (bad JSON from the model, sandbox
-  launch failure) persists nothing and returns an `error` response.
+  failure in the LLM call or the sandbox launch persists nothing and
+  returns an `error` response; a failure in the git commit specifically
+  does **not** fail the whole operation — see "Why git storage is best-
+  effort" below.
 - `session_init`, `vault_unlocked`, `vault_locked` — no-ops, matching
   the original (the first is disabled upstream too; the latter two
   target a companion secrets-vault connection this slice doesn't have).
@@ -94,6 +98,38 @@ testable path from a chat message to a running previewable app today,
 instead of another contract-only package waiting on the full pipeline.
 Replacing this with the real phased pipeline is future work, not a
 correction of a bug in this one.
+
+## Why git storage is S3, not a real git host
+
+A real git host (GitHub/GitLab) with a service account was considered
+for session storage instead of `aws/git-storage`'s S3 adapter — it
+would mean not maintaining a chunked-object filesystem adapter at all,
+and isomorphic-git already speaks real git HTTP transport natively.
+Rejected for internal per-session storage specifically: this
+migration's standing constraint is AWS-only, and every session's
+generated code would otherwise depend on a third-party service being
+reachable and within its rate limits for the *core* generation loop,
+not just an explicit, opt-in action. A generated app's source also
+shouldn't live on a third party's infrastructure by default just
+because it was generated, before the user has chosen to export
+anything. A real git host stays the right tool for the existing
+GitHub Export feature (`worker/api/controllers/githubExporter/`,
+explicit, OAuth-based, user-initiated) — that's a distinct concern
+from this.
+
+## Why git storage is best-effort
+
+By the time `generation.ts` calls `commitGeneratedFiles`, the sandbox
+task is already running with the user's files — that side effect
+can't be undone, and a working preview is more immediately useful to
+the user than the git history behind it. So unlike every other
+mutate-and-persist path in this package (LLM failure, sandbox launch
+failure: all-or-nothing, nothing persisted), a git-commit failure
+doesn't fail `generate_all`. It's surfaced as `git_commit_error` on
+the persisted state and in the `generation_complete` response instead
+of being silently swallowed, so a real failure (bad IAM permissions,
+`GIT_STORAGE_BUCKET` unset) is visible rather than hidden behind a
+missing `git_commit_sha`.
 
 ## Why the state shape is reduced
 
@@ -141,6 +177,13 @@ stack, then the sandbox module, which itself reads the root stack's
 outputs). Without them set, `generate_all` fails with a clear "not
 configured" error rather than a confusing network failure.
 
+`./git-commit.ts` reads `GIT_STORAGE_BUCKET` — the S3 bucket
+`aws/infra/s3.tf`'s `aws_s3_bucket.git_storage` provisions. Unlike the
+sandbox orchestrator variables above, this doesn't need a manual
+copy-in step: it's the same root stack's own resource. Missing this
+doesn't fail `generate_all` — see "Why git storage is best-effort"
+above.
+
 ## A note on API Gateway's 29-second WebSocket integration timeout
 
 `generate_all` can legitimately run for minutes (LLM completion, then
@@ -162,14 +205,17 @@ migration has tested.
 
 ## Testing
 
-26 tests across four files, no real AWS (`aws-sdk-client-mock`, same
-convention as `aws/actor-spike`) and no real LLM or sandbox-orchestrator
-calls in `handler.test.ts` (`./llm.ts` and `./generation.ts` are
-mocked at the module level; each has its own real-logic tests —
-`generation.test.ts` covers `parseGeneratedProject`'s JSON
-validation/error paths directly, `sandbox-client.test.ts` covers the
-orchestrator HTTP call against a fake `fetch`, and `llm-client` itself
-is tested against a fake `fetch` in its own package).
+29 tests across five files, no real AWS (`aws-sdk-client-mock`, same
+convention as `aws/actor-spike`) and no real LLM, sandbox-orchestrator,
+or S3 calls in `handler.test.ts` (`./llm.ts` and `./generation.ts` are
+mocked at the module level; each dependency has its own real-logic
+tests instead — `generation.test.ts` covers `parseGeneratedProject`'s
+JSON validation/error paths directly, `sandbox-client.test.ts` covers
+the orchestrator HTTP call against a fake `fetch`, `git-commit.test.ts`
+runs real `isomorphic-git` `init`/`add`/`commit`/`log`/`readBlob` calls
+against `aws/git-storage`'s `createFakeS3FS` in-memory backend, and
+`llm-client` itself is tested against a fake `fetch` in its own
+package).
 
 `handler.test.ts`: reject connect with no `sessionId`; initialize a
 new session and ack `agent_connected`; reconnecting to an existing

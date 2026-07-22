@@ -35,11 +35,13 @@ export interface GenerationResult {
 	previewUrl?: string;
 	sandboxInstanceId?: string;
 	bootstrapMessage?: string;
+	gitCommitSha?: string;
+	gitCommitError?: string;
 }
 
 export interface MessageDeps {
 	generateReply: (conversationHistory: ConversationMessage[], userMessage: string) => Promise<string>;
-	runGeneration: (description: string) => Promise<GenerationResult>;
+	runGeneration: (description: string, sessionId: string) => Promise<GenerationResult>;
 }
 
 export interface MessagePlan {
@@ -168,7 +170,7 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 					if (!description) {
 						throw new Error('No project description available -- include a message with generate_all, or send a user_suggestion first.');
 					}
-					const result = await deps.runGeneration(description);
+					const result = await deps.runGeneration(description, state.session_id);
 					const now = new Date().toISOString();
 					return {
 						...state,
@@ -177,6 +179,8 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 						generated_files: Object.fromEntries(result.files.map((f) => [f.filePath, f.fileContents])),
 						sandbox_instance_id: result.sandboxInstanceId,
 						preview_url: result.previewUrl,
+						git_commit_sha: result.gitCommitSha,
+						git_commit_error: result.gitCommitError,
 						current_dev_state: 'REVIEWING',
 						should_be_generating: false,
 						updated_at: now,
@@ -187,6 +191,8 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 					projectName: state.project_name,
 					files: Object.entries(state.generated_files).map(([filePath, fileContents]) => ({ filePath, fileContents })),
 					previewUrl: state.preview_url,
+					gitCommitSha: state.git_commit_sha,
+					gitCommitError: state.git_commit_error,
 				}),
 			};
 		}

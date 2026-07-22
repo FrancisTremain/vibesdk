@@ -45,6 +45,9 @@ export interface AgentSessionState {
 	generated_files: GeneratedFiles;
 	sandbox_instance_id?: string;
 	preview_url?: string;
+	/** Set by generate_all's best-effort commit to aws/git-storage (./git-commit.ts) -- exactly one of the two is set after a successful generation. */
+	git_commit_sha?: string;
+	git_commit_error?: string;
 	created_at: string;
 	updated_at: string;
 	expires_at: number;

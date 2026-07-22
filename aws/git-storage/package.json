@@ -4,8 +4,10 @@
   "version": "0.0.1",
   "description": "S3-only git object storage backend for isomorphic-git (see docs/aws-migration-technical-design.md decision 3). Not part of the main vibesdk build.",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
-    "build": "esbuild src/s3-fs.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/s3-fs.js --external:@aws-sdk/*",
+    "build": "tsc --emitDeclarationOnly --outDir dist && esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --external:@aws-sdk/*",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts --root ."
   },

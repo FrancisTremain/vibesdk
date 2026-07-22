@@ -151,6 +151,36 @@ resource "aws_iam_role_policy" "agent_runtime_lambda_dynamodb" {
   })
 }
 
+resource "aws_iam_role_policy" "agent_runtime_lambda_git_storage" {
+  name = "vibesdk-agent-runtime-git-storage"
+  role = aws_iam_role.agent_runtime_lambda.id
+
+  # aws/agent-runtime's git-commit.ts, via aws/git-storage's S3FS.
+  # S3FS calls HeadObject/GetObject/PutObject/DeleteObjects/CopyObject
+  # (see that package's README) -- none of those are distinct IAM
+  # actions: Head/GetObject are both authorized by s3:GetObject,
+  # CopyObject needs s3:GetObject (read the source) + s3:PutObject
+  # (write the destination), and batch DeleteObjects is authorized per
+  # object by s3:DeleteObject. ListObjectsV2 (readdir) needs
+  # s3:ListBucket, which -- unlike the object-level actions -- applies
+  # to the bucket ARN itself, not an object-path ARN.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = "${aws_s3_bucket.git_storage.arn}/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = aws_s3_bucket.git_storage.arn
+      },
+    ]
+  })
+}
+
 resource "aws_iam_role_policy" "agent_runtime_lambda_apigw_manage_connections" {
   name = "vibesdk-agent-runtime-apigw-manage-connections"
   role = aws_iam_role.agent_runtime_lambda.id
@@ -199,6 +229,11 @@ resource "aws_lambda_function" "agent_runtime" {
       # variables above for why these are plain vars, not remote state.
       SANDBOX_ORCHESTRATOR_ENDPOINT = var.sandbox_orchestrator_endpoint
       SANDBOX_ORCHESTRATOR_SECRET   = var.sandbox_orchestrator_secret
+      # aws/agent-runtime's git-commit.ts -- aws/git-storage's S3FS,
+      # scoped per session under sessions/<sessionId>/git/ in this
+      # bucket (s3.tf). Real S3, not a GitHub-style service account --
+      # see git-commit.ts's own module comment for why.
+      GIT_STORAGE_BUCKET = aws_s3_bucket.git_storage.bucket
     }
   }
 

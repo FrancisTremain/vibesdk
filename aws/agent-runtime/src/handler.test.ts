@@ -15,8 +15,8 @@ process.env.AGENT_CONNECTIONS_TABLE = 'vibesdk-agent-connections';
 const generateAssistantReplyMock = vi.fn<(history: unknown[], message: string) => Promise<string>>();
 vi.mock('./llm', () => ({ generateAssistantReply: (...args: [unknown[], string]) => generateAssistantReplyMock(...args) }));
 
-const runGenerationMock = vi.fn<(description: string) => Promise<import('./messages').GenerationResult>>();
-vi.mock('./generation', () => ({ runGeneration: (...args: [string]) => runGenerationMock(...args) }));
+const runGenerationMock = vi.fn<(description: string, sessionId: string) => Promise<import('./messages').GenerationResult>>();
+vi.mock('./generation', () => ({ runGeneration: (...args: [string, string]) => runGenerationMock(...args) }));
 
 const { handler } = await import('./handler');
 
@@ -270,7 +270,7 @@ describe('$default', () => {
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all', message: 'build me a todo app' }) }));
 
-		expect(runGenerationMock).toHaveBeenCalledWith('build me a todo app');
+		expect(runGenerationMock).toHaveBeenCalledWith('build me a todo app', 'session-1');
 		const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
 		expect(puts).toHaveLength(1);
 		expect(puts[0]!.args[0]!.input.Item).toMatchObject({
@@ -306,7 +306,7 @@ describe('$default', () => {
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all' }) }));
 
-		expect(runGenerationMock).toHaveBeenCalledWith('build a calculator');
+		expect(runGenerationMock).toHaveBeenCalledWith('build a calculator', 'session-1');
 	});
 
 	it('errors without persisting when generate_all has no description available', async () => {

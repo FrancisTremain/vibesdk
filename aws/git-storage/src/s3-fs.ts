@@ -653,3 +653,20 @@ function chunkCountFromMetadata(
 }
 
 export type { S3Object };
+
+/**
+ * Convenience factory for consumers outside this package: constructs
+ * an `S3Client` internally rather than requiring the caller to import
+ * `@aws-sdk/client-s3` themselves and pass one in. That matters across
+ * a `file:` dependency boundary specifically -- a consumer's own
+ * separately-installed `node_modules/@aws-sdk/client-s3` produces a
+ * structurally-identical but nominally distinct `S3Client` type from
+ * this package's copy, which TypeScript then rejects at the `S3FS`
+ * constructor. Calling `createS3FS` instead of `new S3FS(new
+ * S3Client(...), ...)` avoids that entirely -- the `S3Client` never
+ * crosses the package boundary. Pass `s3Client` explicitly only from
+ * within this package's own tests/fakes.
+ */
+export function createS3FS(bucket: string, keyPrefix: string, s3Client?: S3Client): S3FS {
+	return new S3FS(s3Client ?? new S3Client({}), bucket, keyPrefix);
+}

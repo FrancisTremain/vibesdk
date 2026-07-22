@@ -51,18 +51,40 @@ This is not a substitute for testing against real S3 before this ships —
 particularly multipart/large-object behavior and IAM permission edges
 that a fake client can't represent. Do that once real AWS access exists.
 
+## Public exports
+
+`src/index.ts` (the package's `main`/`types` entry) exports `S3FS`,
+`Stat`, and two factories:
+
+- `createS3FS(bucket, keyPrefix, s3Client?)` — constructs its own
+  `S3Client` internally when one isn't passed. Consumers across a
+  `file:` dependency boundary (e.g. `aws/agent-runtime`) should always
+  use this instead of `new S3FS(new S3Client(...), ...)` — a
+  consumer's own separately-installed `@aws-sdk/client-s3` produces a
+  structurally-identical but nominally distinct `S3Client` type that
+  TypeScript rejects at the `S3FS` constructor. Keeping `S3Client`
+  construction inside this package avoids that entirely.
+- `createFakeS3FS(bucket, keyPrefix)` — same idea for tests: returns
+  an `S3FS` backed by an in-memory `FakeS3Client` (also exported
+  directly), so a downstream package's tests can exercise real
+  multi-step git workflows without needing real S3 or fighting the
+  same type-identity issue in their own test files.
+
 ## Build
 
 ```
 npm install
 npm run typecheck
 npm run test
-npm run build   # -> dist/s3-fs.js
+npm run build   # -> dist/index.js
 ```
 
 ## Status
 
-Not wired into the actor Lambda or any real session yet — this is the
-storage backend on its own, unit-tested in isolation. Integration with
-`aws/actor-spike/` (or its eventual successor) and a real S3 bucket is
-still ahead.
+Wired into [`aws/agent-runtime`](../agent-runtime/)'s `generate_all`
+path (`git-commit.ts`, via `createS3FS`) and a real S3 bucket
+(`aws/infra/s3.tf`'s `aws_s3_bucket.git_storage`, IAM wired in
+`aws/infra/agent-runtime.tf`). Still not tested against real S3 itself
+(`src/fake-s3.ts` stands in — see above) — particularly multipart/
+large-object behavior and IAM permission edges a fake client can't
+represent. Do that once real AWS access exists.

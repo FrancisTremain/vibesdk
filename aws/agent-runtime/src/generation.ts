@@ -10,15 +10,17 @@
  * deterministic fixups between phases. This is a deliberate
  * simplification: one LLM call asking for a small complete app as a
  * single JSON object, then one call to aws/sandbox-orchestrator-lambda
- * to actually run it. No phases, no diffing, no fix-up loop, no
- * streaming file-by-file progress events. See this package's README
- * for why that's an honest tradeoff to ship a real end-to-end path
- * with, rather than a half-built phase system.
+ * to actually run it, then a best-effort commit of the same files to
+ * this session's git history in S3 (./git-commit.ts). No phases, no
+ * diffing, no fix-up loop, no streaming file-by-file progress events.
+ * See this package's README for why that's an honest tradeoff to ship
+ * a real end-to-end path with, rather than a half-built phase system.
  */
 
 import { runInference } from 'vibesdk-llm-client';
 import { MODEL_ID, resolveApiKey } from './model';
 import { createSandboxInstance } from './sandbox-client';
+import { commitGeneratedFiles } from './git-commit';
 
 export interface GeneratedFile {
 	filePath: string;
@@ -35,6 +37,9 @@ export interface GenerationResult extends GeneratedProject {
 	previewUrl?: string;
 	sandboxInstanceId?: string;
 	bootstrapMessage?: string;
+	gitCommitSha?: string;
+	/** Set instead of throwing when the git-storage commit fails -- see ./git-commit.ts for why this path is best-effort, not all-or-nothing like the rest of generate_all. */
+	gitCommitError?: string;
 }
 
 const SYSTEM_PROMPT = `You are a code generator for vibesdk, an AI app-generation platform running on a minimal AWS runtime.
@@ -102,13 +107,23 @@ function extractJson(raw: string): string {
 	return fenceMatch?.[1] ?? trimmed;
 }
 
-export async function runGeneration(description: string, fetchImpl: typeof fetch = fetch): Promise<GenerationResult> {
+export async function runGeneration(description: string, sessionId: string, fetchImpl: typeof fetch = fetch): Promise<GenerationResult> {
 	const project = await generateProjectFiles(description);
 	const sandbox = await createSandboxInstance(project.files, project.projectName, project.initCommand, fetchImpl);
-	return {
+
+	const result: GenerationResult = {
 		...project,
 		previewUrl: sandbox.previewURL,
 		sandboxInstanceId: sandbox.runId,
 		bootstrapMessage: typeof sandbox.message === 'string' ? sandbox.message : undefined,
 	};
+
+	try {
+		const { commitSha } = await commitGeneratedFiles(sessionId, project.files, `Generate: ${project.projectName}`);
+		result.gitCommitSha = commitSha;
+	} catch (err) {
+		result.gitCommitError = err instanceof Error ? err.message : String(err);
+	}
+
+	return result;
 }
