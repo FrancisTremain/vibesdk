@@ -168,7 +168,7 @@ resource "aws_security_group" "sandbox_task" {
   }
 
   ingress {
-    description = "Control-plane port (aws/sandbox-controlplane), reachable from the orchestrator Lambda's ENIs and the same IP allowlist for direct debugging"
+    description = "Control-plane port (aws/sandbox-controlplane), reachable from the orchestrator Lambda ENIs and the same IP allowlist for direct debugging"
     from_port   = 8080
     to_port     = 8080
     protocol    = "tcp"
