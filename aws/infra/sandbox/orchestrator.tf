@@ -147,7 +147,10 @@ resource "aws_apigatewayv2_integration" "sandbox_orchestrator_lambda" {
   integration_type       = "AWS_PROXY"
   integration_uri        = aws_lambda_function.sandbox_orchestrator.invoke_arn
   payload_format_version = "2.0"
-  timeout_milliseconds   = var.orchestrator_lambda_timeout_seconds * 1000
+  # API Gateway v2 integration timeout is capped at 30000ms regardless of
+  # the Lambda's own configured timeout (180s here) -- min() keeps this
+  # correct even if orchestrator_lambda_timeout_seconds changes.
+  timeout_milliseconds = min(var.orchestrator_lambda_timeout_seconds * 1000, 30000)
 }
 
 # Kept in sync with aws/sandbox-orchestrator-lambda/src/handler.ts's switch.
