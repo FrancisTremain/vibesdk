@@ -98,3 +98,22 @@ export interface PublicAppQueryOptions {
 	search?: string;
 	userId?: string;
 }
+
+/**
+ * Ported from worker/api/controllers/user/controller.ts's getApps query
+ * params. `sort` is simplified to 'recent'/'oldest' by updatedAt (same
+ * reduction PublicAppQueryOptions already makes -- no popular/trending
+ * ranking); `order` lets the caller flip that direction independent of
+ * `sort`'s label. `period` filters by updatedAt within the given window.
+ */
+export interface UserAppQueryOptions {
+	limit?: number;
+	offset?: number;
+	status?: AppStatus;
+	visibility?: Visibility;
+	framework?: string;
+	search?: string;
+	sort?: 'recent' | 'oldest';
+	order?: 'asc' | 'desc';
+	period?: 'day' | 'week' | 'month' | 'all';
+}

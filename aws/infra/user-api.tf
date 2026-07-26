@@ -114,6 +114,8 @@ resource "aws_apigatewayv2_integration" "user_lambda" {
 # Kept in sync with aws/user-api-lambda/src/handler.ts's switch.
 locals {
   user_api_routes = [
+    "GET /api/user/apps",
+    "PUT /api/user/profile",
     "GET /api/stats",
     "GET /api/stats/activity",
     "GET /api/user/providers",

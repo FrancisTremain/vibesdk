@@ -13,17 +13,18 @@
  * getAppOwnershipByDeploymentId, getPreviewVersion, getAppDetails,
  * toggleAppFavorite, toggleAppStar, recordAppView, getUserAppsWithFavorites,
  * getRecentAppsWithFavorites, getPublicApps (simplified, see below),
- * deleteApp (simplified, see below).
+ * deleteApp (simplified, see below), getUserAppsPaginated (merges the
+ * original's getUserAppsWithAnalytics + getUserAppsCount into one call,
+ * simplified the same way getPublicApps is -- see below).
  *
  * NOT PORTED:
  *   - The weighted trending/popular ranking algorithm
  *     (`executeRankedQuery`, `RANKING_WEIGHTS`, time-period-windowed
- *     recentViews/recentStars). `getPublicApps` here only supports
- *     recent/oldest sort. Real ranking needs its own DynamoDB design
- *     (likely a maintained score attribute + GSI) -- out of scope for
- *     this pass.
- *   - `getUserAppsWithAnalytics`'s 'starred' sort branch and full
- *     ranked-query path, `getUserAppsCount`, `getFavoriteAppsOnly`.
+ *     recentViews/recentStars). `getPublicApps`/`getUserAppsPaginated`
+ *     here only support recent/oldest sort. Real ranking needs its own
+ *     DynamoDB design (likely a maintained score attribute + GSI) --
+ *     out of scope for this pass.
+ *   - `getUserAppsWithAnalytics`'s 'starred' sort branch, `getFavoriteAppsOnly`.
  *   - `deleteApp`'s fork-detachment step (nulling `parentAppId` on any
  *     app that forked from the one being deleted) -- would need a
  *     `by-parent` GSI not designed here. Deleting an app that has forks
@@ -68,6 +69,7 @@ import type {
 	OwnershipResult,
 	PaginatedResult,
 	PublicAppQueryOptions,
+	UserAppQueryOptions,
 	Visibility,
 	ViewerIdentity,
 } from './types';
@@ -423,6 +425,53 @@ export class AppStore {
 
 	async getRecentAppsWithFavorites(userId: string, limit = 10): Promise<AppWithFavoriteStatus[]> {
 		return this.getUserAppsWithFavorites(userId, { limit, offset: 0 });
+	}
+
+	/**
+	 * Ported from AppService.getUserAppsWithAnalytics + getUserAppsCount
+	 * (worker/database/services/AppService.ts) -- same reduction as
+	 * getPublicApps (recent/oldest sort only, title-prefix search), plus
+	 * the same fetch-all-then-filter-in-memory shape (a user's own app
+	 * count is small enough this is fine; see queryByGsi/
+	 * queryListingPartition). Excludes the 'starred' sort branch and full
+	 * ranked-query path, same as this module's other listings.
+	 */
+	async getUserAppsPaginated(userId: string, options: UserAppQueryOptions = {}): Promise<PaginatedResult<EnhancedAppData>> {
+		const { limit = 20, offset = 0, status, visibility, framework, search, sort = 'recent', order, period = 'all' } = options;
+
+		const all = await this.queryByGsi('gsi1', userId, Number.MAX_SAFE_INTEGER, 0);
+		let filtered = all;
+		if (status) filtered = filtered.filter((a) => a.status === status);
+		if (visibility) filtered = filtered.filter((a) => a.visibility === visibility);
+		if (framework) filtered = filtered.filter((a) => a.framework === framework);
+		if (search) {
+			const prefix = search.toLowerCase();
+			filtered = filtered.filter((a) => a.title.toLowerCase().startsWith(prefix));
+		}
+		if (period !== 'all') {
+			const windowMs = { day: 86_400_000, week: 604_800_000, month: 2_592_000_000 }[period];
+			const cutoff = Date.now() - windowMs;
+			filtered = filtered.filter((a) => a.updatedAt >= cutoff);
+		}
+
+		const ascending = order ? order === 'asc' : sort === 'oldest';
+		filtered = [...filtered].sort((a, b) => (ascending ? a.updatedAt - b.updatedAt : b.updatedAt - a.updatedAt));
+
+		const total = filtered.length;
+		const page = filtered.slice(offset, offset + limit);
+
+		const enhanced: EnhancedAppData[] = await Promise.all(
+			page.map(async (app) => ({
+				...app,
+				userFavorited: await this.hasFavorited(userId, app.id),
+				userStarred: await this.hasStarred(userId, app.id),
+			})),
+		);
+
+		return {
+			data: enhanced,
+			pagination: { limit, offset, total, hasMore: offset + limit < total },
+		};
 	}
 
 	/**

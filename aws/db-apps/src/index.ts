@@ -9,6 +9,7 @@ export type {
 	AppVisibilityUpdateResult,
 	PaginatedResult,
 	PublicAppQueryOptions,
+	UserAppQueryOptions,
 	ViewerIdentity,
 	Visibility,
 } from './types';

@@ -3,11 +3,13 @@
  * (worker/api/routes/statsRoutes.ts, worker/api/controllers/stats/
  * controller.ts), custom model-provider listing
  * (worker/api/routes/modelProviderRoutes.ts,
- * worker/api/controllers/modelProviders/controller.ts), and
- * model-config CRUD (worker/api/routes/modelConfigRoutes.ts,
- * worker/api/controllers/modelConfig/controller.ts). Same
- * `event.routeKey`-switch shape as `aws/auth-api-lambda`/
- * `aws/apps-api-lambda`.
+ * worker/api/controllers/modelProviders/controller.ts), model-config
+ * CRUD (worker/api/routes/modelConfigRoutes.ts,
+ * worker/api/controllers/modelConfig/controller.ts), and the user
+ * dashboard's own-apps listing + profile update
+ * (worker/api/routes/userRoutes.ts, worker/api/controllers/user/
+ * controller.ts). Same `event.routeKey`-switch shape as
+ * `aws/auth-api-lambda`/`aws/apps-api-lambda`.
  *
  * Model-config CRUD is wired to `vibesdk-model-config-defaults`, a
  * duplicated snapshot of `AGENT_CONFIG`/`AGENT_CONSTRAINTS` and the
@@ -31,6 +33,8 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { AuthOrchestrator } from 'vibesdk-auth-orchestration';
 import { AnalyticsStore } from 'vibesdk-db-analytics';
+import { AppStore, type UserAppQueryOptions } from 'vibesdk-db-apps';
+import { UserStore } from 'vibesdk-db-identity';
 import { ModelConfigStore, ModelProviderStore } from 'vibesdk-db-model-config';
 import {
 	AGENT_CONFIG,
@@ -63,6 +67,8 @@ let cachedAnalytics: AnalyticsStore | null = null;
 let cachedProviders: ModelProviderStore | null = null;
 let cachedModelConfigs: ModelConfigStore | null = null;
 let cachedAuth: AuthOrchestrator | null = null;
+let cachedApps: AppStore | null = null;
+let cachedUsers: UserStore | null = null;
 let ddbClientOverride: DynamoDBDocumentClient | null = null;
 
 /** Test-only, mirrors the sibling Lambda packages' setDdbClientForTests. */
@@ -72,6 +78,8 @@ export function setDdbClientForTests(client: DynamoDBDocumentClient | null): voi
 	cachedProviders = null;
 	cachedModelConfigs = null;
 	cachedAuth = null;
+	cachedApps = null;
+	cachedUsers = null;
 }
 
 function getDdb(): DynamoDBDocumentClient {
@@ -94,6 +102,18 @@ function getModelConfigs(): ModelConfigStore {
 	if (cachedModelConfigs) return cachedModelConfigs;
 	cachedModelConfigs = new ModelConfigStore(getDdb(), requireEnv('MODEL_CONFIG_TABLE'));
 	return cachedModelConfigs;
+}
+
+function getApps(): AppStore {
+	if (cachedApps) return cachedApps;
+	cachedApps = new AppStore(getDdb(), requireEnv('APPS_TABLE'));
+	return cachedApps;
+}
+
+function getUsers(): UserStore {
+	if (cachedUsers) return cachedUsers;
+	cachedUsers = new UserStore(getDdb(), requireEnv('IDENTITY_TABLE'));
+	return cachedUsers;
 }
 
 function isAgentActionKey(value: string | undefined): value is AgentActionKey {
@@ -147,6 +167,58 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 
 	try {
 		switch (routeKey) {
+			case 'GET /api/user/apps': {
+				// Ported from worker/api/controllers/user/controller.ts's
+				// getApps -- see vibesdk-db-apps's getUserAppsPaginated for
+				// what's simplified (recent/oldest sort only, no ranked
+				// query -- same reduction as GET /api/apps/public).
+				const session = await getUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+
+				const query = new URLSearchParams(event.queryStringParameters as Record<string, string> | undefined);
+				const page = Math.max(parseInt(query.get('page') || '1') || 1, 1);
+				const limit = Math.min(Math.max(parseInt(query.get('limit') || '20') || 20, 1), 100);
+				const status = query.get('status');
+				const visibility = query.get('visibility');
+				const options: UserAppQueryOptions = {
+					limit,
+					offset: (page - 1) * limit,
+					status: status === 'generating' || status === 'completed' ? status : undefined,
+					visibility: visibility === 'private' || visibility === 'public' ? visibility : undefined,
+					framework: query.get('framework') || undefined,
+					search: query.get('search') || undefined,
+					sort: query.get('sort') === 'oldest' ? 'oldest' : 'recent',
+					order: query.get('order') === 'asc' ? 'asc' : query.get('order') === 'desc' ? 'desc' : undefined,
+					period: (['day', 'week', 'month'] as const).includes(query.get('period') as never)
+						? (query.get('period') as 'day' | 'week' | 'month')
+						: 'all',
+				};
+
+				const result = await getApps().getUserAppsPaginated(session.user.id, options);
+				return successResponse({ apps: result.data, pagination: result.pagination });
+			}
+
+			case 'PUT /api/user/profile': {
+				// Ported from worker/api/controllers/user/controller.ts's
+				// updateProfile -- vibesdk-db-identity's
+				// updateUserProfileWithValidation already carries the full
+				// original validation (username format/length/reserved
+				// words, uniqueness), no reduction here.
+				const session = await getUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+
+				const body = parseJsonBody(event);
+				const username = typeof body?.username === 'string' ? body.username : undefined;
+				const displayName = typeof body?.displayName === 'string' ? body.displayName : undefined;
+				const bio = typeof body?.bio === 'string' ? body.bio : undefined;
+				const themeRaw = body?.theme;
+				const theme = themeRaw === 'light' || themeRaw === 'dark' || themeRaw === 'system' ? themeRaw : undefined;
+
+				const result = await getUsers().updateUserProfileWithValidation(session.user.id, { username, displayName, bio, theme });
+				if (!result.success) return errorResponse(result.message, 400);
+				return successResponse(result);
+			}
+
 			case 'GET /api/stats': {
 				const session = await getUser(event);
 				if (!session) return errorResponse('Unauthorized', 401);

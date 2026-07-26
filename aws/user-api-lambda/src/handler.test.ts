@@ -13,6 +13,7 @@ process.env.MODEL_CONFIG_TABLE = 'test-model-config';
 process.env.IDENTITY_TABLE = 'test-identity';
 process.env.AUTH_FLOWS_TABLE = 'test-auth-flows';
 process.env.JWT_SECRET = 'Test-Jwt-Secret-For-UserApiLambda-2024!';
+process.env.ORIGIN_VERIFY_SECRET = 'test-origin-verify-secret';
 
 const { handler, setDdbClientForTests } = await import('./handler');
 
@@ -27,7 +28,6 @@ function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxy
 		routeKey: 'GET /api/stats',
 		rawPath: '/api/stats',
 		rawQueryString: '',
-		headers: {},
 		requestContext: {
 			accountId: '123',
 			apiId: 'api',
@@ -42,6 +42,7 @@ function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxy
 		},
 		isBase64Encoded: false,
 		...overrides,
+		headers: { 'x-origin-verify': 'test-origin-verify-secret', ...overrides.headers },
 	} as APIGatewayProxyEventV2;
 }
 
@@ -85,6 +86,84 @@ describe('user-api-lambda handler', () => {
 		);
 		expect(result.statusCode).toBe(200);
 		expect(body(result).data.appCount).toBe(0);
+	});
+
+	it('requires auth for /api/user/apps', async () => {
+		const result = asStructured(await handler(event({ routeKey: 'GET /api/user/apps' })));
+		expect(result.statusCode).toBe(401);
+	});
+
+	it("lists a user's own apps with pagination", async () => {
+		const { token, userId } = await registerUser(ddb, 'userapps@example.com');
+		const { AppStore } = await import('vibesdk-db-apps');
+		const apps = new AppStore(ddb as unknown as DynamoDBDocumentClient, 'test-apps');
+		await apps.createApp({
+			title: 'My App',
+			description: null,
+			iconUrl: null,
+			originalPrompt: 'build me a thing',
+			finalPrompt: null,
+			framework: 'react',
+			userId,
+			sessionToken: null,
+			visibility: 'private',
+			status: 'completed',
+			deploymentId: null,
+			githubRepositoryUrl: null,
+			githubRepositoryVisibility: null,
+			isArchived: false,
+			isFeatured: false,
+			version: 1,
+			parentAppId: null,
+			previewVersion: 1,
+			screenshotUrl: null,
+			screenshotCapturedAt: null,
+			lastDeployedAt: null,
+		});
+
+		const result = asStructured(
+			await handler(event({ routeKey: 'GET /api/user/apps', headers: { authorization: `Bearer ${token}` } })),
+		);
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data.apps).toHaveLength(1);
+		expect(body(result).data.apps[0].title).toBe('My App');
+		expect(body(result).data.pagination.total).toBe(1);
+	});
+
+	it('requires auth for profile updates', async () => {
+		const result = asStructured(
+			await handler(event({ routeKey: 'PUT /api/user/profile', body: JSON.stringify({ displayName: 'New Name' }) })),
+		);
+		expect(result.statusCode).toBe(401);
+	});
+
+	it('updates displayName and bio for the authenticated user', async () => {
+		const { token } = await registerUser(ddb, 'profile@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'PUT /api/user/profile',
+					headers: { authorization: `Bearer ${token}` },
+					body: JSON.stringify({ displayName: 'New Name', bio: 'Hello there' }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data.success).toBe(true);
+	});
+
+	it('rejects an invalid username on profile update', async () => {
+		const { token } = await registerUser(ddb, 'badusername@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'PUT /api/user/profile',
+					headers: { authorization: `Bearer ${token}` },
+					body: JSON.stringify({ username: 'a' }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(400);
 	});
 
 	it('returns an empty activity timeline for a fresh user', async () => {

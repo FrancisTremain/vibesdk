@@ -245,6 +245,50 @@ describe('getUserAppsWithFavorites', () => {
 	});
 });
 
+describe('getUserAppsPaginated', () => {
+	it('filters by status, visibility, and framework', async () => {
+		const { store } = makeStore();
+		await store.createApp(baseNewApp({ userId: 'alice', status: 'completed', visibility: 'public', framework: 'react' }));
+		await store.createApp(baseNewApp({ userId: 'alice', status: 'generating', visibility: 'public', framework: 'react' }));
+		await store.createApp(baseNewApp({ userId: 'alice', status: 'completed', visibility: 'private', framework: 'vue' }));
+		await store.createApp(baseNewApp({ userId: 'bob', status: 'completed', visibility: 'public', framework: 'react' }));
+
+		const result = await store.getUserAppsPaginated('alice', { status: 'completed', visibility: 'public' });
+		expect(result.data).toHaveLength(1);
+		expect(result.data[0]!.framework).toBe('react');
+		expect(result.pagination.total).toBe(1);
+	});
+
+	it('paginates and reports hasMore', async () => {
+		const { store } = makeStore();
+		for (let i = 0; i < 3; i++) {
+			await store.createApp(baseNewApp({ userId: 'alice', title: `App ${i}` }));
+		}
+
+		const page1 = await store.getUserAppsPaginated('alice', { limit: 2, offset: 0 });
+		expect(page1.data).toHaveLength(2);
+		expect(page1.pagination.total).toBe(3);
+		expect(page1.pagination.hasMore).toBe(true);
+
+		const page2 = await store.getUserAppsPaginated('alice', { limit: 2, offset: 2 });
+		expect(page2.data).toHaveLength(1);
+		expect(page2.pagination.hasMore).toBe(false);
+	});
+
+	it('sorts oldest-first when requested', async () => {
+		const { store } = makeStore();
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date('2026-01-15T12:00:00.000Z'));
+		const first = await store.createApp(baseNewApp({ userId: 'alice', title: 'First' }));
+		vi.setSystemTime(new Date('2026-01-15T12:00:01.000Z'));
+		const second = await store.createApp(baseNewApp({ userId: 'alice', title: 'Second' }));
+		vi.useRealTimers();
+
+		const result = await store.getUserAppsPaginated('alice', { sort: 'oldest' });
+		expect(result.data.map((a) => a.id)).toEqual([first.id, second.id]);
+	});
+});
+
 describe('getPublicApps', () => {
 	it('only includes public or anonymous apps with a listable status', async () => {
 		const { store } = makeStore();
