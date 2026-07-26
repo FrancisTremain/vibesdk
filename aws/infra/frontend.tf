@@ -156,8 +156,15 @@ resource "aws_cloudfront_function" "ip_allowlist" {
 }
 
 resource "aws_cloudfront_distribution" "site" {
-  enabled             = true
-  is_ipv6_enabled     = true
+  enabled = true
+  # The ip_allowlist CloudFront Function's ipToInt() only parses IPv4
+  # dotted-quad addresses -- over IPv6 it returns null for event.viewer.ip,
+  # ipInCidr never matches, and every client (including allowlisted ones)
+  # gets rejected and silently remapped to index.html by
+  # custom_error_response. Disabling IPv6 forces all clients onto IPv4,
+  # matching var.allowed_ips's IPv4 CIDRs. Revisit if IPv6 support and a
+  # real IPv6-aware allowlist are ever needed.
+  is_ipv6_enabled     = false
   default_root_object = "index.html"
   aliases             = [local.site_domain]
 
