@@ -307,15 +307,24 @@ resource "aws_cloudfront_distribution" "site" {
     }
   }
 
+  # error_caching_min_ttl defaults to 300s if unset -- meaning a single
+  # 403/404 (e.g. from a transient origin hiccup, or while debugging) gets
+  # cached and re-served as the SPA fallback for up to 5 minutes independent
+  # of the behavior's own cache policy, and independent of whether an
+  # invalidation targeted the underlying path (error-response caching uses
+  # its own cache keyed by path+status, not the normal cache key). Zero it
+  # out so a fixed backend is reflected immediately.
   custom_error_response {
-    error_code         = 403
-    response_code      = 200
-    response_page_path = "/index.html"
+    error_code            = 403
+    response_code         = 200
+    response_page_path    = "/index.html"
+    error_caching_min_ttl = 0
   }
   custom_error_response {
-    error_code         = 404
-    response_code      = 200
-    response_page_path = "/index.html"
+    error_code            = 404
+    response_code         = 200
+    response_page_path    = "/index.html"
+    error_caching_min_ttl = 0
   }
 
   restrictions {
