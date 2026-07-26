@@ -124,18 +124,19 @@ output "cert_validation_records" {
 # apply indefinitely waiting for a validation Terraform can't complete
 # itself.
 
-resource "aws_cloudfront_origin_request_policy" "api_passthrough" {
-  name = "vibesdk-api-passthrough"
-
-  cookies_config {
-    cookie_behavior = "all"
-  }
-  headers_config {
-    header_behavior = "allViewer"
-  }
-  query_strings_config {
-    query_string_behavior = "all"
-  }
+# AWS managed "AllViewerExceptHostHeader" policy (id below is the fixed,
+# documented value for this managed policy -- managed policies aren't
+# creatable/lookupable as a resource, only referenced by id). Forwarding
+# the viewer's original Host header (this distribution's own domain) to
+# the API Gateway origin -- which a plain "allViewer" custom policy did --
+# made the default execute-api endpoint reject every request with a
+# generic {"message":"Forbidden"} 403 *before* Lambda ever ran, since
+# execute-api's default domain validates the Host header matches its own.
+# That 403 then got remapped to the SPA's index.html by
+# custom_error_response, which is why every /api/* call silently returned
+# the frontend instead of JSON.
+locals {
+  api_origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
 }
 
 # IP pinhole at the edge. AWS WAF (aws_wafv2_web_acl) would do this too,
@@ -239,7 +240,7 @@ resource "aws_cloudfront_distribution" "site" {
     target_origin_id         = "auth-api"
     viewer_protocol_policy   = "https-only"
     cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # AWS managed CachingDisabled
-    origin_request_policy_id = aws_cloudfront_origin_request_policy.api_passthrough.id
+    origin_request_policy_id = local.api_origin_request_policy_id
 
     function_association {
       event_type   = "viewer-request"
@@ -254,7 +255,7 @@ resource "aws_cloudfront_distribution" "site" {
     target_origin_id         = "apps-api"
     viewer_protocol_policy   = "https-only"
     cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
-    origin_request_policy_id = aws_cloudfront_origin_request_policy.api_passthrough.id
+    origin_request_policy_id = local.api_origin_request_policy_id
 
     function_association {
       event_type   = "viewer-request"
@@ -269,7 +270,7 @@ resource "aws_cloudfront_distribution" "site" {
     target_origin_id         = "user-api"
     viewer_protocol_policy   = "https-only"
     cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
-    origin_request_policy_id = aws_cloudfront_origin_request_policy.api_passthrough.id
+    origin_request_policy_id = local.api_origin_request_policy_id
 
     function_association {
       event_type   = "viewer-request"
@@ -284,7 +285,7 @@ resource "aws_cloudfront_distribution" "site" {
     target_origin_id         = "user-api"
     viewer_protocol_policy   = "https-only"
     cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
-    origin_request_policy_id = aws_cloudfront_origin_request_policy.api_passthrough.id
+    origin_request_policy_id = local.api_origin_request_policy_id
 
     function_association {
       event_type   = "viewer-request"
@@ -299,7 +300,7 @@ resource "aws_cloudfront_distribution" "site" {
     target_origin_id         = "user-api"
     viewer_protocol_policy   = "https-only"
     cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
-    origin_request_policy_id = aws_cloudfront_origin_request_policy.api_passthrough.id
+    origin_request_policy_id = local.api_origin_request_policy_id
 
     function_association {
       event_type   = "viewer-request"
