@@ -107,6 +107,8 @@ resource "aws_apigatewayv2_integration" "apps_lambda" {
 # Kept in sync with aws/apps-api-lambda/src/handler.ts's switch.
 locals {
   apps_api_routes = [
+    "GET /api/status",
+    "GET /api/capabilities",
     "GET /api/apps/public",
     "GET /api/apps",
     "GET /api/apps/recent",

@@ -12,6 +12,7 @@ process.env.APPS_TABLE = 'test-apps';
 process.env.IDENTITY_TABLE = 'test-identity';
 process.env.AUTH_FLOWS_TABLE = 'test-auth-flows';
 process.env.JWT_SECRET = 'Test-Jwt-Secret-For-AppsApiLambda-2024!';
+process.env.ORIGIN_VERIFY_SECRET = 'test-origin-verify-secret';
 
 const { handler, setDdbClientForTests } = await import('./handler');
 
@@ -26,7 +27,6 @@ function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxy
 		routeKey: 'GET /api/apps/public',
 		rawPath: '/api/apps/public',
 		rawQueryString: '',
-		headers: {},
 		requestContext: {
 			accountId: '123',
 			apiId: 'api',
@@ -41,6 +41,7 @@ function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxy
 		},
 		isBase64Encoded: false,
 		...overrides,
+		headers: { 'x-origin-verify': 'test-origin-verify-secret', ...overrides.headers },
 	} as APIGatewayProxyEventV2;
 }
 
@@ -107,6 +108,19 @@ describe('apps-api-lambda handler', () => {
 		expect(result.statusCode).toBe(200);
 		expect(body(result).data.apps).toHaveLength(1);
 		expect(body(result).data.apps[0].title).toBe('Public App');
+	});
+
+	it('reports no active platform message', async () => {
+		const result = asStructured(await handler(event({ routeKey: 'GET /api/status' })));
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data).toEqual({ globalUserMessage: '', changeLogs: '', hasActiveMessage: false });
+	});
+
+	it('reports platform capabilities with only the general feature enabled', async () => {
+		const result = asStructured(await handler(event({ routeKey: 'GET /api/capabilities' })));
+		expect(result.statusCode).toBe(200);
+		const enabled = body(result).data.features.filter((f: { enabled: boolean }) => f.enabled).map((f: { id: string }) => f.id);
+		expect(enabled).toEqual(['general']);
 	});
 
 	it('rejects an out-of-range page in the public listing', async () => {

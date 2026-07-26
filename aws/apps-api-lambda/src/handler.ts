@@ -101,6 +101,92 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 
 	try {
 		switch (routeKey) {
+			case 'GET /api/status': {
+				// Ported from worker/api/controllers/status/controller.ts.
+				// Global platform messaging (context.config.globalMessaging)
+				// has no AWS equivalent config surface yet, so this always
+				// reports no active message rather than fabricating one.
+				return successResponse({
+					globalUserMessage: '',
+					changeLogs: '',
+					hasActiveMessage: false,
+				});
+			}
+
+			case 'GET /api/capabilities': {
+				// Ported from worker/api/controllers/capabilities/controller.ts.
+				// The original reads PLATFORM_CAPABILITIES from wrangler.jsonc
+				// config; AWS has no equivalent env surface, so feature
+				// enablement is hardcoded to what aws/agent-runtime actually
+				// supports today: a single generic agentic generation flow
+				// (see aws/agent-runtime/src/generation.ts -- no per-project-
+				// type behavior, no SpaceDO/think support), not the "app"
+				// feature's live-reload/think behavior or "presentation"'s
+				// export formats.
+				return successResponse({
+					features: [
+						{
+							id: 'app',
+							name: 'Application',
+							description: 'Full-stack web applications',
+							enabled: false,
+							capabilities: {
+								hasPreview: true,
+								hasLiveReload: false,
+								requiresSandbox: true,
+								requiresWebSocket: true,
+								supportedViews: ['editor', 'preview', 'docs'],
+								defaultView: 'editor',
+								supportedExports: ['github'],
+								hasCustomHeaderActions: false,
+								hasCustomSidebar: false,
+								hasCustomFileFilter: false,
+								behaviorType: 'agentic',
+							},
+						},
+						{
+							id: 'presentation',
+							name: 'Presentation',
+							description: 'Interactive slide presentations',
+							enabled: false,
+							capabilities: {
+								hasPreview: true,
+								hasLiveReload: true,
+								requiresSandbox: true,
+								requiresWebSocket: true,
+								supportedViews: ['editor', 'preview', 'docs'],
+								defaultView: 'preview',
+								supportedExports: ['github'],
+								hasCustomHeaderActions: false,
+								hasCustomSidebar: false,
+								hasCustomFileFilter: false,
+								behaviorType: 'agentic',
+							},
+						},
+						{
+							id: 'general',
+							name: 'General',
+							description: 'General-purpose code generation',
+							enabled: true,
+							capabilities: {
+								hasPreview: false,
+								hasLiveReload: false,
+								requiresSandbox: false,
+								requiresWebSocket: true,
+								supportedViews: ['editor', 'docs'],
+								defaultView: 'editor',
+								supportedExports: ['github'],
+								hasCustomHeaderActions: false,
+								hasCustomSidebar: false,
+								hasCustomFileFilter: false,
+								behaviorType: 'agentic',
+							},
+						},
+					],
+					version: '1.0.0-aws',
+				});
+			}
+
 			case 'GET /api/apps/public': {
 				const session = await getUser(event);
 				const query = new URLSearchParams(event.queryStringParameters as Record<string, string> | undefined);
