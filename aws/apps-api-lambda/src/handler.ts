@@ -11,9 +11,11 @@
  * `getFavoriteAppsOnly` -- excluded when `aws/db-apps` was built,
  * nothing to wire here), git-clone-token/preview-token routes (deploy-
  * token issuance, out of scope until the sandbox/deploy port), fork
- * (disabled in the original too), and public-endpoint rate limiting
- * (`RateLimitService.enforcePublicAppsRateLimit` -- `aws/rate-limit`
- * exists but isn't wired into this handler yet).
+ * (disabled in the original too).
+ *
+ * GET /api/apps/public is rate-limited via vibesdk-rate-limit, matching
+ * the original's enforcePublicAppsRateLimit
+ * (worker/services/rate-limit/rateLimits.ts).
  */
 
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
@@ -21,9 +23,11 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { AuthOrchestrator } from 'vibesdk-auth-orchestration';
 import { AppStore } from 'vibesdk-db-apps';
+import { DynamoRateLimiter } from 'vibesdk-rate-limit';
 import { toPublicAppListItem } from './public-app-dto';
 import { parsePublicAppsQuery } from './public-apps-query';
 import { errorResponse, successResponse } from './response';
+import { getPublicAppsRateLimitIdentifier } from './rate-limit-identifier';
 
 function requireEnv(name: string): string {
 	const value = process.env[name];
@@ -45,6 +49,7 @@ function verifyOrigin(event: APIGatewayProxyEventV2): APIGatewayProxyResultV2 | 
 
 let cachedApps: AppStore | null = null;
 let cachedAuth: AuthOrchestrator | null = null;
+let cachedRateLimiter: DynamoRateLimiter | null = null;
 let ddbClientOverride: DynamoDBDocumentClient | null = null;
 
 /** Test-only, mirrors aws/auth-api-lambda's setDdbClientForTests. */
@@ -52,6 +57,7 @@ export function setDdbClientForTests(client: DynamoDBDocumentClient | null): voi
 	ddbClientOverride = client;
 	cachedApps = null;
 	cachedAuth = null;
+	cachedRateLimiter = null;
 }
 
 function getDdb(): DynamoDBDocumentClient {
@@ -63,6 +69,15 @@ function getApps(): AppStore {
 	cachedApps = new AppStore(getDdb(), requireEnv('APPS_TABLE'));
 	return cachedApps;
 }
+
+function getRateLimiter(): DynamoRateLimiter {
+	if (cachedRateLimiter) return cachedRateLimiter;
+	cachedRateLimiter = new DynamoRateLimiter(getDdb(), requireEnv('RATE_LIMITS_TABLE'));
+	return cachedRateLimiter;
+}
+
+/** Matches worker/services/rate-limit/config.ts's DEFAULT_RATE_LIMIT_SETTINGS.publicApps. */
+const PUBLIC_APPS_RATE_LIMIT = { limit: 120, period: 60, burst: 40, burstWindow: 10 };
 
 function getAuth(): AuthOrchestrator {
 	if (cachedAuth) return cachedAuth;
@@ -189,6 +204,22 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 
 			case 'GET /api/apps/public': {
 				const session = await getUser(event);
+
+				// Layered on top of CloudFront's IP allowlist to make
+				// bulk-harvest/scan attacks more expensive even from an
+				// already-allowlisted client, matching the original's
+				// enforcePublicAppsRateLimit (worker/services/rate-limit/
+				// rateLimits.ts). Fails open on a rate-limiter error rather
+				// than 500ing a listing request over an infra hiccup, same
+				// as the original's catch-and-log behavior.
+				const identifier = getPublicAppsRateLimitIdentifier(event, session?.user.id);
+				try {
+					const rateLimit = await getRateLimiter().increment(`platform:publicApps:${identifier}`, PUBLIC_APPS_RATE_LIMIT);
+					if (!rateLimit.success) return errorResponse('Too many requests', 429);
+				} catch {
+					// Rate limiter unavailable -- fail open, see comment above.
+				}
+
 				const query = new URLSearchParams(event.queryStringParameters as Record<string, string> | undefined);
 				const parsed = parsePublicAppsQuery(query);
 				if (!parsed.ok) return errorResponse(parsed.error, 400);

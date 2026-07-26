@@ -20,6 +20,16 @@
  * 2. `QueryCommand` supports GSI queries (`IndexName`), copied from
  *    `aws/db-apps`'s fake -- needed for `vibesdk-db-audit`'s
  *    `AuditLogStore.listForUser`, which queries the `by-user` GSI.
+ * 3. Also handles `vibesdk-rate-limit`'s DynamoRateLimiter commands,
+ *    which use a `rate_limit_key`/`bucket_start` key schema instead of
+ *    this file's usual `pk`/`sk`, and a `SET ... = if_not_exists(...)
+ *    ADD ...` UpdateExpression this generic fake's regex-based
+ *    SET/ADD parsing doesn't evaluate function calls in (it would
+ *    otherwise write the literal string "if_not_exists(#ttl, :ttl)" as
+ *    the ttl value). Detected by the presence of `rate_limit_key` in
+ *    the command's Key/ExpressionAttributeValues, kept in a separate
+ *    Map so its numeric `bucket_start` sort key doesn't collide with
+ *    the string `sk` this file's Item type otherwise assumes.
  */
 
 import {
@@ -42,8 +52,16 @@ class TransactionCanceledError extends Error {
 	}
 }
 
+interface RateLimitItem {
+	rate_limit_key: string;
+	bucket_start: number;
+	count: number;
+	ttl: number;
+}
+
 export class FakeDynamoDocumentClient {
 	private readonly items = new Map<string, Item>();
+	private readonly rateLimitItems = new Map<string, RateLimitItem>();
 
 	get size(): number {
 		return this.items.size;
@@ -73,15 +91,26 @@ export class FakeDynamoDocumentClient {
 			return { Item: this.items.get(`${pk}#${sk}`) };
 		}
 		if (kind === 'DeleteCommand') {
-			const { pk, sk } = (typed as DeleteCommand).input.Key as { pk: string; sk: string };
-			this.items.delete(`${pk}#${sk}`);
+			const key = (typed as DeleteCommand).input.Key as { pk?: string; sk?: string; rate_limit_key?: string; bucket_start?: number };
+			if (key.rate_limit_key !== undefined) {
+				this.rateLimitItems.delete(this.rateLimitKeyOf(key.rate_limit_key, key.bucket_start!));
+				return {};
+			}
+			this.items.delete(`${key.pk}#${key.sk}`);
 			return {};
 		}
 		if (kind === 'UpdateCommand') {
+			const key = (typed as UpdateCommand).input.Key as { pk?: string; sk?: string; rate_limit_key?: string; bucket_start?: number };
+			if (key.rate_limit_key !== undefined) {
+				this.applyRateLimitUpdate(typed as UpdateCommand);
+				return {};
+			}
 			this.applyUpdate(typed as UpdateCommand);
 			return {};
 		}
 		if (kind === 'QueryCommand') {
+			const values = (typed as QueryCommand).input.ExpressionAttributeValues ?? {};
+			if (':key' in values) return this.applyRateLimitQuery(typed as QueryCommand);
 			return this.applyQuery(typed as QueryCommand);
 		}
 		if (kind === 'TransactWriteCommand') {
@@ -89,6 +118,41 @@ export class FakeDynamoDocumentClient {
 			return {};
 		}
 		throw new Error(`FakeDynamoDocumentClient: unhandled command ${kind}`);
+	}
+
+	private rateLimitKeyOf(rate_limit_key: string, bucket_start: number): string {
+		return `${rate_limit_key}#${bucket_start}`;
+	}
+
+	private applyRateLimitUpdate(command: UpdateCommand): void {
+		const { Key, ExpressionAttributeValues } = command.input;
+		const rate_limit_key = Key?.rate_limit_key as string;
+		const bucket_start = Key?.bucket_start as number;
+		const inc = ExpressionAttributeValues?.[':inc'] as number;
+		const ttl = ExpressionAttributeValues?.[':ttl'] as number;
+
+		const k = this.rateLimitKeyOf(rate_limit_key, bucket_start);
+		const existing = this.rateLimitItems.get(k);
+		this.rateLimitItems.set(k, {
+			rate_limit_key,
+			bucket_start,
+			count: (existing?.count ?? 0) + inc,
+			ttl: existing?.ttl ?? ttl, // if_not_exists semantics
+		});
+	}
+
+	private applyRateLimitQuery(command: QueryCommand): { Items: RateLimitItem[] } {
+		const values = command.input.ExpressionAttributeValues ?? {};
+		const key = values[':key'] as string;
+		const hasRange = ':start' in values && ':end' in values;
+
+		const matches = Array.from(this.rateLimitItems.values()).filter((item) => {
+			if (item.rate_limit_key !== key) return false;
+			if (!hasRange) return true;
+			return item.bucket_start >= (values[':start'] as number) && item.bucket_start <= (values[':end'] as number);
+		});
+
+		return { Items: matches };
 	}
 
 	private applyQuery(command: QueryCommand): { Items: Item[] } {

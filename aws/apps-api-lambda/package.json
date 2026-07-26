@@ -14,7 +14,8 @@
     "@aws-sdk/client-dynamodb": "^3.600.0",
     "@aws-sdk/lib-dynamodb": "^3.600.0",
     "vibesdk-auth-orchestration": "file:../auth-orchestration",
-    "vibesdk-db-apps": "file:../db-apps"
+    "vibesdk-db-apps": "file:../db-apps",
+    "vibesdk-rate-limit": "file:../rate-limit"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.138",

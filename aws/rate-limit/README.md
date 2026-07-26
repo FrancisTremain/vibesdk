@@ -49,14 +49,17 @@ using `vitest`'s fake timers to control window boundaries deterministically.
 npm install
 npm run typecheck
 npm run test
-npm run build   # -> dist/dynamo-rate-limiter.js
+npm run build   # -> dist/index.js
 ```
 
 ## Status
 
-Not wired into anything real yet — this is the rate limiter on its own,
-unit-tested in isolation, same as `aws/git-storage/`. Needs a real
-DynamoDB table (see `docs/aws-dynamodb-schema.md` for the sibling
-control-plane schema this could live alongside) and integration with
-whatever calls `DORateLimitStore` today
-(`worker/services/rate-limit/rateLimits.ts`).
+Wired into `aws/apps-api-lambda`'s `GET /api/apps/public` (the
+`vibesdk-rate-limits` DynamoDB table, see `aws/infra/
+dynamodb-rate-limit.tf`), matching the original's
+`enforcePublicAppsRateLimit` config (120 req/60s, 40 req/10s burst).
+Not yet wired into the global API rate limit or auth rate limit paths
+(`RateLimitService.enforceGlobalApiLimit`/`enforceAuthRateLimit`) --
+those would need their own call sites in `aws/auth-api-lambda`/
+`aws/user-api-lambda` plus a decision on where a "global" per-request
+limiter belongs when there's no single entry Lambda for all routes.

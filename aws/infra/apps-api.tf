@@ -47,6 +47,16 @@ resource "aws_iam_role_policy" "apps_api_lambda_dynamodb" {
         ]
       },
       {
+        # Rate-limit bucket increments (GET /api/apps/public).
+        Effect = "Allow"
+        Action = [
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+        ]
+        Resource = [aws_dynamodb_table.rate_limits.arn]
+      },
+      {
         # Token validation only -- read the user/session, never write.
         Effect = "Allow"
         Action = [
@@ -84,6 +94,7 @@ resource "aws_lambda_function" "apps_api" {
       APPS_TABLE           = aws_dynamodb_table.apps.name
       IDENTITY_TABLE       = aws_dynamodb_table.identity.name
       AUTH_FLOWS_TABLE     = aws_dynamodb_table.auth_flows.name
+      RATE_LIMITS_TABLE    = aws_dynamodb_table.rate_limits.name
       JWT_SECRET           = var.jwt_secret
       ORIGIN_VERIFY_SECRET = random_password.origin_verify.result
     }

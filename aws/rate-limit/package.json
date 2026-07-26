@@ -4,8 +4,10 @@
   "version": "0.0.1",
   "description": "DynamoDB-backed rate limiter replacing DORateLimitStore (see docs/aws-migration-technical-design.md component mapping). Not part of the main vibesdk build.",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
-    "build": "esbuild src/dynamo-rate-limiter.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/dynamo-rate-limiter.js --external:@aws-sdk/*",
+    "build": "tsc --emitDeclarationOnly --outDir dist && esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --external:@aws-sdk/*",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts --root ."
   },

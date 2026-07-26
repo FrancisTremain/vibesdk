@@ -11,6 +11,7 @@ import { JWTUtils } from 'vibesdk-auth-orchestration';
 process.env.APPS_TABLE = 'test-apps';
 process.env.IDENTITY_TABLE = 'test-identity';
 process.env.AUTH_FLOWS_TABLE = 'test-auth-flows';
+process.env.RATE_LIMITS_TABLE = 'test-rate-limits';
 process.env.JWT_SECRET = 'Test-Jwt-Secret-For-AppsApiLambda-2024!';
 process.env.ORIGIN_VERIFY_SECRET = 'test-origin-verify-secret';
 
@@ -121,6 +122,25 @@ describe('apps-api-lambda handler', () => {
 		expect(result.statusCode).toBe(200);
 		const enabled = body(result).data.features.filter((f: { enabled: boolean }) => f.enabled).map((f: { id: string }) => f.id);
 		expect(enabled).toEqual(['general']);
+	});
+
+	it('rate-limits repeated unauthenticated public-listing requests from the same client', async () => {
+		for (let i = 0; i < 40; i++) {
+			const result = asStructured(await handler(event({ routeKey: 'GET /api/apps/public' })));
+			expect(result.statusCode).toBe(200);
+		}
+
+		const limited = asStructured(await handler(event({ routeKey: 'GET /api/apps/public' })));
+		expect(limited.statusCode).toBe(429);
+	});
+
+	it('tracks rate limits per client so one client cannot exhaust another\'s quota', async () => {
+		for (let i = 0; i < 40; i++) {
+			await handler(event({ routeKey: 'GET /api/apps/public', requestContext: { http: { sourceIp: '9.9.9.9' } } as never }));
+		}
+
+		const otherClient = asStructured(await handler(event({ routeKey: 'GET /api/apps/public' })));
+		expect(otherClient.statusCode).toBe(200);
 	});
 
 	it('rejects an out-of-range page in the public listing', async () => {
