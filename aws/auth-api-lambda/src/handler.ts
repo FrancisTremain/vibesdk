@@ -14,19 +14,26 @@
  * plays the same role for a route table this small.
  *
  * NOT PORTED (see this package's README for the full list and why):
- * session-list/API-key-management routes, CSRF token rotation
- * (`CsrfService`, entirely Cloudflare-cookie-flavored and arguably
- * redundant once every route requires either a bearer token or an
- * HttpOnly SameSite=Lax cookie), Cloudflare OAuth and the AI Gateway
- * auto-connect side effect on its callback (out of scope everywhere
- * else in this migration too), `updateProfile` (needs `UserStore`
- * wiring beyond what `AuthOrchestrator` exposes today).
+ * CSRF token rotation (`CsrfService`, entirely Cloudflare-cookie-
+ * flavored and arguably redundant once every route requires either a
+ * bearer token or an HttpOnly SameSite=Lax cookie), Cloudflare OAuth
+ * and the AI Gateway auto-connect side effect on its callback (out of
+ * scope everywhere else in this migration too).
+ *
+ * Session listing/revocation and API-key management
+ * (list/create/revoke/exchange-for-token) are wired to
+ * `vibesdk-db-identity`'s `SessionStore`/`ApiKeyStore` directly,
+ * alongside `AuthOrchestrator` (which only exposes token validation,
+ * not session/key CRUD). `AuthOrchestrator.validateTokenAndGetUser`
+ * already resolves the exchange endpoint's synthetic `api_key:<id>`
+ * sessionId shape, so no changes were needed there.
  */
 
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-import { AuthOrchestrator, SecurityError, type OAuthProvider } from 'vibesdk-auth-orchestration';
+import { AuthOrchestrator, JWTUtils, SecurityError, type OAuthProvider } from 'vibesdk-auth-orchestration';
+import { ApiKeyStore, SessionStore, UserStore } from 'vibesdk-db-identity';
 import {
 	accessTokenCookie,
 	clearAccessTokenCookie,
@@ -36,6 +43,7 @@ import {
 	OAUTH_NONCE_COOKIE,
 } from './cookies';
 import { errorResponse, redirectResponse, successResponse } from './response';
+import { generateApiKey, sha256Hash } from './api-key-crypto';
 
 function requireEnv(name: string): string {
 	const value = process.env[name];
@@ -57,6 +65,9 @@ function verifyOrigin(event: APIGatewayProxyEventV2): APIGatewayProxyResultV2 | 
 }
 
 let cachedAuth: AuthOrchestrator | null = null;
+let cachedSessions: SessionStore | null = null;
+let cachedApiKeys: ApiKeyStore | null = null;
+let cachedUsers: UserStore | null = null;
 let ddbClientOverride: DynamoDBDocumentClient | null = null;
 
 /** Test-only: inject a fake DynamoDB client instead of a real one, and
@@ -65,13 +76,40 @@ let ddbClientOverride: DynamoDBDocumentClient | null = null;
 export function setDdbClientForTests(client: DynamoDBDocumentClient | null): void {
 	ddbClientOverride = client;
 	cachedAuth = null;
+	cachedSessions = null;
+	cachedApiKeys = null;
+	cachedUsers = null;
 }
+
+function getDdb(): DynamoDBDocumentClient {
+	return ddbClientOverride ?? DynamoDBDocumentClient.from(new DynamoDBClient({}));
+}
+
+function getSessions(): SessionStore {
+	if (cachedSessions) return cachedSessions;
+	cachedSessions = new SessionStore(getDdb(), requireEnv('IDENTITY_TABLE'));
+	return cachedSessions;
+}
+
+function getApiKeys(): ApiKeyStore {
+	if (cachedApiKeys) return cachedApiKeys;
+	cachedApiKeys = new ApiKeyStore(getDdb(), requireEnv('IDENTITY_TABLE'));
+	return cachedApiKeys;
+}
+
+function getUsers(): UserStore {
+	if (cachedUsers) return cachedUsers;
+	cachedUsers = new UserStore(getDdb(), requireEnv('IDENTITY_TABLE'));
+	return cachedUsers;
+}
+
+const MAX_API_KEYS_PER_USER = 25;
 
 /** Built once per warm Lambda instance, not per invocation. */
 function getAuth(): AuthOrchestrator {
 	if (cachedAuth) return cachedAuth;
 
-	const ddb = ddbClientOverride ?? DynamoDBDocumentClient.from(new DynamoDBClient({}));
+	const ddb = getDdb();
 	cachedAuth = new AuthOrchestrator({
 		ddb,
 		identityTable: requireEnv('IDENTITY_TABLE'),
@@ -141,6 +179,8 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 	const auth = getAuth();
 	const routeKey = event.routeKey;
 	const provider = event.pathParameters?.provider;
+	const sessionIdParam = event.pathParameters?.sessionId;
+	const keyId = event.pathParameters?.keyId;
 
 	try {
 		switch (routeKey) {
@@ -195,6 +235,27 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 				const session = await requireUser(event);
 				if (!session) return errorResponse('Unauthorized', 401);
 				return successResponse({ user: session.user, sessionId: session.sessionId });
+			}
+
+			case 'PUT /api/auth/profile': {
+				// Same underlying operation as PUT /api/user/profile
+				// (aws/user-api-lambda) -- the original registers this as
+				// two routes (AuthController.updateProfile /
+				// UserController.updateProfile) against the same
+				// UserService method.
+				const session = await requireUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+
+				const body = parseJsonBody(event);
+				const username = typeof body?.username === 'string' ? body.username : undefined;
+				const displayName = typeof body?.displayName === 'string' ? body.displayName : undefined;
+				const bio = typeof body?.bio === 'string' ? body.bio : undefined;
+				const themeRaw = body?.theme;
+				const theme = themeRaw === 'light' || themeRaw === 'dark' || themeRaw === 'system' ? themeRaw : undefined;
+
+				const result = await getUsers().updateUserProfileWithValidation(session.user.id, { username, displayName, bio, theme });
+				if (!result.success) return errorResponse(result.message, 400);
+				return successResponse(result);
 			}
 
 			case 'POST /api/auth/verify-email': {
@@ -299,6 +360,116 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 				if (!isOAuthProvider(provider)) return errorResponse('Unsupported OAuth provider', 400);
 				await auth.unlinkOAuthIdentity(session.user.id, provider);
 				return successResponse({ message: 'Provider unlinked successfully' });
+			}
+
+			case 'GET /api/auth/sessions': {
+				const session = await requireUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+				const sessions = await getSessions().getUserSessions(session.user.id);
+				return successResponse({ sessions });
+			}
+
+			case 'DELETE /api/auth/sessions/{sessionId}': {
+				const session = await requireUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+				if (!sessionIdParam) return errorResponse('Session ID is required', 400);
+				await getSessions().revokeUserSession(sessionIdParam, session.user.id);
+				return successResponse({ message: 'Session revoked successfully' });
+			}
+
+			case 'GET /api/auth/api-keys': {
+				const session = await requireUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+				const keys = await getApiKeys().getUserApiKeys(session.user.id);
+				return successResponse({
+					keys: keys.map((k) => ({
+						id: k.id,
+						name: k.name,
+						keyPreview: k.keyPreview,
+						createdAt: k.createdAt,
+						lastUsed: k.lastUsed,
+						isActive: !!k.isActive,
+					})),
+				});
+			}
+
+			case 'POST /api/auth/api-keys': {
+				const session = await requireUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+
+				const body = parseJsonBody(event);
+				const name = typeof body?.name === 'string' ? body.name.trim() : '';
+				if (!name) return errorResponse('API key name is required', 400);
+				const sanitizedName = name.substring(0, 100);
+
+				const apiKeys = getApiKeys();
+				const activeCount = await apiKeys.getActiveApiKeyCount(session.user.id);
+				if (activeCount >= MAX_API_KEYS_PER_USER) {
+					return errorResponse(
+						`Maximum of ${MAX_API_KEYS_PER_USER} API keys allowed. Please revoke an existing key before creating a new one.`,
+						400,
+					);
+				}
+
+				const { key, keyHash, keyPreview } = generateApiKey();
+				await apiKeys.createApiKey({ userId: session.user.id, name: sanitizedName, keyHash, keyPreview });
+
+				return successResponse({
+					key, // Returned only once -- the hash is all that's stored.
+					keyPreview,
+					name: sanitizedName,
+					message: 'API key created successfully',
+				});
+			}
+
+			case 'DELETE /api/auth/api-keys/{keyId}': {
+				const session = await requireUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+				if (!keyId) return errorResponse('API key ID is required', 400);
+				await getApiKeys().revokeApiKey(keyId, session.user.id);
+				return successResponse({ message: 'API key revoked successfully' });
+			}
+
+			case 'POST /api/auth/exchange-api-key': {
+				// Ported from AuthController.exchangeApiKey -- exchanges a
+				// long-lived API key for a short-lived (15m) access token
+				// carrying a synthetic `api_key:<id>` sessionId, which
+				// AuthOrchestrator.validateTokenAndGetUser already resolves
+				// back to the source key (see its own module).
+				const authHeader = event.headers?.authorization ?? event.headers?.Authorization;
+				const xApiKey = event.headers?.['x-api-key'] ?? event.headers?.['X-API-Key'];
+
+				let apiKeyRaw: string | null = null;
+				if (authHeader?.toLowerCase().startsWith('bearer ')) {
+					apiKeyRaw = authHeader.slice(7).trim();
+				} else if (xApiKey) {
+					apiKeyRaw = xApiKey.trim();
+				}
+
+				if (!apiKeyRaw) return errorResponse('Missing API key', 401);
+				if (apiKeyRaw.length > 256) return errorResponse('Invalid API key', 401);
+				if (!/^[A-Za-z0-9_-]+$/.test(apiKeyRaw)) return errorResponse('Invalid API key', 401);
+
+				const apiKeys = getApiKeys();
+				const keyHash = sha256Hash(apiKeyRaw);
+				const apiKey = await apiKeys.findApiKeyByHash(keyHash);
+				if (!apiKey) return errorResponse('Invalid API key', 401);
+
+				const user = await auth.getUserForAuth(apiKey.userId);
+				if (!user) return errorResponse('Invalid API key', 401);
+
+				const expiresIn = 15 * 60;
+				const accessToken = await JWTUtils.getInstance(requireEnv('JWT_SECRET')).createToken(
+					{ sub: user.id, email: user.email, type: 'access', sessionId: `api_key:${apiKey.id}` },
+					expiresIn,
+				);
+				await apiKeys.updateApiKeyLastUsed(apiKey.id);
+
+				return successResponse({
+					accessToken,
+					expiresIn,
+					expiresAt: new Date(Date.now() + expiresIn * 1000).toISOString(),
+				});
 			}
 
 			default:

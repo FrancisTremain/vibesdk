@@ -121,6 +121,7 @@ locals {
     "POST /api/auth/logout",
     "GET /api/auth/check",
     "GET /api/auth/profile",
+    "PUT /api/auth/profile",
     "POST /api/auth/verify-email",
     "POST /api/auth/resend-verification",
     "GET /api/auth/oauth/{provider}",
@@ -128,6 +129,12 @@ locals {
     "GET /api/auth/callback/{provider}",
     "GET /api/auth/identities",
     "DELETE /api/auth/identities/{provider}",
+    "GET /api/auth/sessions",
+    "DELETE /api/auth/sessions/{sessionId}",
+    "GET /api/auth/api-keys",
+    "POST /api/auth/api-keys",
+    "DELETE /api/auth/api-keys/{keyId}",
+    "POST /api/auth/exchange-api-key",
   ]
 }
 

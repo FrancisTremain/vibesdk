@@ -16,6 +16,7 @@ process.env.GITHUB_CLIENT_ID = 'gh-client';
 process.env.GITHUB_CLIENT_SECRET = 'gh-secret';
 process.env.GOOGLE_CLIENT_ID = 'go-client';
 process.env.GOOGLE_CLIENT_SECRET = 'go-secret';
+process.env.ORIGIN_VERIFY_SECRET = 'test-origin-verify-secret';
 
 const { handler, setDdbClientForTests } = await import('./handler');
 
@@ -30,7 +31,6 @@ function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxy
 		routeKey: 'GET /api/auth/check',
 		rawPath: '/api/auth/check',
 		rawQueryString: '',
-		headers: {},
 		requestContext: {
 			accountId: '123',
 			apiId: 'api',
@@ -45,6 +45,7 @@ function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxy
 		},
 		isBase64Encoded: false,
 		...overrides,
+		headers: { 'x-origin-verify': 'test-origin-verify-secret', ...overrides.headers },
 	} as APIGatewayProxyEventV2;
 }
 
@@ -54,6 +55,13 @@ function jsonBody(body: unknown): string {
 
 function body(result: APIGatewayProxyStructuredResultV2): any {
 	return JSON.parse(result.body ?? '{}');
+}
+
+async function registerAndGetToken(email: string): Promise<string> {
+	const result = asStructured(
+		await handler(event({ routeKey: 'POST /api/auth/register', body: jsonBody({ email, password: 'Str0ngPassw0rd!' }) })),
+	);
+	return result.cookies!.find((c) => c.startsWith('accessToken='))!.split(';')[0]!.split('=')[1]!;
 }
 
 describe('auth-api-lambda handler', () => {
@@ -240,5 +248,132 @@ describe('auth-api-lambda handler', () => {
 		);
 		expect(result.statusCode).toBe(302);
 		expect(result.headers?.Location).toContain('error=missing_params');
+	});
+
+	it('requires auth on /sessions and lists the current session once logged in', async () => {
+		const unauth = asStructured(await handler(event({ routeKey: 'GET /api/auth/sessions' })));
+		expect(unauth.statusCode).toBe(401);
+
+		const token = await registerAndGetToken('sessions@example.com');
+		const result = asStructured(
+			await handler(event({ routeKey: 'GET /api/auth/sessions', headers: { authorization: `Bearer ${token}` } })),
+		);
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data.sessions.length).toBeGreaterThanOrEqual(1);
+	});
+
+	it('revokes a session by id', async () => {
+		const token = await registerAndGetToken('revoke-session@example.com');
+		const list = asStructured(
+			await handler(event({ routeKey: 'GET /api/auth/sessions', headers: { authorization: `Bearer ${token}` } })),
+		);
+		const sessionId = body(list).data.sessions[0].id;
+
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'DELETE /api/auth/sessions/{sessionId}',
+					pathParameters: { sessionId },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(200);
+	});
+
+	it('updates the profile via PUT /api/auth/profile', async () => {
+		const token = await registerAndGetToken('authprofile@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'PUT /api/auth/profile',
+					headers: { authorization: `Bearer ${token}` },
+					body: jsonBody({ displayName: 'New Name' }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data.success).toBe(true);
+	});
+
+	it('creates, lists, and revokes an API key, enforcing the per-user cap', async () => {
+		const token = await registerAndGetToken('apikeys@example.com');
+		const auth = { authorization: `Bearer ${token}` };
+
+		const created = asStructured(
+			await handler(event({ routeKey: 'POST /api/auth/api-keys', headers: auth, body: jsonBody({ name: 'my key' }) })),
+		);
+		expect(created.statusCode).toBe(200);
+		expect(body(created).data.key).toBeTruthy();
+
+		const listed = asStructured(await handler(event({ routeKey: 'GET /api/auth/api-keys', headers: auth })));
+		expect(body(listed).data.keys).toHaveLength(1);
+		const keyId = body(listed).data.keys[0].id;
+
+		const revoked = asStructured(
+			await handler(event({ routeKey: 'DELETE /api/auth/api-keys/{keyId}', pathParameters: { keyId }, headers: auth })),
+		);
+		expect(revoked.statusCode).toBe(200);
+	});
+
+	it('rejects creating an API key with no name', async () => {
+		const token = await registerAndGetToken('apikey-noname@example.com');
+		const result = asStructured(
+			await handler(
+				event({ routeKey: 'POST /api/auth/api-keys', headers: { authorization: `Bearer ${token}` }, body: jsonBody({}) }),
+			),
+		);
+		expect(result.statusCode).toBe(400);
+	});
+
+	it('exchanges a valid API key for a short-lived access token, then accepts it on /check', async () => {
+		const token = await registerAndGetToken('exchange@example.com');
+		const created = asStructured(
+			await handler(
+				event({
+					routeKey: 'POST /api/auth/api-keys',
+					headers: { authorization: `Bearer ${token}` },
+					body: jsonBody({ name: 'exchange key' }),
+				}),
+			),
+		);
+		const rawKey = body(created).data.key;
+
+		const exchanged = asStructured(
+			await handler(event({ routeKey: 'POST /api/auth/exchange-api-key', headers: { 'x-api-key': rawKey } })),
+		);
+		expect(exchanged.statusCode).toBe(200);
+		const accessToken = body(exchanged).data.accessToken;
+
+		const check = asStructured(
+			await handler(event({ routeKey: 'GET /api/auth/check', headers: { authorization: `Bearer ${accessToken}` } })),
+		);
+		expect(body(check).data.authenticated).toBe(true);
+		expect(body(check).data.user.email).toBe('exchange@example.com');
+	});
+
+	it('rejects exchanging an invalid API key', async () => {
+		const result = asStructured(
+			await handler(event({ routeKey: 'POST /api/auth/exchange-api-key', headers: { 'x-api-key': 'not-a-real-key' } })),
+		);
+		expect(result.statusCode).toBe(401);
+	});
+
+	it('rejects exchanging a revoked API key', async () => {
+		const token = await registerAndGetToken('exchange-revoked@example.com');
+		const auth = { authorization: `Bearer ${token}` };
+		const created = asStructured(
+			await handler(event({ routeKey: 'POST /api/auth/api-keys', headers: auth, body: jsonBody({ name: 'to revoke' }) })),
+		);
+		const rawKey = body(created).data.key;
+		const keyId = body(created).data.keyPreview; // not the id; re-fetch below
+		const listed = asStructured(await handler(event({ routeKey: 'GET /api/auth/api-keys', headers: auth })));
+		const realKeyId = body(listed).data.keys.find((k: { keyPreview: string }) => k.keyPreview === keyId).id;
+		await handler(event({ routeKey: 'DELETE /api/auth/api-keys/{keyId}', pathParameters: { keyId: realKeyId }, headers: auth }));
+
+		const result = asStructured(
+			await handler(event({ routeKey: 'POST /api/auth/exchange-api-key', headers: { 'x-api-key': rawKey } })),
+		);
+		expect(result.statusCode).toBe(401);
 	});
 });
