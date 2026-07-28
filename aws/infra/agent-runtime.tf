@@ -21,13 +21,13 @@ variable "agent_model_id" {
 }
 
 variable "sandbox_orchestrator_endpoint" {
-  description = "aws/infra/sandbox's sandbox_orchestrator_api_endpoint output (aws/infra/sandbox/orchestrator.tf). A plain variable, not a terraform_remote_state read, deliberately -- reading the sandbox module's state from here would invert this migration's established apply order (root stack first, aws/infra/sandbox second, reading the root stack's outputs). Empty until the sandbox module has been applied once and this value copied in; generate_all fails with a clear 'not configured' error until then, rather than this stack's apply blocking on it."
+  description = "aws/infra/sandbox's sandbox_orchestrator_api_endpoint output (aws/infra/sandbox/orchestrator.tf). A plain variable, not a terraform_remote_state read, deliberately -- reading the sandbox module's state from here would invert this migration's established apply order (root stack first, aws/infra/sandbox second, reading the root stack's outputs). Empty (falling back to data.aws_ssm_parameter.sandbox_orchestrator_endpoint in main.tf) until the sandbox module has been applied once and this value copied in; generate_all fails with a clear 'not configured' error until then, rather than this stack's apply blocking on it."
   type        = string
   default     = ""
 }
 
 variable "sandbox_orchestrator_secret" {
-  description = "aws/infra/sandbox's sandbox_orchestrator_secret output (the X-Orchestrator-Secret value aws/sandbox-orchestrator-lambda expects). Same plain-variable reasoning as var.sandbox_orchestrator_endpoint."
+  description = "aws/infra/sandbox's sandbox_orchestrator_secret output (the X-Orchestrator-Secret value aws/sandbox-orchestrator-lambda expects). Same plain-variable/SSM-fallback reasoning as var.sandbox_orchestrator_endpoint."
   type        = string
   default     = ""
   sensitive   = true
@@ -227,8 +227,8 @@ resource "aws_lambda_function" "agent_runtime" {
       # aws/agent-runtime's generation.ts -> sandbox-client.ts, calling
       # aws/sandbox-orchestrator-lambda's createInstance. See the two
       # variables above for why these are plain vars, not remote state.
-      SANDBOX_ORCHESTRATOR_ENDPOINT = var.sandbox_orchestrator_endpoint
-      SANDBOX_ORCHESTRATOR_SECRET   = var.sandbox_orchestrator_secret
+      SANDBOX_ORCHESTRATOR_ENDPOINT = var.sandbox_orchestrator_endpoint != "" ? var.sandbox_orchestrator_endpoint : data.aws_ssm_parameter.sandbox_orchestrator_endpoint.value
+      SANDBOX_ORCHESTRATOR_SECRET   = var.sandbox_orchestrator_secret != "" ? var.sandbox_orchestrator_secret : data.aws_ssm_parameter.sandbox_orchestrator_secret.value
       # aws/agent-runtime's git-commit.ts -- aws/git-storage's S3FS,
       # scoped per session under sessions/<sessionId>/git/ in this
       # bucket (s3.tf). Real S3, not a GitHub-style service account --

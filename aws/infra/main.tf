@@ -73,3 +73,16 @@ data "aws_ssm_parameter" "jwt_secret" {
   name            = "/vibesdk/jwt_secret"
   with_decryption = true
 }
+
+# Same reasoning as data.aws_ssm_parameter.jwt_secret above -- lets a plain
+# `terraform apply` avoid silently blanking these back to var.*'s empty
+# default (which would break the deployed sandbox integration) whenever
+# they aren't explicitly passed.
+data "aws_ssm_parameter" "sandbox_orchestrator_endpoint" {
+  name = "/vibesdk/sandbox_orchestrator_endpoint"
+}
+
+data "aws_ssm_parameter" "sandbox_orchestrator_secret" {
+  name            = "/vibesdk/sandbox_orchestrator_secret"
+  with_decryption = true
+}
