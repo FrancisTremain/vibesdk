@@ -57,6 +57,15 @@ save_to_cache() {
 	rm -f /tmp/cache-save.tar.gz
 }
 
+# CloudShell's default persistent storage is 1GB total, and each package's
+# node_modules runs 100-130MB -- building all 21 packages without cleanup
+# blows past that well before reaching the last few packages. node_modules
+# is only needed transiently to run the package's own build/package script;
+# lib dependents consume the lib via its dist/ output (referenced through
+# the file: dependency's package directory, not its node_modules), and
+# lambdas bundle everything into a self-contained zip via esbuild. So it's
+# safe -- and necessary here -- to remove node_modules immediately after
+# each package's build step.
 for lib in $LIBS; do
 	dir="$AWS_DIR/$lib"
 	if try_restore_from_cache "$dir" "$lib" "dist"; then
@@ -65,6 +74,7 @@ for lib in $LIBS; do
 		(cd "$dir" && npm install --no-audit --no-fund >/dev/null 2>&1 && npm run build >/dev/null 2>&1)
 		save_to_cache "$dir" "$lib" "dist"
 	fi
+	rm -rf "$dir/node_modules"
 done
 
 for lam in $LAMBDAS; do
@@ -76,6 +86,7 @@ for lam in $LAMBDAS; do
 		(cd "$dir" && npm install --no-audit --no-fund >/dev/null 2>&1 && npm run package >/dev/null 2>&1)
 		save_to_cache "$dir" "$lam" "$zip_name"
 	fi
+	rm -rf "$dir/node_modules"
 done
 
 echo "BUILD DONE (cached)"
