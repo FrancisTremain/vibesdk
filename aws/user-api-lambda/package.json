@@ -16,6 +16,7 @@
     "vibesdk-auth-orchestration": "file:../auth-orchestration",
     "vibesdk-db-analytics": "file:../db-analytics",
     "vibesdk-db-apps": "file:../db-apps",
+    "vibesdk-db-llm-usage": "file:../db-llm-usage",
     "vibesdk-db-identity": "file:../db-identity",
     "vibesdk-db-model-config": "file:../db-model-config",
     "vibesdk-model-config-defaults": "file:../model-config-defaults"

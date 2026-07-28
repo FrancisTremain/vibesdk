@@ -1,0 +1,24 @@
+{
+  "name": "vibesdk-db-llm-usage",
+  "private": true,
+  "version": "0.0.1",
+  "description": "DynamoDB-backed LLM usage tracking (tokens/cost/errors per request) for aws/agent-runtime's inference calls, powering GET /api/user/{id}/analytics and GET /api/agent/{id}/analytics -- an AWS-native replacement for the original's Cloudflare AI Gateway GraphQL analytics query, which has no AWS equivalent. Not part of the main vibesdk build.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --emitDeclarationOnly --outDir dist && esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --external:@aws-sdk/*",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts --root ."
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts"
+}

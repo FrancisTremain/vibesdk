@@ -181,7 +181,7 @@ describe('$default', () => {
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'user_suggestion', message: 'build me a todo app' }) }));
 
-		expect(generateAssistantReplyMock).toHaveBeenCalledWith([], 'build me a todo app');
+		expect(generateAssistantReplyMock).toHaveBeenCalledWith([], 'build me a todo app', 'session-1', 'user-1');
 
 		const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
 		expect(puts).toHaveLength(1);
@@ -283,7 +283,7 @@ describe('$default', () => {
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all', message: 'build me a todo app' }) }));
 
-		expect(runGenerationMock).toHaveBeenCalledWith('build me a todo app', 'session-1');
+		expect(runGenerationMock).toHaveBeenCalledWith('build me a todo app', 'session-1', 'user-1');
 		const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
 		expect(puts).toHaveLength(1);
 		expect(puts[0]!.args[0]!.input.Item).toMatchObject({
@@ -319,7 +319,7 @@ describe('$default', () => {
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all' }) }));
 
-		expect(runGenerationMock).toHaveBeenCalledWith('build a calculator', 'session-1');
+		expect(runGenerationMock).toHaveBeenCalledWith('build a calculator', 'session-1', 'user-1');
 	});
 
 	it('errors without persisting when generate_all has no description available', async () => {

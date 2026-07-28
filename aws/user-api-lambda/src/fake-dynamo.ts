@@ -20,6 +20,13 @@
  * 2. `QueryCommand` supports GSI queries (`IndexName`), copied from
  *    `aws/db-apps`'s fake -- needed for `vibesdk-db-audit`'s
  *    `AuditLogStore.listForUser`, which queries the `by-user` GSI.
+ * 3. `GetCommand`/tables can use a single hash key (e.g. `session_id`),
+ *    not just `pk`/`sk` -- needed for the agent-sessions ownership
+ *    check in ./handler.ts. Keyed generically by all the fields in
+ *    `Key`, so both shapes coexist.
+ * 4. `QueryCommand` supports an optional `sk >= :cutoff` /
+ *    `<indexName>sk >= :cutoff` range filter -- needed for
+ *    vibesdk-db-llm-usage's time-windowed analytics queries.
  */
 
 import {
@@ -31,7 +38,13 @@ import {
 	TransactWriteCommand,
 } from '@aws-sdk/lib-dynamodb';
 
-type Item = Record<string, unknown> & { pk: string; sk: string };
+type Item = Record<string, unknown>;
+
+function deriveKey(item: Record<string, unknown>): string {
+	if (item.pk !== undefined && item.sk !== undefined) return `${item.pk}#${item.sk}`;
+	if (item.session_id !== undefined) return `session_id#${item.session_id}`;
+	throw new Error('FakeDynamoDocumentClient: cannot derive key for item (expected pk/sk or session_id)');
+}
 
 class TransactionCanceledError extends Error {
 	name = 'TransactionCanceledException';
@@ -53,6 +66,13 @@ export class FakeDynamoDocumentClient {
 		return this.items.get(`${pk}#${sk}`);
 	}
 
+	/** Test-setup helper for tables that aren't otherwise reachable
+	 *  through this fake's PutCommand path in a given test (e.g. seeding
+	 *  an agent-sessions item directly). */
+	seed(item: Record<string, unknown>): void {
+		this.items.set(deriveKey(item), item);
+	}
+
 	async send(command: unknown): Promise<unknown> {
 		const kind = (command as { constructor?: { name?: string } })?.constructor?.name;
 		const typed = command as
@@ -69,12 +89,12 @@ export class FakeDynamoDocumentClient {
 			return {};
 		}
 		if (kind === 'GetCommand') {
-			const { pk, sk } = (typed as GetCommand).input.Key as { pk: string; sk: string };
-			return { Item: this.items.get(`${pk}#${sk}`) };
+			const key = (typed as GetCommand).input.Key as Record<string, unknown>;
+			return { Item: this.items.get(deriveKey(key)) };
 		}
 		if (kind === 'DeleteCommand') {
-			const { pk, sk } = (typed as DeleteCommand).input.Key as { pk: string; sk: string };
-			this.items.delete(`${pk}#${sk}`);
+			const key = (typed as DeleteCommand).input.Key as Record<string, unknown>;
+			this.items.delete(deriveKey(key));
 			return {};
 		}
 		if (kind === 'UpdateCommand') {
@@ -95,14 +115,18 @@ export class FakeDynamoDocumentClient {
 		const indexName = command.input.IndexName;
 		const values = command.input.ExpressionAttributeValues ?? {};
 		const scanForward = command.input.ScanIndexForward ?? true;
+		const cutoff = values[':cutoff'] as string | undefined;
 
 		if (indexName) {
 			const pkAttr = `${indexName}pk`;
 			const skAttr = `${indexName}sk`;
 			const pkValue = values[':pk'];
-			const matches = Array.from(this.items.values()).filter((item) => item[pkAttr] === pkValue);
+			let matches = Array.from(this.items.values()).filter((item) => item[pkAttr] === pkValue);
+			if (cutoff !== undefined) matches = matches.filter((item) => (item[skAttr] as string) >= cutoff);
 			matches.sort((a, b) => {
-				const diff = ((a[skAttr] as number) ?? 0) - ((b[skAttr] as number) ?? 0);
+				const av = a[skAttr];
+				const bv = b[skAttr];
+				const diff = typeof av === 'string' && typeof bv === 'string' ? av.localeCompare(bv) : ((av as number) ?? 0) - ((bv as number) ?? 0);
 				return scanForward ? diff : -diff;
 			});
 			return { Items: matches };
@@ -112,14 +136,15 @@ export class FakeDynamoDocumentClient {
 		const prefix = values[':prefix'] as string | undefined;
 		const matches = Array.from(this.items.values()).filter((item) => {
 			if (item.pk !== pkValue) return false;
-			if (prefix) return item.sk.startsWith(prefix);
+			if (prefix) return (item.sk as string).startsWith(prefix);
+			if (cutoff !== undefined) return (item.sk as string) >= cutoff;
 			return true;
 		});
 		return { Items: matches };
 	}
 
 	private applyPut(item: Item, conditionExpression?: string): void {
-		const key = `${item.pk}#${item.sk}`;
+		const key = deriveKey(item);
 		if (conditionExpression === 'attribute_not_exists(pk)' && this.items.has(key)) {
 			throw Object.assign(new Error('ConditionalCheckFailedException'), {
 				name: 'ConditionalCheckFailedException',
@@ -129,9 +154,9 @@ export class FakeDynamoDocumentClient {
 	}
 
 	private applyUpdate(command: UpdateCommand): void {
-		const { pk, sk } = command.input.Key as { pk: string; sk: string };
-		const key = `${pk}#${sk}`;
-		const existing = this.items.get(key) ?? ({ pk, sk } as Item);
+		const keyObj = command.input.Key as Record<string, unknown>;
+		const key = deriveKey(keyObj);
+		const existing = this.items.get(key) ?? (keyObj as Item);
 		const values = command.input.ExpressionAttributeValues ?? {};
 		const names = command.input.ExpressionAttributeNames ?? {};
 		const expr = command.input.UpdateExpression ?? '';

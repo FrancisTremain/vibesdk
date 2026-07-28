@@ -15,6 +15,7 @@
     "@aws-sdk/client-dynamodb": "^3.600.0",
     "@aws-sdk/lib-dynamodb": "^3.600.0",
     "isomorphic-git": "^1.27.0",
+    "vibesdk-db-llm-usage": "file:../db-llm-usage",
     "vibesdk-git-storage": "file:../git-storage",
     "vibesdk-llm-client": "file:../llm-client"
   },

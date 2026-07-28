@@ -143,11 +143,20 @@ resource "aws_iam_role_policy" "agent_runtime_lambda_dynamodb" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"]
-      Resource = [aws_dynamodb_table.agent_sessions.arn, aws_dynamodb_table.agent_connections.arn]
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"]
+        Resource = [aws_dynamodb_table.agent_sessions.arn, aws_dynamodb_table.agent_connections.arn]
+      },
+      {
+        # Write-only -- aws/agent-runtime never reads this table back,
+        # only aws/user-api-lambda's analytics routes do.
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem"]
+        Resource = [aws_dynamodb_table.llm_usage.arn]
+      },
+    ]
   })
 }
 
@@ -216,6 +225,7 @@ resource "aws_lambda_function" "agent_runtime" {
     variables = {
       AGENT_SESSIONS_TABLE    = aws_dynamodb_table.agent_sessions.name
       AGENT_CONNECTIONS_TABLE = aws_dynamodb_table.agent_connections.name
+      LLM_USAGE_TABLE         = aws_dynamodb_table.llm_usage.name
       # aws/llm-client provider dispatch -- see that package's README for
       # the provider/model-name id convention and the apiKeyEnvVarFor()
       # naming this must match (${PROVIDER}_API_KEY, matching

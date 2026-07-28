@@ -56,6 +56,18 @@ resource "aws_iam_role_policy" "user_api_lambda_dynamodb" {
         Action   = ["dynamodb:GetItem", "dynamodb:Query"]
         Resource = [aws_dynamodb_table.identity.arn, aws_dynamodb_table.auth_flows.arn]
       },
+      {
+        # GET /api/user/{id}/analytics, GET /api/agent/{id}/analytics.
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query"]
+        Resource = [aws_dynamodb_table.llm_usage.arn, "${aws_dynamodb_table.llm_usage.arn}/index/*"]
+      },
+      {
+        # GET /api/agent/{id}/analytics's ownership check (isSessionOwner).
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = [aws_dynamodb_table.agent_sessions.arn]
+      },
     ]
   })
 }
@@ -79,10 +91,12 @@ resource "aws_lambda_function" "user_api" {
 
   environment {
     variables = {
-      APPS_TABLE         = aws_dynamodb_table.apps.name
-      MODEL_CONFIG_TABLE = aws_dynamodb_table.model_config.name
-      IDENTITY_TABLE     = aws_dynamodb_table.identity.name
-      AUTH_FLOWS_TABLE   = aws_dynamodb_table.auth_flows.name
+      APPS_TABLE           = aws_dynamodb_table.apps.name
+      MODEL_CONFIG_TABLE   = aws_dynamodb_table.model_config.name
+      IDENTITY_TABLE       = aws_dynamodb_table.identity.name
+      AUTH_FLOWS_TABLE     = aws_dynamodb_table.auth_flows.name
+      LLM_USAGE_TABLE      = aws_dynamodb_table.llm_usage.name
+      AGENT_SESSIONS_TABLE = aws_dynamodb_table.agent_sessions.name
       JWT_SECRET         = var.jwt_secret != "" ? var.jwt_secret : data.aws_ssm_parameter.jwt_secret.value
       # Read by vibesdk-model-config-defaults (AGENT_CONFIG selection,
       # BYOK-platform-key check) -- see that package's README.
@@ -116,6 +130,8 @@ locals {
   user_api_routes = [
     "GET /api/user/apps",
     "PUT /api/user/profile",
+    "GET /api/user/{id}/analytics",
+    "GET /api/agent/{id}/analytics",
     "GET /api/stats",
     "GET /api/stats/activity",
     "GET /api/user/providers",

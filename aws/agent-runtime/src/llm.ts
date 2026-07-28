@@ -11,6 +11,7 @@
 import { runInference, type ChatMessage } from 'vibesdk-llm-client';
 import type { ConversationMessage } from './state';
 import { MODEL_ID, resolveApiKey } from './model';
+import { recordUsage } from './usage';
 
 const SYSTEM_PROMPT =
 	'You are the conversational assistant for vibesdk, an AI app-generation platform. ' +
@@ -19,7 +20,12 @@ const SYSTEM_PROMPT =
 	'for something that requires those, say so plainly rather than claiming to have done it. ' +
 	'Otherwise, respond helpfully and concisely.';
 
-export async function generateAssistantReply(history: ConversationMessage[], userMessage: string): Promise<string> {
+export async function generateAssistantReply(
+	history: ConversationMessage[],
+	userMessage: string,
+	sessionId: string,
+	userId: string,
+): Promise<string> {
 	const apiKey = resolveApiKey(MODEL_ID);
 
 	const messages: ChatMessage[] = [
@@ -28,6 +34,21 @@ export async function generateAssistantReply(history: ConversationMessage[], use
 		{ role: 'user', content: userMessage },
 	];
 
-	const result = await runInference({ modelId: MODEL_ID, apiKey, messages, maxTokens: 1024 });
-	return result.content;
+	const provider = MODEL_ID.split('/')[0] ?? MODEL_ID;
+	try {
+		const result = await runInference({ modelId: MODEL_ID, apiKey, messages, maxTokens: 1024 });
+		await recordUsage({
+			userId,
+			sessionId,
+			provider,
+			model: MODEL_ID,
+			tokensIn: result.usage.inputTokens,
+			tokensOut: result.usage.outputTokens,
+			error: false,
+		});
+		return result.content;
+	} catch (err) {
+		await recordUsage({ userId, sessionId, provider, model: MODEL_ID, tokensIn: 0, tokensOut: 0, error: true });
+		throw err;
+	}
 }

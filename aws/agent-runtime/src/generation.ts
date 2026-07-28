@@ -21,6 +21,7 @@ import { runInference } from 'vibesdk-llm-client';
 import { MODEL_ID, resolveApiKey } from './model';
 import { createSandboxInstance } from './sandbox-client';
 import { commitGeneratedFiles } from './git-commit';
+import { recordUsage } from './usage';
 
 export interface GeneratedFile {
 	filePath: string;
@@ -54,18 +55,40 @@ Rules:
 - Do not invent external services, databases, or API keys the app can't actually run without.
 - Every file's "fileContents" must be the complete, final file content -- no diffs, no placeholders like "// rest of the code".`;
 
-export async function generateProjectFiles(description: string): Promise<GeneratedProject> {
+export async function generateProjectFiles(description: string, sessionId: string, userId: string): Promise<GeneratedProject> {
 	const apiKey = resolveApiKey(MODEL_ID);
-	const result = await runInference({
-		modelId: MODEL_ID,
-		apiKey,
-		maxTokens: 8192,
-		messages: [
-			{ role: 'system', content: SYSTEM_PROMPT },
-			{ role: 'user', content: description },
-		],
-	});
-	return parseGeneratedProject(result.content);
+	const provider = MODEL_ID.split('/')[0] ?? MODEL_ID;
+
+	let content: string;
+	try {
+		const result = await runInference({
+			modelId: MODEL_ID,
+			apiKey,
+			maxTokens: 8192,
+			messages: [
+				{ role: 'system', content: SYSTEM_PROMPT },
+				{ role: 'user', content: description },
+			],
+		});
+		await recordUsage({
+			userId,
+			sessionId,
+			provider,
+			model: MODEL_ID,
+			tokensIn: result.usage.inputTokens,
+			tokensOut: result.usage.outputTokens,
+			error: false,
+		});
+		content = result.content;
+	} catch (err) {
+		await recordUsage({ userId, sessionId, provider, model: MODEL_ID, tokensIn: 0, tokensOut: 0, error: true });
+		throw err;
+	}
+
+	// Deliberately outside the try/catch above -- a parse failure here
+	// means the LLM call itself succeeded (tokens spent, no provider
+	// error), so it must not be double-recorded as a usage error.
+	return parseGeneratedProject(content);
 }
 
 /** Exported for direct unit testing of the parsing/validation logic without a network call. */
@@ -107,8 +130,8 @@ function extractJson(raw: string): string {
 	return fenceMatch?.[1] ?? trimmed;
 }
 
-export async function runGeneration(description: string, sessionId: string, fetchImpl: typeof fetch = fetch): Promise<GenerationResult> {
-	const project = await generateProjectFiles(description);
+export async function runGeneration(description: string, sessionId: string, userId: string, fetchImpl: typeof fetch = fetch): Promise<GenerationResult> {
+	const project = await generateProjectFiles(description, sessionId, userId);
 	const sandbox = await createSandboxInstance(project.files, project.projectName, project.initCommand, fetchImpl);
 
 	const result: GenerationResult = {

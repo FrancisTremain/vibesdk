@@ -12,6 +12,8 @@ process.env.APPS_TABLE = 'test-apps';
 process.env.MODEL_CONFIG_TABLE = 'test-model-config';
 process.env.IDENTITY_TABLE = 'test-identity';
 process.env.AUTH_FLOWS_TABLE = 'test-auth-flows';
+process.env.LLM_USAGE_TABLE = 'test-llm-usage';
+process.env.AGENT_SESSIONS_TABLE = 'test-agent-sessions';
 process.env.JWT_SECRET = 'Test-Jwt-Secret-For-UserApiLambda-2024!';
 process.env.ORIGIN_VERIFY_SECRET = 'test-origin-verify-secret';
 
@@ -367,5 +369,149 @@ describe('model-config routes', () => {
 		);
 		expect(result.statusCode).toBe(200);
 		expect(body(result).data.resetCount).toBe(1);
+	});
+
+	it('requires auth for /api/user/{id}/analytics', async () => {
+		const result = asStructured(
+			await handler(event({ routeKey: 'GET /api/user/{id}/analytics', pathParameters: { id: 'someone' } })),
+		);
+		expect(result.statusCode).toBe(401);
+	});
+
+	it("rejects reading another user's analytics", async () => {
+		const { token } = await registerUser(ddb, 'ua-owner@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'GET /api/user/{id}/analytics',
+					pathParameters: { id: 'not-me' },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(403);
+	});
+
+	it('rejects an out-of-range days parameter for /api/user/{id}/analytics', async () => {
+		const { token, userId } = await registerUser(ddb, 'ua-days@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'GET /api/user/{id}/analytics',
+					pathParameters: { id: userId },
+					rawQueryString: 'days=400',
+					queryStringParameters: { days: '400' },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(400);
+	});
+
+	it('returns zeroed usage analytics for a user with no recorded LLM calls', async () => {
+		const { token, userId } = await registerUser(ddb, 'ua-zero@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'GET /api/user/{id}/analytics',
+					pathParameters: { id: userId },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data).toMatchObject({ userId, totalRequests: 0, errorRate: 0, lastRequestAt: null });
+	});
+
+	it('aggregates recorded LLM usage for a user', async () => {
+		const { token, userId } = await registerUser(ddb, 'ua-agg@example.com');
+		const { UsageStore } = await import('vibesdk-db-llm-usage');
+		const usage = new UsageStore(ddb as unknown as ConstructorParameters<typeof UsageStore>[0], 'test-llm-usage');
+		await usage.recordUsage({
+			userId,
+			sessionId: 'session-1',
+			provider: 'anthropic',
+			model: 'anthropic/claude-sonnet-4-5',
+			tokensIn: 100,
+			tokensOut: 50,
+			error: false,
+		});
+
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'GET /api/user/{id}/analytics',
+					pathParameters: { id: userId },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data).toMatchObject({ userId, totalRequests: 1, tokensIn: 100, tokensOut: 50 });
+	});
+
+	it('requires auth for /api/agent/{id}/analytics', async () => {
+		const result = asStructured(
+			await handler(event({ routeKey: 'GET /api/agent/{id}/analytics', pathParameters: { id: 'session-1' } })),
+		);
+		expect(result.statusCode).toBe(401);
+	});
+
+	it("rejects reading another user's agent session analytics", async () => {
+		const { token } = await registerUser(ddb, 'aa-owner@example.com');
+		ddb.seed({ session_id: 'someone-elses-session', user_id: 'a-different-user' });
+
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'GET /api/agent/{id}/analytics',
+					pathParameters: { id: 'someone-elses-session' },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(403);
+	});
+
+	it('returns 403 for an agent session that does not exist', async () => {
+		const { token } = await registerUser(ddb, 'aa-missing@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'GET /api/agent/{id}/analytics',
+					pathParameters: { id: 'nonexistent-session' },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(403);
+	});
+
+	it('returns usage analytics for a session the user owns', async () => {
+		const { token, userId } = await registerUser(ddb, 'aa-owned@example.com');
+		ddb.seed({ session_id: 'my-session', user_id: userId });
+		const { UsageStore } = await import('vibesdk-db-llm-usage');
+		const usage = new UsageStore(ddb as unknown as ConstructorParameters<typeof UsageStore>[0], 'test-llm-usage');
+		await usage.recordUsage({
+			userId,
+			sessionId: 'my-session',
+			provider: 'anthropic',
+			model: 'anthropic/claude-sonnet-4-5',
+			tokensIn: 10,
+			tokensOut: 20,
+			error: true,
+		});
+
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'GET /api/agent/{id}/analytics',
+					pathParameters: { id: 'my-session' },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data).toMatchObject({ sessionId: 'my-session', totalRequests: 1, erroredRequests: 1, errorRate: 1 });
 	});
 });

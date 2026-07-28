@@ -19,7 +19,7 @@ AWS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CACHE_BUCKET="vibesdk-terraform-state"
 CACHE_PREFIX="lambda-build-cache"
 
-LIBS="oauth-clients auth-crypto db-identity db-auth-flows db-audit db-apps db-analytics db-model-config model-config-defaults llm-client git-storage secrets-vault auth-orchestration rate-limit"
+LIBS="oauth-clients auth-crypto db-identity db-auth-flows db-audit db-apps db-analytics db-llm-usage db-model-config model-config-defaults llm-client git-storage secrets-vault auth-orchestration rate-limit"
 LAMBDAS="actor-spike auth-api-lambda apps-api-lambda user-api-lambda agent-runtime github-export-lambda browser-capture-lambda sandbox-orchestrator-lambda"
 
 package_hash() {

@@ -324,6 +324,21 @@ resource "aws_cloudfront_distribution" "site" {
   }
 
   ordered_cache_behavior {
+    path_pattern             = "/api/agent/*"
+    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods           = ["GET", "HEAD"]
+    target_origin_id         = "user-api"
+    viewer_protocol_policy   = "https-only"
+    cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+    origin_request_policy_id = local.api_origin_request_policy_id
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.ip_allowlist.arn
+    }
+  }
+
+  ordered_cache_behavior {
     path_pattern             = "/api/model-configs*"
     allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
     cached_methods           = ["GET", "HEAD"]

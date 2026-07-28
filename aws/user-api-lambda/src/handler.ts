@@ -30,11 +30,12 @@
 
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { AuthOrchestrator } from 'vibesdk-auth-orchestration';
 import { AnalyticsStore } from 'vibesdk-db-analytics';
 import { AppStore, type UserAppQueryOptions } from 'vibesdk-db-apps';
 import { UserStore } from 'vibesdk-db-identity';
+import { UsageStore } from 'vibesdk-db-llm-usage';
 import { ModelConfigStore, ModelProviderStore } from 'vibesdk-db-model-config';
 import {
 	AGENT_CONFIG,
@@ -69,6 +70,7 @@ let cachedModelConfigs: ModelConfigStore | null = null;
 let cachedAuth: AuthOrchestrator | null = null;
 let cachedApps: AppStore | null = null;
 let cachedUsers: UserStore | null = null;
+let cachedUsage: UsageStore | null = null;
 let ddbClientOverride: DynamoDBDocumentClient | null = null;
 
 /** Test-only, mirrors the sibling Lambda packages' setDdbClientForTests. */
@@ -80,6 +82,7 @@ export function setDdbClientForTests(client: DynamoDBDocumentClient | null): voi
 	cachedAuth = null;
 	cachedApps = null;
 	cachedUsers = null;
+	cachedUsage = null;
 }
 
 function getDdb(): DynamoDBDocumentClient {
@@ -114,6 +117,39 @@ function getUsers(): UserStore {
 	if (cachedUsers) return cachedUsers;
 	cachedUsers = new UserStore(getDdb(), requireEnv('IDENTITY_TABLE'));
 	return cachedUsers;
+}
+
+function getUsage(): UsageStore {
+	if (cachedUsage) return cachedUsage;
+	// Cast at the package boundary -- see aws/agent-runtime/src/usage.ts's
+	// identical comment: vibesdk-db-llm-usage's independently-installed
+	// @aws-sdk/lib-dynamodb copy can drift to a different patch version
+	// than this package's, which TS treats as structurally distinct
+	// despite both being real DynamoDBDocumentClient instances at runtime.
+	cachedUsage = new UsageStore(getDdb() as unknown as ConstructorParameters<typeof UsageStore>[0], requireEnv('LLM_USAGE_TABLE'));
+	return cachedUsage;
+}
+
+/** GET /api/agent/{id}/analytics's ownership check: agent ids are
+ *  aws/agent-runtime session ids, whose only owner record is the
+ *  session item itself (session_id -> user_id), not a dedicated
+ *  db-* store the way apps/identity have one. */
+async function isSessionOwner(sessionId: string, userId: string): Promise<boolean> {
+	const result = await getDdb().send(
+		new GetCommand({ TableName: requireEnv('AGENT_SESSIONS_TABLE'), Key: { session_id: sessionId } }),
+	);
+	const item = result.Item as { user_id?: string } | undefined;
+	return item?.user_id === userId;
+}
+
+const VALID_ANALYTICS_DAYS_RANGE = { min: 1, max: 365 };
+
+function parseAnalyticsDays(event: APIGatewayProxyEventV2): number | null {
+	const raw = event.queryStringParameters?.days;
+	if (raw === undefined) return 30;
+	const days = parseInt(raw, 10);
+	if (!Number.isInteger(days) || days < VALID_ANALYTICS_DAYS_RANGE.min || days > VALID_ANALYTICS_DAYS_RANGE.max) return null;
+	return days;
 }
 
 function isAgentActionKey(value: string | undefined): value is AgentActionKey {
@@ -217,6 +253,43 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 				const result = await getUsers().updateUserProfileWithValidation(session.user.id, { username, displayName, bio, theme });
 				if (!result.success) return errorResponse(result.message, 400);
 				return successResponse(result);
+			}
+
+			case 'GET /api/user/{id}/analytics': {
+				// Ported from AnalyticsController.getUserAnalytics, but backed
+				// by vibesdk-db-llm-usage instead of Cloudflare AI Gateway's
+				// GraphQL Analytics API (no AWS equivalent exists) -- see that
+				// package's module comment for exactly what's tracked and what
+				// isn't (no cache-hit data, since aws/llm-client has no cache).
+				const session = await getUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+				const targetUserId = event.pathParameters?.id;
+				if (!targetUserId) return errorResponse('User ID is required', 400);
+				if (targetUserId !== session.user.id) return errorResponse('Forbidden', 403);
+
+				const days = parseAnalyticsDays(event);
+				if (days === null) return errorResponse('days must be an integer between 1 and 365', 400);
+
+				const analytics = await getUsage().getUserAnalytics(targetUserId, days);
+				return successResponse(analytics);
+			}
+
+			case 'GET /api/agent/{id}/analytics': {
+				// Ported from AnalyticsController.getAgentAnalytics -- "agent"
+				// here means an aws/agent-runtime session id. Ownership is
+				// enforced in-handler (see isSessionOwner) since agent sessions
+				// have no dedicated db-* store the way apps/identity do.
+				const session = await getUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+				const agentId = event.pathParameters?.id;
+				if (!agentId) return errorResponse('Agent ID is required', 400);
+				if (!(await isSessionOwner(agentId, session.user.id))) return errorResponse('Forbidden', 403);
+
+				const days = parseAnalyticsDays(event);
+				if (days === null) return errorResponse('days must be an integer between 1 and 365', 400);
+
+				const analytics = await getUsage().getSessionAnalytics(agentId, days);
+				return successResponse(analytics);
 			}
 
 			case 'GET /api/stats': {

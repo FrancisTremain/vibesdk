@@ -56,8 +56,8 @@ export interface CaptureResult {
 }
 
 export interface MessageDeps {
-	generateReply: (conversationHistory: ConversationMessage[], userMessage: string) => Promise<string>;
-	runGeneration: (description: string, sessionId: string) => Promise<GenerationResult>;
+	generateReply: (conversationHistory: ConversationMessage[], userMessage: string, sessionId: string, userId: string) => Promise<string>;
+	runGeneration: (description: string, sessionId: string, userId: string) => Promise<GenerationResult>;
 	deployProject: (files: { filePath: string; fileContents: string }[], projectName: string, initCommand: string) => Promise<DeployResult>;
 	captureScreenshot: (
 		sessionId: string,
@@ -125,7 +125,7 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 				// limited past retries, etc.) this throws and nothing is
 				// persisted -- handler.ts turns that into an `error` response.
 				mutate: async (state) => {
-					const reply = await deps.generateReply(state.conversation_messages, content);
+					const reply = await deps.generateReply(state.conversation_messages, content, state.session_id, state.user_id);
 					const now = new Date().toISOString();
 					return {
 						...state,
@@ -199,7 +199,7 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 					if (!description) {
 						throw new Error('No project description available -- include a message with generate_all, or send a user_suggestion first.');
 					}
-					const result = await deps.runGeneration(description, state.session_id);
+					const result = await deps.runGeneration(description, state.session_id, state.user_id);
 					const now = new Date().toISOString();
 					return {
 						...state,
