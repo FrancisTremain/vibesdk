@@ -1,22 +1,46 @@
 // Generated from ip-allowlist.js.tftpl by Terraform (templatefile) --
 // var.allowed_ips is baked in at apply time since CloudFront Functions
 // can't read Terraform variables or environment variables at runtime.
+//
+// Also does SPA client-side-routing rewrite (any non-/api/ path with no
+// file extension in its last segment -> /index.html) -- this used to be
+// handled by the distribution's custom_error_response (403/404 ->
+// index.html), but that setting applies to every origin in the
+// distribution, not just the S3 static one: it was silently rewriting
+// every legitimate 403/404 JSON error from the API Lambda origins
+// (auth-api/apps-api/user-api) into a 200 HTML page too, breaking the
+// frontend's error handling (CSRF violations, ownership checks, 404s --
+// anything status 403/404) app-wide. Doing the rewrite here, before the
+// origin fetch, means CloudFront never needs custom_error_response's
+// blanket remap at all -- see frontend.tf for its removal.
 function handler(event) {
 	var request = event.request;
 	var clientIp = event.viewer.ip;
 	var allowed = ${allowed_ips_json};
 
+	var allowedByIp = false;
 	for (var i = 0; i < allowed.length; i++) {
 		if (ipInCidr(clientIp, allowed[i])) {
-			return request;
+			allowedByIp = true;
+			break;
+		}
+	}
+	if (!allowedByIp) {
+		return {
+			statusCode: 403,
+			statusDescription: 'Forbidden',
+			body: { encoding: 'text', data: 'Forbidden' },
+		};
+	}
+
+	if (request.uri.indexOf('/api/') !== 0) {
+		var lastSegment = request.uri.substring(request.uri.lastIndexOf('/') + 1);
+		if (lastSegment.indexOf('.') === -1) {
+			request.uri = '/index.html';
 		}
 	}
 
-	return {
-		statusCode: 403,
-		statusDescription: 'Forbidden',
-		body: { encoding: 'text', data: 'Forbidden' },
-	};
+	return request;
 }
 
 function ipInCidr(ip, cidr) {

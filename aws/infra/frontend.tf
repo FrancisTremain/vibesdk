@@ -150,7 +150,11 @@ resource "aws_cloudfront_function" "ip_allowlist" {
   name    = "vibesdk-ip-allowlist"
   runtime = "cloudfront-js-2.0"
   publish = true
-  comment = "Blocks everything except var.allowed_ips -- see frontend.tf"
+  # Resource/function name kept as "ip_allowlist"/"vibesdk-ip-allowlist"
+  # to avoid an unnecessary destroy+recreate -- it also does the SPA
+  # client-side-routing rewrite now (see the .tftpl's module comment for
+  # why that moved here instead of staying in custom_error_response).
+  comment = "Blocks everything except var.allowed_ips, and rewrites SPA client-routes to /index.html -- see frontend.tf"
   code = templatefile("${path.module}/cloudfront-functions/ip-allowlist.js.tftpl", {
     allowed_ips_json = jsonencode(var.allowed_ips)
   })
@@ -353,25 +357,17 @@ resource "aws_cloudfront_distribution" "site" {
     }
   }
 
-  # error_caching_min_ttl defaults to 300s if unset -- meaning a single
-  # 403/404 (e.g. from a transient origin hiccup, or while debugging) gets
-  # cached and re-served as the SPA fallback for up to 5 minutes independent
-  # of the behavior's own cache policy, and independent of whether an
-  # invalidation targeted the underlying path (error-response caching uses
-  # its own cache keyed by path+status, not the normal cache key). Zero it
-  # out so a fixed backend is reflected immediately.
-  custom_error_response {
-    error_code            = 403
-    response_code         = 200
-    response_page_path    = "/index.html"
-    error_caching_min_ttl = 0
-  }
-  custom_error_response {
-    error_code            = 404
-    response_code         = 200
-    response_page_path    = "/index.html"
-    error_caching_min_ttl = 0
-  }
+  # No custom_error_response block, deliberately -- it used to remap
+  # every 403/404 to /index.html (response_code 200) for SPA client-side
+  # routing, but that setting applies distribution-wide to every origin,
+  # not just the S3 static one: it was silently rewriting every
+  # legitimate 403/404 JSON error from the API Lambda origins into a 200
+  # HTML page too (CSRF violations, ownership checks, not-found lookups
+  # -- anything status 403/404 from auth-api/apps-api/user-api). SPA
+  # routing is now handled by aws_cloudfront_function.ip_allowlist
+  # rewriting the request URI to /index.html *before* the origin fetch
+  # (see that function's .tftpl), so this distribution-wide remap isn't
+  # needed at all -- API origins now return their real status codes.
 
   restrictions {
     geo_restriction {

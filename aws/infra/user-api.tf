@@ -97,7 +97,7 @@ resource "aws_lambda_function" "user_api" {
       AUTH_FLOWS_TABLE     = aws_dynamodb_table.auth_flows.name
       LLM_USAGE_TABLE      = aws_dynamodb_table.llm_usage.name
       AGENT_SESSIONS_TABLE = aws_dynamodb_table.agent_sessions.name
-      JWT_SECRET         = var.jwt_secret != "" ? var.jwt_secret : data.aws_ssm_parameter.jwt_secret.value
+      JWT_SECRET           = var.jwt_secret != "" ? var.jwt_secret : data.aws_ssm_parameter.jwt_secret.value
       # Read by vibesdk-model-config-defaults (AGENT_CONFIG selection,
       # BYOK-platform-key check) -- see that package's README.
       PLATFORM_MODEL_PROVIDERS = var.platform_model_providers
