@@ -62,3 +62,14 @@ provider "aws" {
 }
 
 data "aws_caller_identity" "current" {}
+
+# Lets `terraform apply` run without a `-var jwt_secret=...` on every
+# invocation -- once seeded (see aws/infra/README.md), the secret lives in
+# SSM instead of being retyped/re-exposed in each CloudShell session's
+# shell history. var.jwt_secret still takes precedence when explicitly
+# passed, so a real secrets-pipeline migration later doesn't need this
+# data source removed first.
+data "aws_ssm_parameter" "jwt_secret" {
+  name            = "/vibesdk/jwt_secret"
+  with_decryption = true
+}

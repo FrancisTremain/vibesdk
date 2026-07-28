@@ -84,7 +84,7 @@ resource "aws_lambda_function" "auth_api" {
       IDENTITY_TABLE       = aws_dynamodb_table.identity.name
       AUTH_FLOWS_TABLE     = aws_dynamodb_table.auth_flows.name
       AUDIT_TABLE          = aws_dynamodb_table.audit_log.name
-      JWT_SECRET           = var.jwt_secret
+      JWT_SECRET           = var.jwt_secret != "" ? var.jwt_secret : data.aws_ssm_parameter.jwt_secret.value
       ALLOWED_EMAIL        = var.allowed_email
       GITHUB_CLIENT_ID     = var.github_oauth_client_id
       GITHUB_CLIENT_SECRET = var.github_oauth_client_secret

@@ -92,7 +92,7 @@ resource "aws_lambda_function" "github_export" {
   environment {
     variables = {
       GIT_STORAGE_BUCKET            = aws_s3_bucket.git_storage.bucket
-      JWT_SECRET                    = var.jwt_secret
+      JWT_SECRET                    = var.jwt_secret != "" ? var.jwt_secret : data.aws_ssm_parameter.jwt_secret.value
       GITHUB_EXPORTER_CLIENT_ID     = var.github_exporter_client_id
       GITHUB_EXPORTER_CLIENT_SECRET = var.github_exporter_client_secret
     }

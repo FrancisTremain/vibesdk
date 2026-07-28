@@ -25,9 +25,10 @@ variable "public_base_url" {
 }
 
 variable "jwt_secret" {
-  description = "JWT signing secret for aws/auth-orchestration's JWTUtils. Must be >=32 chars with at least 3 character classes (enforced at Lambda cold-start by JWTUtils' own validation) -- generate with e.g. `openssl rand -base64 48`. No default: never commit a real secret to Terraform state as a literal; source this from SSM Parameter Store / Secrets Manager in the real apply, not this variable directly, once a secrets pipeline exists."
+  description = "JWT signing secret for aws/auth-orchestration's JWTUtils. Must be >=32 chars with at least 3 character classes (enforced at Lambda cold-start by JWTUtils' own validation) -- generate with e.g. `openssl rand -base64 48`. Defaults to empty, in which case main.tf's data.aws_ssm_parameter.jwt_secret (an SSM SecureString at /vibesdk/jwt_secret) is used instead -- never commit a real secret to Terraform state as a literal var default."
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "allowed_email" {

@@ -95,7 +95,7 @@ resource "aws_lambda_function" "apps_api" {
       IDENTITY_TABLE       = aws_dynamodb_table.identity.name
       AUTH_FLOWS_TABLE     = aws_dynamodb_table.auth_flows.name
       RATE_LIMITS_TABLE    = aws_dynamodb_table.rate_limits.name
-      JWT_SECRET           = var.jwt_secret
+      JWT_SECRET           = var.jwt_secret != "" ? var.jwt_secret : data.aws_ssm_parameter.jwt_secret.value
       ORIGIN_VERIFY_SECRET = random_password.origin_verify.result
     }
   }
