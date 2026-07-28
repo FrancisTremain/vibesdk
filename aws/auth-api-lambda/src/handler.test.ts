@@ -26,6 +26,13 @@ function asStructured(result: APIGatewayProxyResultV2): APIGatewayProxyStructure
 }
 
 function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxyEventV2 {
+	// http.method is derived from routeKey rather than hardcoded, so
+	// every test's requestContext.http.method matches the route it's
+	// actually exercising -- otherwise checkCsrf (which switches on
+	// requestContext.http.method) would silently never see a non-GET
+	// request no matter what routeKey a test passed.
+	const routeKey = overrides.routeKey ?? 'GET /api/auth/check';
+	const method = routeKey.split(' ')[0] ?? 'GET';
 	return {
 		version: '2.0',
 		routeKey: 'GET /api/auth/check',
@@ -36,7 +43,7 @@ function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxy
 			apiId: 'api',
 			domainName: 'app.example.com',
 			domainPrefix: 'app',
-			http: { method: 'GET', path: '/api/auth/check', protocol: 'HTTP/1.1', sourceIp: '1.2.3.4', userAgent: 'test' },
+			http: { method, path: '/api/auth/check', protocol: 'HTTP/1.1', sourceIp: '1.2.3.4', userAgent: 'test' },
 			requestId: 'req-1',
 			routeKey: 'GET /api/auth/check',
 			stage: '$default',
@@ -45,7 +52,11 @@ function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxy
 		},
 		isBase64Encoded: false,
 		...overrides,
-		headers: { 'x-origin-verify': 'test-origin-verify-secret', ...overrides.headers },
+		headers: { 'x-origin-verify': 'test-origin-verify-secret', 'x-csrf-token': 'test-csrf-token', ...overrides.headers },
+		// Full replace, not merge, when a test supplies its own cookies --
+		// otherwise a test asserting "no CSRF cookie present" could never
+		// actually clear the default one.
+		cookies: overrides.cookies ?? [`csrf-token=${encodeURIComponent(JSON.stringify({ token: 'test-csrf-token', timestamp: Date.now() }))}`],
 	} as APIGatewayProxyEventV2;
 }
 
@@ -375,5 +386,67 @@ describe('auth-api-lambda handler', () => {
 			await handler(event({ routeKey: 'POST /api/auth/exchange-api-key', headers: { 'x-api-key': rawKey } })),
 		);
 		expect(result.statusCode).toBe(401);
+	});
+
+	it('mints a CSRF token and cookie from GET /api/auth/csrf-token', async () => {
+		const result = asStructured(await handler(event({ routeKey: 'GET /api/auth/csrf-token' })));
+		expect(result.statusCode).toBe(200);
+		expect(typeof body(result).data.token).toBe('string');
+		expect(body(result).data.expiresIn).toBe(7200);
+		expect(result.cookies?.some((c) => c.startsWith('csrf-token='))).toBe(true);
+	});
+
+	it('rejects a state-changing request with no CSRF cookie/header at all', async () => {
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'POST /api/auth/register',
+					headers: { 'x-csrf-token': undefined as unknown as string },
+					cookies: [],
+					body: jsonBody({ email: 'no-csrf@example.com', password: 'Str0ngPassw0rd!' }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(403);
+	});
+
+	it('rejects a state-changing request with a mismatched CSRF header', async () => {
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'POST /api/auth/register',
+					headers: { 'x-csrf-token': 'a-different-token' },
+					body: jsonBody({ email: 'mismatch-csrf@example.com', password: 'Str0ngPassw0rd!' }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(403);
+	});
+
+	it('allows a state-changing request with a matching CSRF cookie/header pair', async () => {
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'POST /api/auth/register',
+					body: jsonBody({ email: 'valid-csrf@example.com', password: 'Str0ngPassw0rd!' }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(200);
+	});
+
+	it('allows a state-changing request with a bearer token even without a CSRF pair', async () => {
+		const token = await registerAndGetToken('bearer-bypasses-csrf@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'PUT /api/auth/profile',
+					headers: { authorization: `Bearer ${token}`, 'x-csrf-token': undefined as unknown as string },
+					cookies: [],
+					body: jsonBody({ displayName: 'No CSRF Needed' }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(200);
 	});
 });

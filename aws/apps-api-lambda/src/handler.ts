@@ -16,6 +16,11 @@
  * GET /api/apps/public is rate-limited via vibesdk-rate-limit, matching
  * the original's enforcePublicAppsRateLimit
  * (worker/services/rate-limit/rateLimits.ts).
+ *
+ * CSRF protection (double-submit cookie) is enforced via vibesdk-csrf's
+ * checkCsrf on every non-GET/HEAD/OPTIONS request without an explicit
+ * Authorization/X-API-Key credential -- see aws/auth-api-lambda's
+ * GET /api/auth/csrf-token, which mints the cookie this checks against.
  */
 
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
@@ -23,6 +28,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { AuthOrchestrator } from 'vibesdk-auth-orchestration';
 import { AppStore } from 'vibesdk-db-apps';
+import { checkCsrf } from 'vibesdk-csrf';
 import { DynamoRateLimiter } from 'vibesdk-rate-limit';
 import { toPublicAppListItem } from './public-app-dto';
 import { parsePublicAppsQuery } from './public-apps-query';
@@ -109,6 +115,9 @@ async function getUser(event: APIGatewayProxyEventV2) {
 export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> {
 	const originError = verifyOrigin(event);
 	if (originError) return originError;
+
+	const csrfResult = checkCsrf(event);
+	if (!csrfResult.ok) return errorResponse('CSRF validation failed', 403);
 
 	const apps = getApps();
 	const routeKey = event.routeKey;

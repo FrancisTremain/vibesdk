@@ -13,12 +13,16 @@
  * middleware chain -- there's no Hono here, `routeKey` string matching
  * plays the same role for a route table this small.
  *
+ * CSRF protection (double-submit cookie, ported from
+ * worker/services/csrf/CsrfService.ts) is enforced via vibesdk-csrf's
+ * checkCsrf on every non-GET/HEAD/OPTIONS request that doesn't present
+ * an explicit Authorization/X-API-Key credential -- see checkCsrf's
+ * call below and the GET /api/auth/csrf-token case, which is the route
+ * src/lib/api-client.ts's fetchCsrfToken already calls.
+ *
  * NOT PORTED (see this package's README for the full list and why):
- * CSRF token rotation (`CsrfService`, entirely Cloudflare-cookie-
- * flavored and arguably redundant once every route requires either a
- * bearer token or an HttpOnly SameSite=Lax cookie), Cloudflare OAuth
- * and the AI Gateway auto-connect side effect on its callback (out of
- * scope everywhere else in this migration too).
+ * Cloudflare OAuth and the AI Gateway auto-connect side effect on its
+ * callback (out of scope everywhere else in this migration too).
  *
  * Session listing/revocation and API-key management
  * (list/create/revoke/exchange-for-token) are wired to
@@ -34,6 +38,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { AuthOrchestrator, JWTUtils, SecurityError, type OAuthProvider } from 'vibesdk-auth-orchestration';
 import { ApiKeyStore, SessionStore, UserStore } from 'vibesdk-db-identity';
+import { buildCsrfCookie, checkCsrf, generateCsrfToken, CSRF_TOKEN_TTL_SECONDS } from 'vibesdk-csrf';
 import {
 	accessTokenCookie,
 	clearAccessTokenCookie,
@@ -176,6 +181,9 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 	const originError = verifyOrigin(event);
 	if (originError) return originError;
 
+	const csrfResult = checkCsrf(event);
+	if (!csrfResult.ok) return errorResponse('CSRF validation failed', 403);
+
 	const auth = getAuth();
 	const routeKey = event.routeKey;
 	const provider = event.pathParameters?.provider;
@@ -184,6 +192,15 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 
 	try {
 		switch (routeKey) {
+			case 'GET /api/auth/csrf-token': {
+				// Ported from CsrfService.enforce's GET-request cookie-minting
+				// path -- src/lib/api-client.ts's fetchCsrfToken calls exactly
+				// this route and reads `data.token`/`data.expiresIn` from the
+				// response body (never document.cookie).
+				const token = generateCsrfToken();
+				return successResponse({ token, expiresIn: CSRF_TOKEN_TTL_SECONDS }, 200, [buildCsrfCookie(token)]);
+			}
+
 			case 'POST /api/auth/register': {
 				const body = parseJsonBody(event);
 				if (!body || typeof body.email !== 'string' || typeof body.password !== 'string') {

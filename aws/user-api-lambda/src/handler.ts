@@ -26,6 +26,11 @@
  * -- see the routes below. `testModelConfig`/`testProvider`'s
  * live-network-call paths aren't ported at all (out of scope for a
  * storage-layer Lambda).
+ *
+ * CSRF protection (double-submit cookie) is enforced via vibesdk-csrf's
+ * checkCsrf on every non-GET/HEAD/OPTIONS request without an explicit
+ * Authorization/X-API-Key credential -- see aws/auth-api-lambda's
+ * GET /api/auth/csrf-token, which mints the cookie this checks against.
  */
 
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
@@ -36,6 +41,7 @@ import { AnalyticsStore } from 'vibesdk-db-analytics';
 import { AppStore, type UserAppQueryOptions } from 'vibesdk-db-apps';
 import { UserStore } from 'vibesdk-db-identity';
 import { UsageStore } from 'vibesdk-db-llm-usage';
+import { checkCsrf } from 'vibesdk-csrf';
 import { ModelConfigStore, ModelProviderStore } from 'vibesdk-db-model-config';
 import {
 	AGENT_CONFIG,
@@ -196,6 +202,9 @@ function parseJsonBody(event: APIGatewayProxyEventV2): Record<string, unknown> |
 export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> {
 	const originError = verifyOrigin(event);
 	if (originError) return originError;
+
+	const csrfResult = checkCsrf(event);
+	if (!csrfResult.ok) return errorResponse('CSRF validation failed', 403);
 
 	const routeKey = event.routeKey;
 	const providerId = event.pathParameters?.id;

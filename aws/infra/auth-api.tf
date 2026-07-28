@@ -116,6 +116,7 @@ resource "aws_apigatewayv2_integration" "auth_lambda" {
 # sync with aws/auth-api-lambda/src/handler.ts's switch statement.
 locals {
   auth_api_routes = [
+    "GET /api/auth/csrf-token",
     "POST /api/auth/register",
     "POST /api/auth/login",
     "POST /api/auth/logout",

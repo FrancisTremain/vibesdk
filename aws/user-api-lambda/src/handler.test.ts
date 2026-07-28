@@ -25,6 +25,11 @@ function asStructured(result: APIGatewayProxyResultV2): APIGatewayProxyStructure
 }
 
 function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxyEventV2 {
+	// http.method is derived from routeKey (not hardcoded), so checkCsrf
+	// (which reads requestContext.http.method) sees the right method for
+	// whatever route a test is actually exercising.
+	const routeKey = overrides.routeKey ?? 'GET /api/stats';
+	const method = routeKey.split(' ')[0] ?? 'GET';
 	return {
 		version: '2.0',
 		routeKey: 'GET /api/stats',
@@ -35,7 +40,7 @@ function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxy
 			apiId: 'api',
 			domainName: 'app.example.com',
 			domainPrefix: 'app',
-			http: { method: 'GET', path: '/api/stats', protocol: 'HTTP/1.1', sourceIp: '1.2.3.4', userAgent: 'test' },
+			http: { method, path: '/api/stats', protocol: 'HTTP/1.1', sourceIp: '1.2.3.4', userAgent: 'test' },
 			requestId: 'req-1',
 			routeKey: 'GET /api/stats',
 			stage: '$default',
@@ -44,7 +49,8 @@ function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxy
 		},
 		isBase64Encoded: false,
 		...overrides,
-		headers: { 'x-origin-verify': 'test-origin-verify-secret', ...overrides.headers },
+		headers: { 'x-origin-verify': 'test-origin-verify-secret', 'x-csrf-token': 'test-csrf-token', ...overrides.headers },
+		cookies: overrides.cookies ?? [`csrf-token=${encodeURIComponent(JSON.stringify({ token: 'test-csrf-token', timestamp: Date.now() }))}`],
 	} as APIGatewayProxyEventV2;
 }
 
@@ -513,5 +519,35 @@ describe('model-config routes', () => {
 		);
 		expect(result.statusCode).toBe(200);
 		expect(body(result).data).toMatchObject({ sessionId: 'my-session', totalRequests: 1, erroredRequests: 1, errorRate: 1 });
+	});
+
+	it('rejects a cookie-authenticated mutation with no CSRF cookie/header', async () => {
+		const { token } = await registerUser(ddb, 'csrf-cookie@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'PUT /api/user/profile',
+					headers: { 'x-csrf-token': undefined as unknown as string },
+					cookies: [`accessToken=${encodeURIComponent(token)}`],
+					body: JSON.stringify({ displayName: 'No CSRF' }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(403);
+	});
+
+	it('allows a bearer-authenticated mutation even without a CSRF pair', async () => {
+		const { token } = await registerUser(ddb, 'csrf-bearer@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'PUT /api/user/profile',
+					headers: { authorization: `Bearer ${token}`, 'x-csrf-token': undefined as unknown as string },
+					cookies: [],
+					body: JSON.stringify({ displayName: 'Bearer OK' }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(200);
 	});
 });

@@ -23,26 +23,36 @@ function asStructured(result: APIGatewayProxyResultV2): APIGatewayProxyStructure
 }
 
 function event(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxyEventV2 {
+	// http.method is derived from routeKey (not hardcoded), and
+	// requestContext.http is merged rather than blindly replaced --
+	// otherwise checkCsrf (which reads requestContext.http.method) would
+	// see undefined for any test that overrides just e.g. sourceIp.
+	const routeKey = overrides.routeKey ?? 'GET /api/apps/public';
+	const method = routeKey.split(' ')[0] ?? 'GET';
+	const overrideRequestContext = (overrides.requestContext ?? {}) as Record<string, unknown>;
+	const overrideHttp = (overrideRequestContext.http ?? {}) as Record<string, unknown>;
 	return {
 		version: '2.0',
-		routeKey: 'GET /api/apps/public',
+		routeKey,
 		rawPath: '/api/apps/public',
 		rawQueryString: '',
+		...overrides,
 		requestContext: {
 			accountId: '123',
 			apiId: 'api',
 			domainName: 'app.example.com',
 			domainPrefix: 'app',
-			http: { method: 'GET', path: '/api/apps/public', protocol: 'HTTP/1.1', sourceIp: '1.2.3.4', userAgent: 'test' },
 			requestId: 'req-1',
-			routeKey: 'GET /api/apps/public',
+			routeKey,
 			stage: '$default',
 			time: 'now',
 			timeEpoch: 0,
+			...overrideRequestContext,
+			http: { method, path: '/api/apps/public', protocol: 'HTTP/1.1', sourceIp: '1.2.3.4', userAgent: 'test', ...overrideHttp },
 		},
 		isBase64Encoded: false,
-		...overrides,
-		headers: { 'x-origin-verify': 'test-origin-verify-secret', ...overrides.headers },
+		headers: { 'x-origin-verify': 'test-origin-verify-secret', 'x-csrf-token': 'test-csrf-token', ...overrides.headers },
+		cookies: overrides.cookies ?? [`csrf-token=${encodeURIComponent(JSON.stringify({ token: 'test-csrf-token', timestamp: Date.now() }))}`],
 	} as APIGatewayProxyEventV2;
 }
 
@@ -358,5 +368,88 @@ describe('apps-api-lambda handler', () => {
 			),
 		);
 		expect(getResult.statusCode).toBe(404);
+	});
+
+	it('rejects a cookie-authenticated mutation with no CSRF cookie/header', async () => {
+		const owner = await registerUser(ddb, 'csrf-owner@example.com');
+		const { AppStore } = await import('vibesdk-db-apps');
+		const apps = new AppStore(ddb as unknown as DynamoDBDocumentClient, 'test-apps');
+		const created = await apps.createApp({
+			title: 'CSRF App',
+			description: null,
+			iconUrl: null,
+			originalPrompt: 'x',
+			finalPrompt: null,
+			framework: null,
+			userId: owner.userId,
+			sessionToken: null,
+			visibility: 'public',
+			status: 'completed',
+			deploymentId: null,
+			githubRepositoryUrl: null,
+			githubRepositoryVisibility: null,
+			isArchived: false,
+			isFeatured: false,
+			version: 1,
+			parentAppId: null,
+			previewVersion: 1,
+			screenshotUrl: null,
+			screenshotCapturedAt: null,
+			lastDeployedAt: null,
+		});
+
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'POST /api/apps/{id}/star',
+					pathParameters: { id: created.id },
+					headers: { 'x-csrf-token': undefined as unknown as string },
+					cookies: [`accessToken=${encodeURIComponent(owner.token)}`],
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(403);
+	});
+
+	it('allows a cookie-authenticated mutation with a matching CSRF cookie/header pair', async () => {
+		const owner = await registerUser(ddb, 'csrf-owner-ok@example.com');
+		const { AppStore } = await import('vibesdk-db-apps');
+		const apps = new AppStore(ddb as unknown as DynamoDBDocumentClient, 'test-apps');
+		const created = await apps.createApp({
+			title: 'CSRF OK App',
+			description: null,
+			iconUrl: null,
+			originalPrompt: 'x',
+			finalPrompt: null,
+			framework: null,
+			userId: owner.userId,
+			sessionToken: null,
+			visibility: 'public',
+			status: 'completed',
+			deploymentId: null,
+			githubRepositoryUrl: null,
+			githubRepositoryVisibility: null,
+			isArchived: false,
+			isFeatured: false,
+			version: 1,
+			parentAppId: null,
+			previewVersion: 1,
+			screenshotUrl: null,
+			screenshotCapturedAt: null,
+			lastDeployedAt: null,
+		});
+
+		const csrfCookie = `csrf-token=${encodeURIComponent(JSON.stringify({ token: 'matching-token', timestamp: Date.now() }))}`;
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'POST /api/apps/{id}/star',
+					pathParameters: { id: created.id },
+					headers: { 'x-csrf-token': 'matching-token' },
+					cookies: [`accessToken=${encodeURIComponent(owner.token)}`, csrfCookie],
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(200);
 	});
 });

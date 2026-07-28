@@ -21,7 +21,14 @@
  * verification wired in at all yet -- any caller who knows a
  * `sessionId` can trigger an export of that session's files using
  * their own GitHub OAuth grant. Not safe to expose publicly without
- * adding an ownership/auth check first; see the README.
+ * adding an ownership/auth check first; see the README. (No CSRF check
+ * either, deliberately, for the same reason: CSRF only matters for
+ * ambient-cookie-authenticated actions, and this handler validates no
+ * session cookie at all yet. No origin-verify check either -- this
+ * Lambda's API Gateway is deliberately not routed through CloudFront
+ * yet (aws/infra/github-export.tf), so there's no CloudFront to inject
+ * that header; adding the check would just 403 the only real traffic
+ * path this Lambda has today.)
  */
 
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
