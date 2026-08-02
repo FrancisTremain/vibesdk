@@ -40,27 +40,48 @@ This is **not** a full port of `worker/agents/core/codingAgent.ts` +
 - `clear_conversation` — resets both fields.
 - `get_conversation_state` — reads them back without mutating.
 - `stop_generation` — clears `should_be_generating`.
-- `generate_all` — **a real end-to-end generate-and-run path.**
-  Resolves a project description (the message itself, else the last
-  user turn in conversation history, else `state.query`), calls
-  `./generation.ts` for one LLM completion asking for a small complete
-  app as a single JSON file list, then calls
-  [`aws/sandbox-orchestrator-lambda`](../sandbox-orchestrator-lambda/)
-  (`./sandbox-client.ts`) to actually launch a Fargate task, write
-  those files, and start the dev server, then (`./git-commit.ts`)
-  commits the same files to this session's real git history in S3 via
-  [`aws/git-storage`](../git-storage/) + `isomorphic-git`. On success,
-  persists `generated_files`, `sandbox_instance_id`, `preview_url`, and
-  `git_commit_sha`, and responds `generation_complete` with a real,
-  browsable preview URL. **This is a deliberate simplification, not a
-  port** of `worker/agents/operations/PhaseGeneration.ts` +
-  `PhaseImplementation.ts` (multi-phase planning, per-phase streaming
-  diffs via the SCOF format, static analysis and fix-up loops between
-  phases) — see "Why generation is a single-shot JSON call" below. A
-  failure in the LLM call or the sandbox launch persists nothing and
-  returns an `error` response; a failure in the git commit specifically
-  does **not** fail the whole operation — see "Why git storage is best-
-  effort" below.
+- `generate_all` — **starts a phased, iterable generation session**
+  via [`aws/agent-harness`](../agent-harness/), the Claude Agent
+  SDK-based harness that superseded the earlier single-shot
+  `./generation.ts` design (kept in the tree as a documented,
+  independently-tested fallback shape, not deleted, but no longer
+  wired into `generate_all` — see "Why generation moved to the Agent
+  SDK harness" below). Resolves a project description (the message
+  itself, else the last user turn in conversation history, else
+  `state.query`), creates an empty sandbox instance via
+  [`aws/sandbox-orchestrator-lambda`](../sandbox-orchestrator-lambda/),
+  then starts a harness session against it
+  (`./harness-generation.ts` + `./harness-client.ts`, talking to
+  [`aws/harness-orchestrator-lambda`](../harness-orchestrator-lambda/)).
+  **Returns as soon as the session is accepted, not once generation
+  finishes** — persists `harness_session_id`, `sandbox_instance_id`,
+  `preview_url`, `sandbox_control_url`, and the initial phase, and
+  responds `generation_started`. The client is expected to send
+  `poll_generation_status` repeatedly afterward.
+- `poll_generation_status` — polls the harness's current phase via
+  `./harness-client.ts`. While still running, mutates `current_phase`
+  and responds `phase_update`. Once the harness reports the turn done,
+  pulls the resulting files out of the sandbox
+  (`./sandbox-client.ts#getSandboxFiles`), persists them as
+  `generated_files`, flips `should_be_generating` off, and responds
+  `generation_complete` — the same response shape `generate_all` used
+  to return directly. A no-op (no state read past the connection
+  lookup, no response) when no harness session has ever started for
+  this chat.
+- `record_activity` — a UI-activity heartbeat from the side-by-side
+  editor/preview pane. Resets `aws/harness-orchestrator-lambda`'s
+  10-minute sliding idle-teardown clock (`./harness-client.ts`'s
+  `recordHarnessActivity`) without sending a chat turn. No state
+  mutation and no response — purely a side effect, so it never
+  contends with the optimistic lock a real message would.
+- `user_suggestion` now branches on whether a harness session exists
+  for this chat: with one, a message is a **follow-up iteration** —
+  pushed into the still-open (or automatically resumed, if idle
+  torn-down) harness session via `./harness-client.ts`'s
+  `sendHarnessMessage`, `should_be_generating` flips back on, and the
+  reply surfaces through the same `poll_generation_status` polling as
+  `generate_all`. Without one, this is unchanged from the original
+  single-turn `deps.generateReply` completion described above.
 - `deploy` — launches a **second, independent** sandbox instance
   (`./deploy.ts`, via the same `aws/sandbox-orchestrator-lambda` call
   `generate_all` uses) from the files already persisted on state — no
@@ -96,25 +117,37 @@ upstream, independent of this migration — see
 [`aws/github-export-lambda`](../github-export-lambda/) for the real
 HTTP-triggered flow).
 
-## Why generation is a single-shot JSON call
+## Why generation moved to the Agent SDK harness
 
 `worker/agents/operations/`'s real pipeline plans multiple phases,
 generates and diffs files phase by phase through a custom streaming
 parser (`worker/agents/output-formats/streaming-formats/scof.ts`), and
-runs static analysis plus deterministic fix-ups between phases —
-several thousand lines of orchestration
-(`worker/agents/inferutils/` alone is ~4,360 lines). Porting that
-faithfully was not attempted here. `./generation.ts` instead asks the
-model for one JSON object (`{projectName, initCommand, files}`) in a
-single completion and hands it straight to the sandbox orchestrator.
-This trades away multi-file consistency on larger apps, incremental
-diffing, and any repair loop — a model that returns malformed JSON or
-a broken `initCommand` fails the whole generation with a clear error,
-there's no fallback or retry-with-fix. What it buys: a real, working,
-testable path from a chat message to a running previewable app today,
-instead of another contract-only package waiting on the full pipeline.
-Replacing this with the real phased pipeline is future work, not a
-correction of a bug in this one.
+runs static analysis plus deterministic fix-ups between phases. SCOF
+existed to solve a Cloudflare-Workers-specific problem — streaming
+file writes character-by-character to the browser within a single
+Worker invocation — that doesn't apply on Lambda/Fargate, which have
+no equivalent cheap token-streaming-to-browser primitive tied to one
+request.
+
+An earlier iteration of this package (`./generation.ts`, kept in the
+tree, no longer wired into `generate_all`) took the simplest possible
+replacement: one LLM completion asking for a small app as a single
+JSON file list, no phases, no diffing, no repair loop. That traded
+away multi-file consistency on larger apps and any recovery from a
+malformed response for a real, working, testable path shipped
+quickly.
+
+`generate_all` now uses [`aws/agent-harness`](../agent-harness/)
+instead: a Claude Agent SDK `query()` running as its own Fargate task
+(`aws/infra/harness`), with built-in tools disabled and replaced by
+custom tools that proxy file/command/analysis operations to the
+target sandbox. This restores real phase-by-phase progress (via the
+harness's `report_phase` tool, surfaced through
+`poll_generation_status`) and genuine follow-up iteration (`streamInput`-based
+multi-turn sessions, not a fresh one-shot completion per message) —
+the two things the single-shot design gave up — without reimplementing
+SCOF, since phase progress and iteration don't depend on
+character-by-character streaming the way the original's UX did.
 
 ## Why deploy is a second sandbox instance, not a real deployment pipeline
 
@@ -213,6 +246,20 @@ stack, then the sandbox module, which itself reads the root stack's
 outputs). Without them set, `generate_all` fails with a clear "not
 configured" error rather than a confusing network failure.
 
+`./harness-client.ts` reads `HARNESS_ORCHESTRATOR_ENDPOINT` and
+`HARNESS_ORCHESTRATOR_SECRET` — the deployed
+`aws/harness-orchestrator-lambda` API's URL and its
+`X-Orchestrator-Secret` value, same manual-copy-in pattern as the
+sandbox orchestrator variables above (`aws/infra/harness` applies
+after the root stack, same reasoning). `./harness-generation.ts` also
+reads `SANDBOX_CONTROLPLANE_SECRET` — the same cluster-wide secret
+`aws/infra/sandbox` generates for its own orchestrator Lambda to
+authenticate against a sandbox task's control-plane port, needed here
+so the harness's custom tools can call that port directly instead of
+proxying every file/command/analysis call back through
+`aws/sandbox-orchestrator-lambda`. Without either set, `generate_all`
+fails with a clear "not configured" error.
+
 `./git-commit.ts` reads `GIT_STORAGE_BUCKET` — the S3 bucket
 `aws/infra/s3.tf`'s `aws_s3_bucket.git_storage` provisions. Unlike the
 sandbox orchestrator variables above, this doesn't need a manual
@@ -250,42 +297,43 @@ migration has tested.
 
 ## Testing
 
-39 tests across seven files, no real AWS (`aws-sdk-client-mock`, same
+46 tests across seven files, no real AWS (`aws-sdk-client-mock`, same
 convention as `aws/actor-spike`) and no real LLM, sandbox-orchestrator,
-S3, or browser-capture calls in `handler.test.ts` (`./llm.ts`,
-`./generation.ts`, `./deploy.ts`, and `./browser-capture-client.ts`
-are all mocked at the module level; each has its own real-logic tests
-instead — `generation.test.ts` covers `parseGeneratedProject`'s JSON
-validation/error paths directly, `sandbox-client.test.ts` and
-`deploy.test.ts` cover their respective orchestrator HTTP calls
-against a fake `fetch`, `browser-capture-client.test.ts` covers the
-capture-Lambda HTTP call the same way, `git-commit.test.ts` runs real
-`isomorphic-git` `init`/`add`/`commit`/`log`/`readBlob` calls against
+harness-orchestrator, S3, or browser-capture calls in `handler.test.ts`
+(`./llm.ts`, `./harness-generation.ts`, `./harness-client.ts`,
+`./sandbox-client.ts`, `./git-commit.ts`, `./deploy.ts`, and
+`./browser-capture-client.ts` are all mocked at the module level; each
+has its own real-logic tests instead — `generation.test.ts` covers the
+now-unused-but-kept `./generation.ts`'s `parseGeneratedProject` JSON
+validation directly, `sandbox-client.test.ts` and `deploy.test.ts`
+cover their respective orchestrator HTTP calls against a fake `fetch`,
+`browser-capture-client.test.ts` covers the capture-Lambda HTTP call
+the same way, `git-commit.test.ts` runs real `isomorphic-git`
+`init`/`add`/`commit`/`log`/`readBlob` calls against
 `aws/git-storage`'s `createFakeS3FS` in-memory backend, and
 `llm-client` itself is tested against a fake `fetch` in its own
 package).
 
-`handler.test.ts`: reject connect with no `sessionId`; initialize a
-new session and ack `agent_connected`; reconnecting to an existing
-session doesn't overwrite it; disconnect removes the connection
-record; unknown connection on `$default` 404s; `user_suggestion` calls
-the LLM and appends both turns under the lock; a `user_suggestion`
-with no message text short-circuits before touching state or calling
-the LLM; an LLM failure persists nothing and returns an `error`
-response; a lock conflict reapplies the mutation (calling the LLM
-again) fresh from the re-read state, not compounded onto the stale
-candidate (same property `actor-spike` tests); `clear_conversation`
-resets and acks; `get_conversation_state` reads without persisting;
-`generate_all` runs generation from an explicit message and persists
-the result; falls back to the last user conversation turn when no
-message is given; errors without persisting when no description is
-available at all; errors without persisting when generation fails;
-`deploy` launches an independent instance from already-generated files
-and persists the result; errors without persisting when there's
-nothing to deploy yet; `capture_screenshot` captures without mutating
-state, rejects a missing `url` before ever calling the capture Lambda,
-and turns a capture failure into a `screenshot_capture_error` response
-rather than a raw `error`; an unknown message type errors.
+`handler.test.ts`: connect/disconnect/reconnect lifecycle;
+`user_suggestion` calls the LLM and appends both turns under the lock
+when no harness session exists yet, routes to the harness's
+`sendHarnessMessage` instead once one does; a lock conflict reapplies
+the mutation fresh from the re-read state; `clear_conversation` and
+`get_conversation_state`; `generate_all` starts a harness session from
+an explicit message (falling back to the last conversation turn, then
+erroring cleanly with no description at all) and persists
+`harness_session_id`/`sandbox_control_url`, responding
+`generation_started` rather than waiting for the turn to finish;
+errors without persisting when starting the harness session fails;
+`poll_generation_status` responds `phase_update` while the harness is
+still working, pulls sandbox files and best-effort-commits them to git
+storage (surfacing a commit failure as `gitCommitError` without
+failing the poll, same best-effort semantics generate_all always had)
+once the harness reports done, and is a no-op when no harness session
+has ever started; `record_activity` resets the harness idle clock
+without touching session state, and is a no-op with no session;
+`deploy` and `capture_screenshot` unchanged from before; an unknown
+message type errors.
 
 ## Build
 

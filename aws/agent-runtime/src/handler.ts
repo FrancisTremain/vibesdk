@@ -26,11 +26,26 @@ import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk
 import { newSessionState, nowEpochSeconds, type AgentSessionState, type WsConnectionRecord } from './state';
 import { planMessage, type IncomingMessage, type MessageDeps, type OutgoingMessage } from './messages';
 import { generateAssistantReply } from './llm';
-import { runGeneration } from './generation';
+import { startHarnessGeneration } from './harness-generation';
+import { getHarnessStatus, sendHarnessMessage, recordHarnessActivity } from './harness-client';
+import { getSandboxFiles } from './sandbox-client';
+import { commitGeneratedFiles } from './git-commit';
 import { deployProject } from './deploy';
 import { captureScreenshot } from './browser-capture-client';
 
-const messageDeps: MessageDeps = { generateReply: generateAssistantReply, runGeneration, deployProject, captureScreenshot };
+const messageDeps: MessageDeps = {
+	generateReply: generateAssistantReply,
+	startHarnessGeneration,
+	pollHarnessStatus: getHarnessStatus,
+	sendHarnessMessage: async (harnessSessionId, content) => {
+		await sendHarnessMessage(harnessSessionId, content);
+	},
+	recordHarnessActivity,
+	getSandboxFiles,
+	commitToGitStorage: commitGeneratedFiles,
+	deployProject,
+	captureScreenshot,
+};
 
 const AGENT_SESSIONS_TABLE = requireEnv('AGENT_SESSIONS_TABLE');
 const AGENT_CONNECTIONS_TABLE = requireEnv('AGENT_CONNECTIONS_TABLE');

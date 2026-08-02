@@ -47,6 +47,12 @@ export interface AgentSessionState {
 	init_command?: string;
 	sandbox_instance_id?: string;
 	preview_url?: string;
+	/** Set once generate_all starts a harness session (aws/agent-harness) against the sandbox above -- see ./harness-generation.ts. */
+	harness_session_id?: string;
+	/** http://<sandbox-ip>:8080, derived from preview_url -- passed to the harness so its custom tools can proxy directly to the sandbox, bypassing aws/sandbox-orchestrator-lambda per tool call. */
+	sandbox_control_url?: string;
+	/** Most recent report_phase call surfaced by the harness -- what poll_generation_status's buildResponse echoes as `phase_update` between generation_started and generation_complete. */
+	current_phase?: { name: string; status: 'started' | 'completed' };
 	/** Set by generate_all's best-effort commit to aws/git-storage (./git-commit.ts) -- exactly one of the two is set after a successful generation. */
 	git_commit_sha?: string;
 	git_commit_error?: string;

@@ -33,6 +33,26 @@ variable "sandbox_orchestrator_secret" {
   sensitive   = true
 }
 
+variable "harness_orchestrator_endpoint" {
+  description = "aws/infra/harness's harness_orchestrator_api_endpoint output (aws/infra/harness/orchestrator.tf). Same plain-variable/SSM-fallback reasoning as var.sandbox_orchestrator_endpoint -- reading aws/infra/harness's state directly here would invert the established apply order (root stack, then aws/infra/sandbox, then aws/infra/harness, each reading only what came before it)."
+  type        = string
+  default     = ""
+}
+
+variable "harness_orchestrator_secret" {
+  description = "aws/infra/harness's harness_orchestrator_secret output (the X-Orchestrator-Secret value aws/harness-orchestrator-lambda expects). Same plain-variable/SSM-fallback reasoning as var.sandbox_orchestrator_endpoint."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "sandbox_controlplane_secret" {
+  description = "aws/infra/sandbox's sandbox_controlplane_secret output -- needed here (not just by aws/sandbox-orchestrator-lambda) because aws/agent-harness's custom tools call a sandbox task's control-plane port directly, bypassing the orchestrator Lambda for per-tool-call efficiency. Same plain-variable/SSM-fallback reasoning as var.sandbox_orchestrator_endpoint."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
 resource "aws_dynamodb_table" "agent_sessions" {
   name         = "vibesdk-agent-sessions"
   billing_mode = "PAY_PER_REQUEST"
@@ -239,6 +259,9 @@ resource "aws_lambda_function" "agent_runtime" {
       # variables above for why these are plain vars, not remote state.
       SANDBOX_ORCHESTRATOR_ENDPOINT = var.sandbox_orchestrator_endpoint != "" ? var.sandbox_orchestrator_endpoint : data.aws_ssm_parameter.sandbox_orchestrator_endpoint.value
       SANDBOX_ORCHESTRATOR_SECRET   = var.sandbox_orchestrator_secret != "" ? var.sandbox_orchestrator_secret : data.aws_ssm_parameter.sandbox_orchestrator_secret.value
+      HARNESS_ORCHESTRATOR_ENDPOINT = var.harness_orchestrator_endpoint != "" ? var.harness_orchestrator_endpoint : data.aws_ssm_parameter.harness_orchestrator_endpoint.value
+      HARNESS_ORCHESTRATOR_SECRET   = var.harness_orchestrator_secret != "" ? var.harness_orchestrator_secret : data.aws_ssm_parameter.harness_orchestrator_secret.value
+      SANDBOX_CONTROLPLANE_SECRET   = var.sandbox_controlplane_secret != "" ? var.sandbox_controlplane_secret : data.aws_ssm_parameter.sandbox_controlplane_secret.value
       # aws/agent-runtime's git-commit.ts -- aws/git-storage's S3FS,
       # scoped per session under sessions/<sessionId>/git/ in this
       # bucket (s3.tf). Real S3, not a GitHub-style service account --

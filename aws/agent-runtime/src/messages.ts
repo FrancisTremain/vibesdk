@@ -34,15 +34,19 @@ export type OutgoingMessage = { type: string } & Record<string, unknown>;
  * fetch-mocked) network call -- see handler.ts for the real
  * implementation (./llm.ts's `generateAssistantReply`).
  */
-export interface GenerationResult {
-	projectName: string;
-	initCommand: string;
-	files: { filePath: string; fileContents: string }[];
+export interface HarnessGenerationStart {
+	sandboxInstanceId: string;
 	previewUrl?: string;
-	sandboxInstanceId?: string;
-	bootstrapMessage?: string;
-	gitCommitSha?: string;
-	gitCommitError?: string;
+	sandboxControlUrl: string;
+	harnessSessionId: string;
+	phase?: { name: string; status: 'started' | 'completed' };
+	done: boolean;
+}
+
+export interface HarnessStatus {
+	phase?: { name: string; status: 'started' | 'completed' };
+	done: boolean;
+	error?: string;
 }
 
 export interface DeployResult {
@@ -57,7 +61,18 @@ export interface CaptureResult {
 
 export interface MessageDeps {
 	generateReply: (conversationHistory: ConversationMessage[], userMessage: string, sessionId: string, userId: string) => Promise<string>;
-	runGeneration: (description: string, sessionId: string, userId: string) => Promise<GenerationResult>;
+	/** Starts a harness session (aws/agent-harness) against a freshly created, empty sandbox -- see ./harness-generation.ts. Returns once the session is accepted, not once generation finishes (see that module's header for why). */
+	startHarnessGeneration: (description: string, sessionId: string, userId: string) => Promise<HarnessGenerationStart>;
+	/** Polls the harness's current phase/done state -- see ./harness-client.ts. */
+	pollHarnessStatus: (harnessSessionId: string) => Promise<HarnessStatus>;
+	/** Pushes a follow-up user turn into an already-running (or resumable) harness session. Does not wait for the turn to finish. */
+	sendHarnessMessage: (harnessSessionId: string, content: string) => Promise<void>;
+	/** UI-activity heartbeat (editor/preview interaction) -- resets the harness's idle-teardown clock without sending a chat turn. */
+	recordHarnessActivity: (harnessSessionId: string) => Promise<void>;
+	/** Pulls the final file set out of the sandbox once the harness reports a turn done -- the harness writes files via its own tool calls, this runtime never holds them until this point. */
+	getSandboxFiles: (sandboxInstanceId: string) => Promise<{ filePath: string; fileContents: string }[]>;
+	/** Best-effort commit of the pulled files to this session's git history in S3 (./git-commit.ts) -- same best-effort semantics generate_all always had; a failure here doesn't fail poll_generation_status. */
+	commitToGitStorage: (sessionId: string, files: { filePath: string; fileContents: string }[], message: string) => Promise<{ commitSha: string }>;
 	deployProject: (files: { filePath: string; fileContents: string }[], projectName: string, initCommand: string) => Promise<DeployResult>;
 	captureScreenshot: (
 		sessionId: string,
@@ -114,19 +129,31 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 			}
 			const content = incoming.message;
 			return {
-				// Calls the LLM (via deps.generateReply) before returning the
-				// user+assistant turn to persist. This is NOT
-				// worker/agents/operations/UserConversationProcessor.ts's real
-				// conversational-AI handling (no tool calling, no blueprint/
-				// project-state awareness, no streaming) -- a single-turn
-				// completion over the conversation history, with a system
-				// prompt that's explicit about what this runtime can't do yet.
-				// See ./llm.ts. If the call fails (no API key configured, rate
-				// limited past retries, etc.) this throws and nothing is
-				// persisted -- handler.ts turns that into an `error` response.
+				// Two paths, branching on whether a harness session already
+				// exists for this chat (i.e. generate_all has run at least
+				// once): with one, this is the "follow-up iteration" path --
+				// push the message into the still-open (or resumable, if
+				// idle-torn-down) harness session via deps.sendHarnessMessage
+				// and let poll_generation_status surface the reply/phase
+				// updates, same as generate_all itself. Without one, this is
+				// pre-generation chit-chat, unchanged from the original
+				// single-turn deps.generateReply completion (no tool calling,
+				// no blueprint/project-state awareness -- see ./llm.ts).
 				mutate: async (state) => {
-					const reply = await deps.generateReply(state.conversation_messages, content, state.session_id, state.user_id);
 					const now = new Date().toISOString();
+					if (state.harness_session_id) {
+						await deps.sendHarnessMessage(state.harness_session_id, content);
+						return {
+							...state,
+							conversation_messages: [...state.conversation_messages, { role: 'user', content, created_at: now }],
+							pending_user_inputs: [...state.pending_user_inputs, content],
+							should_be_generating: true,
+							current_dev_state: 'PHASE_IMPLEMENTING',
+							updated_at: now,
+						};
+					}
+
+					const reply = await deps.generateReply(state.conversation_messages, content, state.session_id, state.user_id);
 					return {
 						...state,
 						conversation_messages: [
@@ -139,6 +166,9 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 					};
 				},
 				buildResponse: (state) => {
+					if (state.harness_session_id) {
+						return { type: 'conversation_response', message: 'Working on it...' };
+					}
 					const last = state.conversation_messages[state.conversation_messages.length - 1];
 					return { type: 'conversation_response', message: last?.content ?? '' };
 				},
@@ -187,45 +217,120 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 			// resolved inside `mutate` since state isn't loaded yet here.
 			const explicitDescription = incoming.message;
 			return {
-				// See ./generation.ts for exactly what this does and doesn't
-				// do (one LLM call for a small single-shot app, one call to
-				// aws/sandbox-orchestrator-lambda to run it) -- not
-				// worker/agents/operations/PhaseGeneration.ts's real phased
-				// pipeline. On failure (bad JSON from the model, sandbox
-				// launch failure, etc.) this throws and nothing is
-				// persisted, same error-handling shape as user_suggestion.
+				// Starts a harness session (aws/agent-harness) via
+				// deps.startHarnessGeneration -- see that module and
+				// ./harness-client.ts for what this actually does (an empty
+				// sandbox, then a Claude Agent SDK query() against it with
+				// custom tools proxying every mutation there). This resolves
+				// once the session is *accepted*, not once generation
+				// finishes -- a real phased build can run for minutes, far
+				// past any HTTP timeout in front of this Lambda. The client
+				// is expected to send poll_generation_status repeatedly
+				// after this to observe phase progress and eventual
+				// completion. On failure (sandbox launch failure, harness
+				// start failure) this throws and nothing is persisted, same
+				// error-handling shape as user_suggestion.
 				mutate: async (state) => {
 					const description = explicitDescription || lastUserMessage(state) || state.query;
 					if (!description) {
 						throw new Error('No project description available -- include a message with generate_all, or send a user_suggestion first.');
 					}
-					const result = await deps.runGeneration(description, state.session_id, state.user_id);
+					const result = await deps.startHarnessGeneration(description, state.session_id, state.user_id);
 					const now = new Date().toISOString();
 					return {
 						...state,
 						query: state.query || description,
-						project_name: result.projectName,
-						init_command: result.initCommand,
-						generated_files: Object.fromEntries(result.files.map((f) => [f.filePath, f.fileContents])),
 						sandbox_instance_id: result.sandboxInstanceId,
 						preview_url: result.previewUrl,
-						git_commit_sha: result.gitCommitSha,
-						git_commit_error: result.gitCommitError,
+						sandbox_control_url: result.sandboxControlUrl,
+						harness_session_id: result.harnessSessionId,
+						current_phase: result.phase,
+						current_dev_state: 'PHASE_GENERATING',
+						should_be_generating: !result.done,
+						updated_at: now,
+					};
+				},
+				buildResponse: (state) => ({
+					type: 'generation_started',
+					previewUrl: state.preview_url,
+					phase: state.current_phase,
+				}),
+			};
+		}
+
+		// Sent repeatedly by the client while should_be_generating is true,
+		// after generate_all or a harness-routed user_suggestion. Not a
+		// fixed poll interval this runtime enforces -- the client decides
+		// its own cadence.
+		case 'poll_generation_status':
+			return {
+				mutate: async (state) => {
+					if (!state.harness_session_id) return state;
+
+					const status = await deps.pollHarnessStatus(state.harness_session_id);
+					const now = new Date().toISOString();
+					if (!status.done) {
+						return { ...state, current_phase: status.phase, should_be_generating: true, updated_at: now };
+					}
+
+					// Turn finished -- pull the resulting files out of the
+					// sandbox (the harness wrote them there via its own tool
+					// calls, this runtime never held them until now), then
+					// best-effort commit them to git history -- same
+					// best-effort semantics generate_all always had (a
+					// working preview is already live by this point; that
+					// can't be rolled back, so a git-commit failure
+					// shouldn't fail the whole poll).
+					const files = state.sandbox_instance_id ? await deps.getSandboxFiles(state.sandbox_instance_id) : [];
+					let gitCommitSha: string | undefined;
+					let gitCommitError: string | undefined;
+					try {
+						const result = await deps.commitToGitStorage(state.session_id, files, `Generate: ${state.project_name || state.query}`);
+						gitCommitSha = result.commitSha;
+					} catch (err) {
+						gitCommitError = err instanceof Error ? err.message : String(err);
+					}
+					return {
+						...state,
+						current_phase: status.phase,
+						generated_files: Object.fromEntries(files.map((f) => [f.filePath, f.fileContents])),
+						git_commit_sha: gitCommitSha,
+						git_commit_error: gitCommitError,
 						current_dev_state: 'REVIEWING',
 						should_be_generating: false,
 						updated_at: now,
 					};
 				},
-				buildResponse: (state) => ({
-					type: 'generation_complete',
-					projectName: state.project_name,
-					files: Object.entries(state.generated_files).map(([filePath, fileContents]) => ({ filePath, fileContents })),
-					previewUrl: state.preview_url,
-					gitCommitSha: state.git_commit_sha,
-					gitCommitError: state.git_commit_error,
-				}),
+				buildResponse: (state) => {
+					if (!state.harness_session_id) return null;
+					if (state.should_be_generating) {
+						return { type: 'phase_update', phase: state.current_phase };
+					}
+					return {
+						type: 'generation_complete',
+						projectName: state.project_name,
+						files: Object.entries(state.generated_files).map(([filePath, fileContents]) => ({ filePath, fileContents })),
+						previewUrl: state.preview_url,
+						gitCommitSha: state.git_commit_sha,
+						gitCommitError: state.git_commit_error,
+					};
+				},
 			};
-		}
+
+		// UI-activity heartbeat from the side-by-side editor/preview pane --
+		// resets the harness's idle-teardown clock (aws/harness-orchestrator-lambda's
+		// 10-minute sliding timeout) without sending a chat turn. No state
+		// mutation, so this never contends with the optimistic lock a real
+		// message would.
+		case 'record_activity':
+			return {
+				buildResponse: async (state) => {
+					if (state.harness_session_id) {
+						await deps.recordHarnessActivity(state.harness_session_id).catch(() => {});
+					}
+					return null;
+				},
+			};
 
 		case 'deploy':
 			return {

@@ -15,8 +15,23 @@ process.env.AGENT_CONNECTIONS_TABLE = 'vibesdk-agent-connections';
 const generateAssistantReplyMock = vi.fn<(history: unknown[], message: string) => Promise<string>>();
 vi.mock('./llm', () => ({ generateAssistantReply: (...args: [unknown[], string]) => generateAssistantReplyMock(...args) }));
 
-const runGenerationMock = vi.fn<(description: string, sessionId: string) => Promise<import('./messages').GenerationResult>>();
-vi.mock('./generation', () => ({ runGeneration: (...args: [string, string]) => runGenerationMock(...args) }));
+const startHarnessGenerationMock = vi.fn<(description: string, sessionId: string, userId: string) => Promise<import('./messages').HarnessGenerationStart>>();
+vi.mock('./harness-generation', () => ({ startHarnessGeneration: (...args: [string, string, string]) => startHarnessGenerationMock(...args) }));
+
+const getHarnessStatusMock = vi.fn<(sessionId: string) => Promise<import('./messages').HarnessStatus>>();
+const sendHarnessMessageMock = vi.fn<(sessionId: string, content: string) => Promise<unknown>>();
+const recordHarnessActivityMock = vi.fn<(sessionId: string) => Promise<void>>();
+vi.mock('./harness-client', () => ({
+	getHarnessStatus: (...args: [string]) => getHarnessStatusMock(...args),
+	sendHarnessMessage: (...args: [string, string]) => sendHarnessMessageMock(...args),
+	recordHarnessActivity: (...args: [string]) => recordHarnessActivityMock(...args),
+}));
+
+const getSandboxFilesMock = vi.fn<(instanceId: string) => Promise<{ filePath: string; fileContents: string }[]>>();
+vi.mock('./sandbox-client', () => ({ getSandboxFiles: (...args: [string]) => getSandboxFilesMock(...args) }));
+
+const commitGeneratedFilesMock = vi.fn<(sessionId: string, files: unknown[], message: string) => Promise<{ commitSha: string }>>();
+vi.mock('./git-commit', () => ({ commitGeneratedFiles: (...args: [string, unknown[], string]) => commitGeneratedFilesMock(...args) }));
 
 const deployProjectMock = vi.fn<(files: unknown[], projectName: string, initCommand: string) => Promise<import('./messages').DeployResult>>();
 vi.mock('./deploy', () => ({ deployProject: (...args: [unknown[], string, string]) => deployProjectMock(...args) }));
@@ -76,7 +91,14 @@ beforeEach(() => {
 	apigwMock.on(PostToConnectionCommand).resolves({});
 	generateAssistantReplyMock.mockReset();
 	generateAssistantReplyMock.mockResolvedValue('a reply');
-	runGenerationMock.mockReset();
+	startHarnessGenerationMock.mockReset();
+	getHarnessStatusMock.mockReset();
+	sendHarnessMessageMock.mockReset();
+	recordHarnessActivityMock.mockReset();
+	recordHarnessActivityMock.mockResolvedValue(undefined);
+	getSandboxFilesMock.mockReset();
+	commitGeneratedFilesMock.mockReset();
+	commitGeneratedFilesMock.mockResolvedValue({ commitSha: 'abc123' });
 	deployProjectMock.mockReset();
 	captureScreenshotMock.mockReset();
 });
@@ -269,37 +291,37 @@ describe('$default', () => {
 		expect(response).toMatchObject({ type: 'conversation_state', state: { pendingUserInputs: ['queued'] } });
 	});
 
-	it('runs generation from an explicit message and persists the result', async () => {
+	it('starts a harness session from an explicit message and persists the result', async () => {
 		wireConnection();
 		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
 		ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
-		runGenerationMock.mockResolvedValue({
-			projectName: 'todo-app',
-			initCommand: 'bun run dev',
-			files: [{ filePath: 'index.html', fileContents: '<h1>todo</h1>' }],
-			previewUrl: 'http://203.0.113.5:3000',
+		startHarnessGenerationMock.mockResolvedValue({
 			sandboxInstanceId: 'inst-1',
+			previewUrl: 'http://203.0.113.5:3000',
+			sandboxControlUrl: 'http://203.0.113.5:8080',
+			harnessSessionId: 'harness-1',
+			phase: { name: 'planning', status: 'started' },
+			done: false,
 		});
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all', message: 'build me a todo app' }) }));
 
-		expect(runGenerationMock).toHaveBeenCalledWith('build me a todo app', 'session-1', 'user-1');
+		expect(startHarnessGenerationMock).toHaveBeenCalledWith('build me a todo app', 'session-1', 'user-1');
 		const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
 		expect(puts).toHaveLength(1);
 		expect(puts[0]!.args[0]!.input.Item).toMatchObject({
-			project_name: 'todo-app',
-			generated_files: { 'index.html': '<h1>todo</h1>' },
+			harness_session_id: 'harness-1',
 			sandbox_instance_id: 'inst-1',
 			preview_url: 'http://203.0.113.5:3000',
-			current_dev_state: 'REVIEWING',
-			should_be_generating: false,
+			sandbox_control_url: 'http://203.0.113.5:8080',
+			current_dev_state: 'PHASE_GENERATING',
+			should_be_generating: true,
 		});
 		const [response] = responsesSent();
 		expect(response).toMatchObject({
-			type: 'generation_complete',
-			projectName: 'todo-app',
+			type: 'generation_started',
 			previewUrl: 'http://203.0.113.5:3000',
-			files: [{ filePath: 'index.html', fileContents: '<h1>todo</h1>' }],
+			phase: { name: 'planning', status: 'started' },
 		});
 	});
 
@@ -315,11 +337,16 @@ describe('$default', () => {
 			},
 		});
 		ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
-		runGenerationMock.mockResolvedValue({ projectName: 'calc', initCommand: 'bun run dev', files: [{ filePath: 'a.js', fileContents: '1' }] });
+		startHarnessGenerationMock.mockResolvedValue({
+			sandboxInstanceId: 'inst-1',
+			sandboxControlUrl: 'http://203.0.113.5:8080',
+			harnessSessionId: 'harness-1',
+			done: false,
+		});
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all' }) }));
 
-		expect(runGenerationMock).toHaveBeenCalledWith('build a calculator', 'session-1', 'user-1');
+		expect(startHarnessGenerationMock).toHaveBeenCalledWith('build a calculator', 'session-1', 'user-1');
 	});
 
 	it('errors without persisting when generate_all has no description available', async () => {
@@ -328,22 +355,128 @@ describe('$default', () => {
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all' }) }));
 
-		expect(runGenerationMock).not.toHaveBeenCalled();
+		expect(startHarnessGenerationMock).not.toHaveBeenCalled();
 		expect(ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' })).toHaveLength(0);
 		const [response] = responsesSent();
 		expect(response).toMatchObject({ type: 'error', error: expect.stringContaining('No project description available') });
 	});
 
-	it('errors without persisting when generation fails', async () => {
+	it('errors without persisting when starting the harness session fails', async () => {
 		wireConnection();
 		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
-		runGenerationMock.mockRejectedValue(new Error('Model did not return valid JSON: Unexpected token'));
+		startHarnessGenerationMock.mockRejectedValue(new Error('Sandbox instance creation did not return a runId/previewURL'));
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all', message: 'build me a todo app' }) }));
 
 		expect(ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' })).toHaveLength(0);
 		const [response] = responsesSent();
-		expect(response).toMatchObject({ type: 'error', error: expect.stringContaining('did not return valid JSON') });
+		expect(response).toMatchObject({ type: 'error', error: expect.stringContaining('did not return a runId') });
+	});
+
+	it('routes user_suggestion to the harness once a session exists, instead of the standalone LLM reply', async () => {
+		wireConnection();
+		const generating = { ...baseSession, harness_session_id: 'harness-1', should_be_generating: false, current_dev_state: 'REVIEWING' as const };
+		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: generating });
+		ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
+		sendHarnessMessageMock.mockResolvedValue({ done: false });
+
+		await callHandler(wsEvent({ body: JSON.stringify({ type: 'user_suggestion', message: 'now add auth' }) }));
+
+		expect(sendHarnessMessageMock).toHaveBeenCalledWith('harness-1', 'now add auth');
+		expect(generateAssistantReplyMock).not.toHaveBeenCalled();
+		const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
+		expect(puts[0]!.args[0]!.input.Item).toMatchObject({ should_be_generating: true, current_dev_state: 'PHASE_IMPLEMENTING' });
+		const [response] = responsesSent();
+		expect(response).toMatchObject({ type: 'conversation_response' });
+	});
+
+	describe('poll_generation_status', () => {
+		it('reports phase_update while the harness is still working', async () => {
+			wireConnection();
+			const generating = { ...baseSession, harness_session_id: 'harness-1', sandbox_instance_id: 'inst-1', should_be_generating: true };
+			ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: generating });
+			ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
+			getHarnessStatusMock.mockResolvedValue({ done: false, phase: { name: 'implementation', status: 'started' } });
+
+			await callHandler(wsEvent({ body: JSON.stringify({ type: 'poll_generation_status' }) }));
+
+			expect(getSandboxFilesMock).not.toHaveBeenCalled();
+			const [response] = responsesSent();
+			expect(response).toMatchObject({ type: 'phase_update', phase: { name: 'implementation', status: 'started' } });
+		});
+
+		it('pulls sandbox files and reports generation_complete once the harness is done', async () => {
+			wireConnection();
+			const generating = { ...baseSession, harness_session_id: 'harness-1', sandbox_instance_id: 'inst-1', should_be_generating: true };
+			ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: generating });
+			ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
+			getHarnessStatusMock.mockResolvedValue({ done: true, phase: { name: 'done', status: 'completed' } });
+			getSandboxFilesMock.mockResolvedValue([{ filePath: 'index.html', fileContents: '<h1>todo</h1>' }]);
+
+			await callHandler(wsEvent({ body: JSON.stringify({ type: 'poll_generation_status' }) }));
+
+			expect(getSandboxFilesMock).toHaveBeenCalledWith('inst-1');
+			expect(commitGeneratedFilesMock).toHaveBeenCalledWith('session-1', [{ filePath: 'index.html', fileContents: '<h1>todo</h1>' }], expect.any(String));
+			const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
+			expect(puts[0]!.args[0]!.input.Item).toMatchObject({
+				generated_files: { 'index.html': '<h1>todo</h1>' },
+				git_commit_sha: 'abc123',
+				current_dev_state: 'REVIEWING',
+				should_be_generating: false,
+			});
+			const [response] = responsesSent();
+			expect(response).toMatchObject({ type: 'generation_complete', files: [{ filePath: 'index.html', fileContents: '<h1>todo</h1>' }], gitCommitSha: 'abc123' });
+		});
+
+		it('does not fail the poll when the git commit fails, and surfaces the error instead', async () => {
+			wireConnection();
+			const generating = { ...baseSession, harness_session_id: 'harness-1', sandbox_instance_id: 'inst-1', should_be_generating: true };
+			ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: generating });
+			ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
+			getHarnessStatusMock.mockResolvedValue({ done: true, phase: { name: 'done', status: 'completed' } });
+			getSandboxFilesMock.mockResolvedValue([{ filePath: 'index.html', fileContents: '<h1>todo</h1>' }]);
+			commitGeneratedFilesMock.mockRejectedValue(new Error('GIT_STORAGE_BUCKET not configured'));
+
+			await callHandler(wsEvent({ body: JSON.stringify({ type: 'poll_generation_status' }) }));
+
+			const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
+			expect(puts[0]!.args[0]!.input.Item).toMatchObject({ git_commit_error: 'GIT_STORAGE_BUCKET not configured', should_be_generating: false });
+			const [response] = responsesSent();
+			expect(response).toMatchObject({ type: 'generation_complete', gitCommitError: 'GIT_STORAGE_BUCKET not configured' });
+		});
+
+		it('is a no-op when no harness session has ever started', async () => {
+			wireConnection();
+			ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
+			ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
+
+			await callHandler(wsEvent({ body: JSON.stringify({ type: 'poll_generation_status' }) }));
+
+			expect(getHarnessStatusMock).not.toHaveBeenCalled();
+			expect(responsesSent()).toHaveLength(0);
+		});
+	});
+
+	describe('record_activity', () => {
+		it('resets the harness idle clock without mutating session state', async () => {
+			wireConnection();
+			ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: { ...baseSession, harness_session_id: 'harness-1' } });
+
+			await callHandler(wsEvent({ body: JSON.stringify({ type: 'record_activity' }) }));
+
+			expect(recordHarnessActivityMock).toHaveBeenCalledWith('harness-1');
+			expect(ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' })).toHaveLength(0);
+			expect(responsesSent()).toHaveLength(0);
+		});
+
+		it('is a no-op when no harness session has ever started', async () => {
+			wireConnection();
+			ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
+
+			await callHandler(wsEvent({ body: JSON.stringify({ type: 'record_activity' }) }));
+
+			expect(recordHarnessActivityMock).not.toHaveBeenCalled();
+		});
 	});
 
 	it('returns an error for an unknown message type', async () => {

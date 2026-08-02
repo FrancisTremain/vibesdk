@@ -1,0 +1,21 @@
+{
+  "name": "vibesdk-agent-harness",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Control-plane HTTP server that runs inside the harness Fargate task (aws/infra/harness) and wraps the Claude Agent SDK's query() in streaming-input mode as the phased code-generation engine. Built-in mutable tools (Bash/Write/Edit/Read/Glob/Grep) are disabled; custom tools (write_file, read_file, run_command, run_static_analysis, report_phase) proxy to the target sandbox task's aws/sandbox-controlplane server instead, so a runaway agent only costs a disposable sandbox restart.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts --root ."
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.220",
+    "tsx": "^4.16.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
+  }
+}

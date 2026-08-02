@@ -86,3 +86,27 @@ data "aws_ssm_parameter" "sandbox_orchestrator_secret" {
   name            = "/vibesdk/sandbox_orchestrator_secret"
   with_decryption = true
 }
+
+# Same reasoning as the sandbox_orchestrator_* data sources above.
+# Requires aws/infra/harness to have been applied at least once and
+# its outputs (harness_orchestrator_api_endpoint,
+# harness_orchestrator_secret) seeded into SSM first -- see
+# aws/infra/README.md's apply-order note. aws/agent-runtime's
+# ./harness-generation.ts also needs the sandbox module's own
+# controlplane secret directly (not proxied through
+# aws/sandbox-orchestrator-lambda for every harness tool call), hence
+# sandbox_controlplane_secret alongside the two harness_orchestrator_*
+# parameters.
+data "aws_ssm_parameter" "harness_orchestrator_endpoint" {
+  name = "/vibesdk/harness_orchestrator_endpoint"
+}
+
+data "aws_ssm_parameter" "harness_orchestrator_secret" {
+  name            = "/vibesdk/harness_orchestrator_secret"
+  with_decryption = true
+}
+
+data "aws_ssm_parameter" "sandbox_controlplane_secret" {
+  name            = "/vibesdk/sandbox_controlplane_secret"
+  with_decryption = true
+}

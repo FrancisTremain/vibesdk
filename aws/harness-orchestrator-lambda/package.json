@@ -1,0 +1,26 @@
+{
+  "name": "vibesdk-harness-orchestrator-lambda",
+  "private": true,
+  "version": "0.0.1",
+  "description": "API Gateway HTTP API (v2) Lambda driving ECS RunTask/DescribeTasks/StopTask against aws/infra/harness's Fargate cluster, tracking sessionId -> task mapping in the vibesdk-harness-sessions DynamoDB table, proxying per-session calls to the right container's aws/agent-harness control-plane server, and sweeping idle sessions on an EventBridge schedule. Not part of the main vibesdk build.",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/handler.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/handler.js --external:@aws-sdk/*",
+    "package": "npm run build && echo '{\"type\":\"module\"}' > dist/package.json && cd dist && zip -r ../harness-orchestrator-lambda.zip handler.js package.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts --root ."
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-ec2": "^3.600.0",
+    "@aws-sdk/client-ecs": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.138",
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
+  }
+}

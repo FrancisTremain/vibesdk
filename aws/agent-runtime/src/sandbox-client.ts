@@ -52,3 +52,27 @@ export async function createSandboxInstance(
 
 	return { success: true, ...json.data };
 }
+
+/** Used by ./harness-generation.ts to pull the final file set out of a sandbox once the harness reports its generation turn done -- the harness writes files via its own tool calls, so this runtime never holds them until this point. */
+export async function getSandboxFiles(
+	instanceId: string,
+	fetchImpl: typeof fetch = fetch,
+): Promise<{ filePath: string; fileContents: string }[]> {
+	const endpoint = process.env.SANDBOX_ORCHESTRATOR_ENDPOINT;
+	const secret = process.env.SANDBOX_ORCHESTRATOR_SECRET;
+	if (!endpoint || !secret) {
+		throw new Error(
+			'Sandbox orchestrator not configured (SANDBOX_ORCHESTRATOR_ENDPOINT / SANDBOX_ORCHESTRATOR_SECRET) -- see aws/infra/agent-runtime.tf.',
+		);
+	}
+
+	const res = await fetchImpl(`${endpoint.replace(/\/$/, '')}/api/sandbox/instances/${encodeURIComponent(instanceId)}/files`, {
+		method: 'GET',
+		headers: { 'x-orchestrator-secret': secret },
+	});
+	const json = (await res.json().catch(() => ({}))) as { success?: boolean; data?: { files?: { filePath: string; fileContents: string }[] }; error?: { message: string } };
+	if (!res.ok || !json.success) {
+		throw new Error(json.error?.message ?? `Fetching sandbox files failed (${res.status})`);
+	}
+	return json.data?.files ?? [];
+}
