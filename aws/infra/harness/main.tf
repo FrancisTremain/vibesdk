@@ -21,11 +21,10 @@
 # benefit -- same "SEPARATE ROOT MODULE, deliberately" reasoning as
 # aws/infra/sandbox/main.tf's header.
 #
-# This stack still needs a real pushed image URI (var.harness_task_image)
-# before apply -- see aws/agent-harness/README.md for the build/push
-# steps.
-#
-# NOT APPLIED. Same status as the rest of this directory.
+# var.harness_task_image defaults to this stack's own ECR repo at
+# :latest -- apply first, then build/push aws/agent-harness's image
+# (see its README); ECS only needs the image to exist by the time a
+# real session RunTask fires.
 
 terraform {
   required_version = ">= 1.5"
@@ -58,6 +57,21 @@ provider "aws" {
       Project = "vibesdk"
     }
   }
+}
+
+# Same reasoning as the root stack's data.aws_ssm_parameter.jwt_secret
+# (see aws/infra/main.tf) -- lets a plain `terraform apply` run without
+# retyping the Anthropic key on every invocation once it's been seeded
+# into SSM (see aws/infra/README.md). var.anthropic_api_key still takes
+# precedence when explicitly passed.
+data "aws_ssm_parameter" "anthropic_api_key" {
+  name            = "/vibesdk/anthropic_api_key"
+  with_decryption = true
+}
+
+locals {
+  anthropic_api_key  = var.anthropic_api_key != "" ? var.anthropic_api_key : data.aws_ssm_parameter.anthropic_api_key.value
+  harness_task_image = var.harness_task_image != "" ? var.harness_task_image : "${aws_ecr_repository.harness.repository_url}:latest"
 }
 
 resource "aws_vpc" "harness" {
@@ -285,7 +299,7 @@ resource "aws_ecs_task_definition" "harness" {
   container_definitions = jsonencode([
     {
       name      = "harness"
-      image     = var.harness_task_image
+      image     = local.harness_task_image
       essential = true
       portMappings = [
         { containerPort = 8081, protocol = "tcp" }, # control plane
@@ -293,7 +307,7 @@ resource "aws_ecs_task_definition" "harness" {
       environment = [
         { name = "CONTROL_PORT", value = "8081" },
         { name = "CONTROLPLANE_SECRET", value = random_password.harness_controlplane_secret.result },
-        { name = "ANTHROPIC_API_KEY", value = var.anthropic_api_key },
+        { name = "ANTHROPIC_API_KEY", value = local.anthropic_api_key },
       ]
       logConfiguration = {
         logDriver = "awslogs"

@@ -127,7 +127,7 @@ resource "aws_lambda_function" "harness_orchestrator" {
 
   environment {
     variables = {
-      HARNESS_SESSIONS_TABLE = aws_dynamodb_table.harness_sessions.name
+      HARNESS_SESSIONS_TABLE  = aws_dynamodb_table.harness_sessions.name
       ECS_CLUSTER             = aws_ecs_cluster.harness.name
       ECS_TASK_DEFINITION_ARN = aws_ecs_task_definition.harness.arn
       ECS_SUBNET_IDS          = "${aws_subnet.harness_a.id},${aws_subnet.harness_b.id}"
@@ -160,7 +160,7 @@ resource "aws_apigatewayv2_integration" "harness_orchestrator_lambda" {
   integration_type       = "AWS_PROXY"
   integration_uri        = aws_lambda_function.harness_orchestrator.invoke_arn
   payload_format_version = "2.0"
-  timeout_milliseconds    = min(var.orchestrator_lambda_timeout_seconds * 1000, 30000)
+  timeout_milliseconds   = min(var.orchestrator_lambda_timeout_seconds * 1000, 30000)
 }
 
 # Kept in sync with aws/harness-orchestrator-lambda/src/handler.ts's switch.
@@ -223,8 +223,8 @@ resource "aws_cloudwatch_event_rule" "harness_idle_sweep" {
 }
 
 resource "aws_cloudwatch_event_target" "harness_idle_sweep" {
-  rule = aws_cloudwatch_event_rule.harness_idle_sweep.name
-  arn  = aws_lambda_function.harness_orchestrator.arn
+  rule  = aws_cloudwatch_event_rule.harness_idle_sweep.name
+  arn   = aws_lambda_function.harness_orchestrator.arn
   input = jsonencode({ "detail-type" = "vibesdk.harness.idle_sweep" })
 }
 

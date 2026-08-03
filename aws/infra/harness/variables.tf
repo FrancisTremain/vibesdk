@@ -5,8 +5,9 @@ variable "aws_region" {
 }
 
 variable "harness_task_image" {
-  description = "Container image URI for the harness task, e.g. <account-id>.dkr.ecr.<region>.amazonaws.com/vibesdk-harness:latest (the repo this stack provisions, aws_ecr_repository.harness). No default -- build and push aws/agent-harness's image first, then set this to the pushed URI."
+  description = "Container image URI for the harness task. Empty default resolves to this stack's own ECR repo at the :latest tag (aws_ecr_repository.harness) -- build and push aws/agent-harness's image to that URI (see its README) either before or after the first apply; ECS only needs the image to exist by the time a real session RunTask fires, not at apply time."
   type        = string
+  default     = ""
 }
 
 variable "allowed_ips" {
@@ -15,7 +16,8 @@ variable "allowed_ips" {
 }
 
 variable "anthropic_api_key" {
-  description = "Passed to every harness task so the Agent SDK's query() can call the Anthropic API directly. Sensitive."
+  description = "Passed to every harness task so the Agent SDK's query() can call the Anthropic API directly. Sensitive. Empty default lets a plain apply fall back to SSM (/vibesdk/anthropic_api_key) -- see data.aws_ssm_parameter.anthropic_api_key in main.tf."
   type        = string
   sensitive   = true
+  default     = ""
 }
