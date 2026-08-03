@@ -150,11 +150,11 @@ resource "aws_vpc_endpoint" "harness_dynamodb" {
 
 resource "aws_security_group" "harness_task" {
   name        = "vibesdk-harness-task"
-  description = "Harness Fargate tasks -- control plane reachable only from var.allowed_ips plus the orchestrator Lambda (no static egress IP), outbound open for the Anthropic API and the sandbox task's public IP"
+  description = "Harness Fargate tasks -- control plane reachable only from var.allowed_ips plus the orchestrator Lambda (no static egress IP), outbound open for the Anthropic API and the sandbox task public IP"
   vpc_id      = aws_vpc.harness.id
 
   ingress {
-    description = "Control-plane port (aws/agent-harness's HTTP server): session start, streamInput follow-ups, status polling"
+    description = "Control-plane port (aws/agent-harness HTTP server): session start, streamInput follow-ups, status polling"
     from_port   = 8081
     to_port     = 8081
     protocol    = "tcp"
