@@ -103,6 +103,14 @@ resource "aws_acm_certificate" "site" {
 
   lifecycle {
     create_before_destroy = true
+    # subject_alternative_names is never set explicitly above (ACM adds
+    # domain_name to it automatically) -- left fully computed, the AWS
+    # provider treats its value as unknown on every plan and forces a
+    # replace of the whole certificate even when nothing real changed.
+    # Ignoring it here is safe: this cert only ever has one SAN, the
+    # domain_name itself, which the domain_name argument above already
+    # tracks and will still force a replace if it actually changes.
+    ignore_changes = [subject_alternative_names]
   }
 }
 
