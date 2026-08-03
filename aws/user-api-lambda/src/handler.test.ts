@@ -16,8 +16,20 @@ process.env.LLM_USAGE_TABLE = 'test-llm-usage';
 process.env.AGENT_SESSIONS_TABLE = 'test-agent-sessions';
 process.env.JWT_SECRET = 'Test-Jwt-Secret-For-UserApiLambda-2024!';
 process.env.ORIGIN_VERIFY_SECRET = 'test-origin-verify-secret';
+process.env.USER_CREDENTIALS_KMS_KEY_ARN = 'arn:aws:kms:ap-southeast-2:123456789012:key/test-key';
 
-const { handler, setDdbClientForTests } = await import('./handler');
+const { handler, setDdbClientForTests, setKmsClientForTests } = await import('./handler');
+
+/** Fakes KMS Encrypt with a reversible transform (base64) -- enough to
+ *  verify the handler round-trips ciphertext through HarnessCredentialsStore
+ *  correctly without needing a real KMS call. */
+class FakeKmsClient {
+	async send(command: { input?: { Plaintext?: Uint8Array } }) {
+		const plaintext = command.input?.Plaintext;
+		if (!plaintext) throw new Error('FakeKmsClient: missing Plaintext');
+		return { CiphertextBlob: Buffer.from(Buffer.from(plaintext).toString('base64'), 'utf-8') };
+	}
+}
 
 function asStructured(result: APIGatewayProxyResultV2): APIGatewayProxyStructuredResultV2 {
 	if (typeof result === 'string') throw new Error('Expected a structured result, got a bare string');
@@ -77,9 +89,11 @@ describe('user-api-lambda handler', () => {
 		JWTUtils.resetInstanceForTests();
 		ddb = new FakeDynamoDocumentClient();
 		setDdbClientForTests(ddb as unknown as DynamoDBDocumentClient);
+		setKmsClientForTests(new FakeKmsClient());
 	});
 	afterEach(() => {
 		setDdbClientForTests(null);
+		setKmsClientForTests(null);
 	});
 
 	it('requires auth for /stats', async () => {
@@ -172,6 +186,79 @@ describe('user-api-lambda handler', () => {
 			),
 		);
 		expect(result.statusCode).toBe(400);
+	});
+});
+
+describe('harness credentials routes (the auth.json branching path)', () => {
+	let ddb: FakeDynamoDocumentClient;
+
+	beforeEach(() => {
+		JWTUtils.resetInstanceForTests();
+		ddb = new FakeDynamoDocumentClient();
+		setDdbClientForTests(ddb as unknown as DynamoDBDocumentClient);
+		setKmsClientForTests(new FakeKmsClient());
+	});
+	afterEach(() => {
+		setDdbClientForTests(null);
+		setKmsClientForTests(null);
+	});
+
+	it('requires auth for GET/PUT/DELETE', async () => {
+		expect(asStructured(await handler(event({ routeKey: 'GET /api/user/credentials' }))).statusCode).toBe(401);
+		expect(
+			asStructured(await handler(event({ routeKey: 'PUT /api/user/credentials', body: JSON.stringify({ credentialsJson: {} }) })))
+				.statusCode,
+		).toBe(401);
+		expect(asStructured(await handler(event({ routeKey: 'DELETE /api/user/credentials' }))).statusCode).toBe(401);
+	});
+
+	it('defaults to platform_key for a fresh user', async () => {
+		const { token } = await registerUser(ddb, 'creds-default@example.com');
+		const result = asStructured(
+			await handler(event({ routeKey: 'GET /api/user/credentials', headers: { authorization: `Bearer ${token}` } })),
+		);
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data.authMode).toBe('platform_key');
+	});
+
+	it('rejects a credentials upload missing claudeAiOauth', async () => {
+		const { token } = await registerUser(ddb, 'creds-invalid@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'PUT /api/user/credentials',
+					headers: { authorization: `Bearer ${token}` },
+					body: JSON.stringify({ credentialsJson: { notTheRightShape: true } }),
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(400);
+	});
+
+	it('uploads valid credentials, switches authMode to byo_credentials, then clears back to platform_key', async () => {
+		const { token } = await registerUser(ddb, 'creds-upload@example.com');
+		const headers = { authorization: `Bearer ${token}` };
+
+		const putResult = asStructured(
+			await handler(
+				event({
+					routeKey: 'PUT /api/user/credentials',
+					headers,
+					body: JSON.stringify({ credentialsJson: { claudeAiOauth: { refreshToken: 'rt-123', accessToken: 'at-456' } } }),
+				}),
+			),
+		);
+		expect(putResult.statusCode).toBe(200);
+		expect(body(putResult).data.authMode).toBe('byo_credentials');
+
+		const getResult = asStructured(await handler(event({ routeKey: 'GET /api/user/credentials', headers })));
+		expect(body(getResult).data.authMode).toBe('byo_credentials');
+
+		const deleteResult = asStructured(await handler(event({ routeKey: 'DELETE /api/user/credentials', headers })));
+		expect(body(deleteResult).data.authMode).toBe('platform_key');
+
+		const getAfterDelete = asStructured(await handler(event({ routeKey: 'GET /api/user/credentials', headers })));
+		expect(body(getAfterDelete).data.authMode).toBe('platform_key');
 	});
 
 	it('returns an empty activity timeline for a fresh user', async () => {

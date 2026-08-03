@@ -15,8 +15,31 @@
  * for every tool call -- only this one-time setup goes through it).
  */
 
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { HarnessCredentialsStore } from 'vibesdk-db-identity';
 import { createSandboxInstance } from './sandbox-client';
 import { createHarnessSession, type HarnessSessionStatus } from './harness-client';
+
+let cachedCredentialsStore: HarnessCredentialsStore | null = null;
+
+/** Whether this user is on the auth.json branching path -- see aws/agent-harness/src/credentials-client.ts. Defaults to the platform key (false) on any lookup failure; an auth-mode read should never block generation from starting. */
+async function shouldUseUserCredentials(userId: string): Promise<boolean> {
+	try {
+		if (!cachedCredentialsStore) {
+			const tableName = process.env.IDENTITY_TABLE;
+			if (!tableName) return false;
+			const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+			// Cast at the package boundary -- see ./usage.ts's identical comment.
+			cachedCredentialsStore = new HarnessCredentialsStore(ddb as unknown as ConstructorParameters<typeof HarnessCredentialsStore>[0], tableName);
+		}
+		const record = await cachedCredentialsStore.get(userId);
+		return record.authMode === 'byo_credentials';
+	} catch (err) {
+		console.error('Failed to read harness auth mode, defaulting to platform key', err);
+		return false;
+	}
+}
 
 export interface HarnessGenerationStart {
 	sandboxInstanceId: string;
@@ -45,7 +68,7 @@ function requireEnv(name: string): string {
 export async function startHarnessGeneration(
 	description: string,
 	sessionId: string,
-	_userId: string,
+	userId: string,
 	fetchImpl: typeof fetch = fetch,
 ): Promise<HarnessGenerationStart> {
 	const sandbox = await createSandboxInstance([], 'generated-app', 'true', fetchImpl);
@@ -55,8 +78,17 @@ export async function startHarnessGeneration(
 
 	const sandboxControlUrl = deriveControlUrl(sandbox.previewURL);
 	const sandboxControlSecret = requireEnv('SANDBOX_CONTROLPLANE_SECRET');
+	const useUserCredentials = await shouldUseUserCredentials(userId);
 
-	const harness: HarnessSessionStatus = await createHarnessSession(sessionId, description, sandboxControlUrl, sandboxControlSecret, fetchImpl);
+	const harness: HarnessSessionStatus = await createHarnessSession(
+		sessionId,
+		description,
+		sandboxControlUrl,
+		sandboxControlSecret,
+		userId,
+		useUserCredentials,
+		fetchImpl,
+	);
 	if (!harness.sessionId) {
 		throw new Error('Harness session creation did not return a sessionId');
 	}

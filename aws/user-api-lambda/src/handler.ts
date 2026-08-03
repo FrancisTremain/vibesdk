@@ -36,10 +36,11 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
+import { KMSClient, EncryptCommand } from '@aws-sdk/client-kms';
 import { AuthOrchestrator } from 'vibesdk-auth-orchestration';
 import { AnalyticsStore } from 'vibesdk-db-analytics';
 import { AppStore, type UserAppQueryOptions } from 'vibesdk-db-apps';
-import { UserStore } from 'vibesdk-db-identity';
+import { UserStore, HarnessCredentialsStore } from 'vibesdk-db-identity';
 import { UsageStore } from 'vibesdk-db-llm-usage';
 import { checkCsrf } from 'vibesdk-csrf';
 import { ModelConfigStore, ModelProviderStore } from 'vibesdk-db-model-config';
@@ -77,7 +78,10 @@ let cachedAuth: AuthOrchestrator | null = null;
 let cachedApps: AppStore | null = null;
 let cachedUsers: UserStore | null = null;
 let cachedUsage: UsageStore | null = null;
+let cachedCredentials: HarnessCredentialsStore | null = null;
+let cachedKms: Pick<KMSClient, 'send'> | null = null;
 let ddbClientOverride: DynamoDBDocumentClient | null = null;
+let kmsClientOverride: Pick<KMSClient, 'send'> | null = null;
 
 /** Test-only, mirrors the sibling Lambda packages' setDdbClientForTests. */
 export function setDdbClientForTests(client: DynamoDBDocumentClient | null): void {
@@ -89,6 +93,13 @@ export function setDdbClientForTests(client: DynamoDBDocumentClient | null): voi
 	cachedApps = null;
 	cachedUsers = null;
 	cachedUsage = null;
+	cachedCredentials = null;
+}
+
+/** Test-only, KMS's own equivalent of setDdbClientForTests. */
+export function setKmsClientForTests(client: Pick<KMSClient, 'send'> | null): void {
+	kmsClientOverride = client;
+	cachedKms = null;
 }
 
 function getDdb(): DynamoDBDocumentClient {
@@ -123,6 +134,16 @@ function getUsers(): UserStore {
 	if (cachedUsers) return cachedUsers;
 	cachedUsers = new UserStore(getDdb(), requireEnv('IDENTITY_TABLE'));
 	return cachedUsers;
+}
+
+function getCredentials(): HarnessCredentialsStore {
+	if (cachedCredentials) return cachedCredentials;
+	cachedCredentials = new HarnessCredentialsStore(getDdb(), requireEnv('IDENTITY_TABLE'));
+	return cachedCredentials;
+}
+
+function getKms(): Pick<KMSClient, 'send'> {
+	return kmsClientOverride ?? (cachedKms ??= new KMSClient({}));
 }
 
 function getUsage(): UsageStore {
@@ -313,6 +334,65 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 				if (!session) return errorResponse('Unauthorized', 401);
 				const activities = await getAnalytics().getUserActivityTimeline(session.user.id, 20);
 				return successResponse({ activities });
+			}
+
+			case 'GET /api/user/credentials': {
+				// Reports which harness auth branch this user is on -- never
+				// the ciphertext itself, so this is safe to return unauthenticated-
+				// adjacent detail once a session is confirmed.
+				const session = await getUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+				const record = await getCredentials().get(session.user.id);
+				return successResponse({ authMode: record.authMode, updatedAt: record.updatedAt });
+			}
+
+			case 'PUT /api/user/credentials': {
+				// Uploads a Claude Code OAuth credentials export (the
+				// `claudeAiOauth` blob from `.credentials.json`, see
+				// aws/agent-harness/src/credentials-client.ts) as this user's
+				// harness auth, replacing the platform's workspace-scoped
+				// Anthropic API key for their sessions. Encrypted here with
+				// KMS before it ever reaches DynamoDB -- this Lambda's role has
+				// kms:Encrypt only, never kms:Decrypt (see
+				// aws/infra/user-credentials.tf), so once written this Lambda
+				// itself can't read the plaintext back either.
+				const session = await getUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+
+				const body = parseJsonBody(event);
+				const credentialsJson = body?.credentialsJson;
+				if (typeof credentialsJson !== 'object' || credentialsJson === null || Array.isArray(credentialsJson)) {
+					return errorResponse('credentialsJson must be the JSON object from a Claude Code .credentials.json export', 400);
+				}
+				if (!('claudeAiOauth' in credentialsJson)) {
+					return errorResponse('credentialsJson is missing the expected claudeAiOauth field -- is this a Claude Code .credentials.json export?', 400);
+				}
+
+				const plaintext = Buffer.from(JSON.stringify(credentialsJson), 'utf-8');
+				// KMS Encrypt's plaintext limit for a symmetric key is 4096
+				// bytes -- a real .credentials.json export is well under this,
+				// so hitting it means something other than a genuine export.
+				if (plaintext.byteLength > 4096) {
+					return errorResponse('credentialsJson is too large to be a valid .credentials.json export', 400);
+				}
+
+				const encrypted = await getKms().send(
+					new EncryptCommand({ KeyId: requireEnv('USER_CREDENTIALS_KMS_KEY_ARN'), Plaintext: plaintext }),
+				);
+				if (!encrypted.CiphertextBlob) return errorResponse('Encryption failed', 500);
+
+				await getCredentials().putEncryptedCredentials(session.user.id, Buffer.from(encrypted.CiphertextBlob).toString('base64'));
+				return successResponse({ authMode: 'byo_credentials' });
+			}
+
+			case 'DELETE /api/user/credentials': {
+				// Reverts to the platform-key path -- deletes the stored
+				// ciphertext entirely (HarnessCredentialsStore.clear), not just
+				// a flag flip.
+				const session = await getUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+				await getCredentials().clear(session.user.id);
+				return successResponse({ authMode: 'platform_key' });
 			}
 
 			case 'GET /api/user/providers': {

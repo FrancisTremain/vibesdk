@@ -18,6 +18,7 @@ export const oauthIdentitySk = (provider: string, providerId: string) =>
 export const sessionIdLookupPk = (sessionId: string) => `SESSIONID#${sessionId}`;
 export const apiKeyIdLookupPk = (keyId: string) => `APIKEYID#${keyId}`;
 export const apiKeyHashLookupPk = (keyHash: string) => `APIKEYHASH#${keyHash}`;
+export const SK_HARNESS_CREDENTIALS = 'HARNESSCREDENTIALS';
 
 export function newId(): string {
 	return crypto.randomUUID();

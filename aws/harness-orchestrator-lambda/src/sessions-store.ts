@@ -37,6 +37,9 @@ export interface HarnessSessionRecord {
 	/** Captured once at session creation so a later resume (after an idle teardown) doesn't need the caller to resupply which sandbox task to proxy tool calls to. */
 	sandboxControlUrl: string;
 	sandboxControlSecret: string;
+	/** Captured once at session creation so a resume-after-idle-teardown relaunch stays on the same auth branch without the caller resupplying it -- see aws/agent-harness/src/credentials-client.ts. */
+	userId?: string;
+	useUserCredentials?: boolean;
 	createdAt: number;
 	lastActivityAt: number;
 	expiresAt: number;

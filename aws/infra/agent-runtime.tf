@@ -176,6 +176,15 @@ resource "aws_iam_role_policy" "agent_runtime_lambda_dynamodb" {
         Action   = ["dynamodb:PutItem"]
         Resource = [aws_dynamodb_table.llm_usage.arn]
       },
+      {
+        # ./harness-generation.ts's shouldUseUserCredentials reads the
+        # HARNESSCREDENTIALS item to decide which auth branch to start a
+        # session on -- read-only, this Lambda never writes it (that's
+        # aws/user-api-lambda's PUT/DELETE /api/user/credentials).
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = [aws_dynamodb_table.identity.arn]
+      },
     ]
   })
 }
@@ -246,6 +255,9 @@ resource "aws_lambda_function" "agent_runtime" {
       AGENT_SESSIONS_TABLE    = aws_dynamodb_table.agent_sessions.name
       AGENT_CONNECTIONS_TABLE = aws_dynamodb_table.agent_connections.name
       LLM_USAGE_TABLE         = aws_dynamodb_table.llm_usage.name
+      # ./harness-generation.ts's shouldUseUserCredentials -- the
+      # auth.json branching path's per-user auth-mode lookup.
+      IDENTITY_TABLE = aws_dynamodb_table.identity.name
       # aws/llm-client provider dispatch -- see that package's README for
       # the provider/model-name id convention and the apiKeyEnvVarFor()
       # naming this must match (${PROVIDER}_API_KEY, matching

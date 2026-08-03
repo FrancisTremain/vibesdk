@@ -35,6 +35,9 @@ export interface StartHarnessRequest {
 	sandboxControlUrl: string;
 	sandboxControlSecret: string;
 	resumeAgentSessionId?: string;
+	/** Routes this session through the auth.json branching path -- see aws/agent-harness/src/credentials-client.ts. Only a userId reference crosses this HTTP call; the harness task decrypts the credential itself. */
+	userId?: string;
+	useUserCredentials?: boolean;
 }
 
 export interface HarnessPhase {

@@ -53,6 +53,23 @@ port simplified away.
    testing) makes a real network call to an LLM provider — out of scope
    for a storage-layer Lambda, not ported at all.
 
+## Harness credentials (the auth.json branching path)
+
+`GET/PUT/DELETE /api/user/credentials` let a user switch their generation
+harness sessions (`aws/agent-harness`) from the platform's workspace-scoped
+Anthropic API key to their own uploaded Claude Code OAuth credentials
+(the `claudeAiOauth` blob from a `.credentials.json` export). `PUT`
+encrypts the uploaded JSON with KMS (`aws_kms_key.user_credentials`,
+[`../infra/user-credentials.tf`](../infra/user-credentials.tf)) before
+writing it to `vibesdk-db-identity`'s `HarnessCredentialsStore` — this
+Lambda's IAM role has `kms:Encrypt` only, never `kms:Decrypt`, so once
+written it can't read the plaintext back either. Decryption happens
+inside the harness Fargate task itself at session-start time, via its
+own IAM role — see `aws/agent-harness/src/credentials-client.ts` and
+`user-credentials.tf`'s module comment for the full reasoning (mainly:
+never put a live account credential on the harness control plane's
+plain-HTTP channel).
+
 ## What's ported
 
 `GET /api/stats` (`AnalyticsStore.getUserStats`), `GET /api/stats/activity`

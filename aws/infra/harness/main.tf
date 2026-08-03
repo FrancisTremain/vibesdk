@@ -74,6 +74,19 @@ locals {
   harness_task_image = var.harness_task_image != "" ? var.harness_task_image : "${aws_ecr_repository.harness.repository_url}:latest"
 }
 
+# Bridges the root stack's KMS key + identity table (aws/infra/user-credentials.tf)
+# into this separate root module -- same SSM-parameter pattern this file
+# already uses for the Anthropic key. Needed so the harness task's own
+# role (not the orchestrator Lambda) can decrypt a user's uploaded
+# credentials directly -- see aws/agent-harness/src/credentials-client.ts.
+data "aws_ssm_parameter" "user_credentials_kms_key_arn" {
+  name = "/vibesdk/user_credentials_kms_key_arn"
+}
+
+data "aws_ssm_parameter" "identity_table_arn" {
+  name = "/vibesdk/identity_table_arn"
+}
+
 resource "aws_vpc" "harness" {
   cidr_block           = "10.44.0.0/16"
   enable_dns_support   = true
@@ -216,6 +229,32 @@ resource "aws_iam_role" "harness_task" {
       Principal = { Service = "ecs-tasks.amazonaws.com" }
       Action    = "sts:AssumeRole"
     }]
+  })
+}
+
+# Lets a task decrypt a user's uploaded credentials directly from AWS
+# APIs (always TLS) instead of the orchestrator Lambda forwarding the
+# plaintext over the control plane's plain-HTTP channel -- see
+# aws/agent-harness/src/credentials-client.ts and
+# aws/infra/user-credentials.tf's module comment for the full reasoning.
+resource "aws_iam_role_policy" "harness_task_user_credentials" {
+  name = "vibesdk-harness-task-user-credentials"
+  role = aws_iam_role.harness_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = [data.aws_ssm_parameter.user_credentials_kms_key_arn.value]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = [data.aws_ssm_parameter.identity_table_arn.value]
+      },
+    ]
   })
 }
 

@@ -67,3 +67,7 @@ aws/infra/sandbox/.terraform/
 aws/infra/sandbox/.terraform.lock.hcl
 aws/infra/sandbox/tfplan
 aws/infra/sandbox/terraform.tfvars
+aws/infra/harness/.terraform/
+aws/infra/harness/.terraform.lock.hcl
+aws/infra/harness/tfplan
+aws/infra/harness/terraform.tfvars

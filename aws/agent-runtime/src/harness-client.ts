@@ -44,9 +44,16 @@ export async function createHarnessSession(
 	userPrompt: string,
 	sandboxControlUrl: string,
 	sandboxControlSecret: string,
+	userId?: string,
+	useUserCredentials?: boolean,
 	fetchImpl: typeof fetch = fetch,
 ): Promise<HarnessSessionStatus> {
-	return call('POST', '/api/harness/sessions', { sessionId, userPrompt, sandboxControlUrl, sandboxControlSecret }, fetchImpl);
+	return call(
+		'POST',
+		'/api/harness/sessions',
+		{ sessionId, userPrompt, sandboxControlUrl, sandboxControlSecret, userId, useUserCredentials },
+		fetchImpl,
+	);
 }
 
 export async function sendHarnessMessage(sessionId: string, content: string, fetchImpl: typeof fetch = fetch): Promise<HarnessSessionStatus> {

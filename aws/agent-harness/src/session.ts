@@ -26,9 +26,13 @@
  * .../status route already expects.
  */
 
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { query, type Query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { createHarnessTools } from './tools';
 import { SandboxClient } from './sandbox-client';
+import { UserCredentialsClient } from './credentials-client';
 
 export interface PhaseReport {
 	name: string;
@@ -46,6 +50,19 @@ export interface HarnessSessionConfig {
 	sandboxControlUrl: string;
 	sandboxControlSecret: string;
 	resumeAgentSessionId?: string;
+	/** Set together to route this session through the auth.json branching path instead of the platform's ANTHROPIC_API_KEY -- see ./credentials-client.ts. */
+	userId?: string;
+	useUserCredentials?: boolean;
+}
+
+/** Writes an uploaded `.credentials.json` export to a fresh temp dir and points CLAUDE_CONFIG_DIR at it, so the Agent SDK's in-process credential lookup (sdk.mjs reads `$CLAUDE_CONFIG_DIR/.credentials.json`) picks it up instead of the task-definition's ANTHROPIC_API_KEY. */
+async function materializeUserCredentials(credentialsJson: Record<string, unknown>): Promise<void> {
+	const dir = await mkdtemp(join(tmpdir(), 'harness-credentials-'));
+	await writeFile(join(dir, '.credentials.json'), JSON.stringify(credentialsJson), { mode: 0o600 });
+	process.env.CLAUDE_CONFIG_DIR = dir;
+	// The CLI/SDK prefers an explicit API key over OAuth credentials when
+	// both are present -- unset it so the file just written actually wins.
+	delete process.env.ANTHROPIC_API_KEY;
 }
 
 /** A long-lived AsyncIterable that query() consumes as `prompt`; push() feeds it new user turns without ever closing the underlying stream. */
@@ -92,12 +109,27 @@ export class HarnessSession {
 	private error: string | undefined;
 	private consumeLoop: Promise<void> | undefined;
 
-	constructor(private readonly config: HarnessSessionConfig) {
+	constructor(
+		private readonly config: HarnessSessionConfig,
+		private readonly credentialsClient: Pick<UserCredentialsClient, 'getCredentialsJson'> = new UserCredentialsClient(
+			process.env.IDENTITY_TABLE ?? '',
+		),
+	) {
 		this.sandbox = new SandboxClient({ baseUrl: config.sandboxControlUrl, secret: config.sandboxControlSecret });
 	}
 
 	/** Starts the query() loop and pushes the first user turn. Resolves once the session id is known (fast) -- does not wait for the turn to finish. */
 	async start(userPrompt: string): Promise<HarnessStatus> {
+		if (this.config.useUserCredentials && this.config.userId) {
+			const credentialsJson = await this.credentialsClient.getCredentialsJson(this.config.userId);
+			if (credentialsJson) await materializeUserCredentials(credentialsJson);
+			// If the user's stored auth mode says byo_credentials but nothing
+			// decrypts (cleared between session-create and task-start, or a
+			// transient KMS/DynamoDB error), fall through silently to the
+			// platform ANTHROPIC_API_KEY still set in this task's environment
+			// rather than failing the whole session over an auth-path edge case.
+		}
+
 		const tools = createHarnessTools({
 			sandbox: this.sandbox,
 			onPhaseReport: (phase) => {

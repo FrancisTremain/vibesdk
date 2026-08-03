@@ -151,6 +151,8 @@ async function launchAndStart(
 	sandboxControlUrl: string,
 	sandboxControlSecret: string,
 	resumeAgentSessionId: string | undefined,
+	userId: string | undefined,
+	useUserCredentials: boolean | undefined,
 ): Promise<HarnessStatus | APIGatewayProxyResultV2> {
 	const store = getStore();
 	const runner = getRunner();
@@ -174,7 +176,15 @@ async function launchAndStart(
 
 	try {
 		const cp = controlPlaneFor(publicIp);
-		const result = await startWithRetry(cp, { sessionId, userPrompt, sandboxControlUrl, sandboxControlSecret, resumeAgentSessionId });
+		const result = await startWithRetry(cp, {
+			sessionId,
+			userPrompt,
+			sandboxControlUrl,
+			sandboxControlSecret,
+			resumeAgentSessionId,
+			userId,
+			useUserCredentials,
+		});
 		if (result.status >= 400) {
 			await store.update(sessionId, { status: 'ERROR', error: JSON.stringify(result.body) });
 			return errorResponse('Harness start failed', 502);
@@ -200,6 +210,8 @@ async function createSession(event: APIGatewayProxyEventV2): Promise<APIGatewayP
 	const sandboxControlUrl = typeof body.sandboxControlUrl === 'string' ? body.sandboxControlUrl : undefined;
 	const sandboxControlSecret = typeof body.sandboxControlSecret === 'string' ? body.sandboxControlSecret : undefined;
 	const sessionId = typeof body.sessionId === 'string' && body.sessionId ? body.sessionId : randomUUID();
+	const userId = typeof body.userId === 'string' ? body.userId : undefined;
+	const useUserCredentials = body.useUserCredentials === true;
 
 	if (!userPrompt) return errorResponse('userPrompt is required', 400);
 	if (!sandboxControlUrl || !sandboxControlSecret) return errorResponse('sandboxControlUrl and sandboxControlSecret are required', 400);
@@ -214,12 +226,14 @@ async function createSession(event: APIGatewayProxyEventV2): Promise<APIGatewayP
 		status: 'PROVISIONING',
 		sandboxControlUrl,
 		sandboxControlSecret,
+		userId,
+		useUserCredentials,
 		createdAt: now,
 		lastActivityAt: now,
 		expiresAt: newExpiresAt(),
 	});
 
-	const result = await launchAndStart(sessionId, userPrompt, sandboxControlUrl, sandboxControlSecret, undefined);
+	const result = await launchAndStart(sessionId, userPrompt, sandboxControlUrl, sandboxControlSecret, undefined, userId, useUserCredentials);
 	if (isErrorResponse(result)) return result;
 	return successResponse({ sessionId, ...result });
 }
@@ -243,7 +257,15 @@ async function sendMessage(sessionId: string, event: APIGatewayProxyEventV2): Pr
 	}
 
 	// IDLE (or ERROR -- worth a fresh attempt) -- resume on a freshly launched task.
-	const result = await launchAndStart(sessionId, content, record.sandboxControlUrl, record.sandboxControlSecret, record.agentSessionId);
+	const result = await launchAndStart(
+		sessionId,
+		content,
+		record.sandboxControlUrl,
+		record.sandboxControlSecret,
+		record.agentSessionId,
+		record.userId,
+		record.useUserCredentials,
+	);
 	if (isErrorResponse(result)) return result;
 	return successResponse(result);
 }

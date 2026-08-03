@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 
 // Fakes the whole SDK module: tools.ts's createSdkMcpServer/tool calls just
@@ -92,5 +92,64 @@ describe('HarnessSession', () => {
 
 		const status = await session.shutdown();
 		expect(status.agentSessionId).toBe('fake-session-1');
+	});
+});
+
+describe('HarnessSession auth.json branching path', () => {
+	const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+	const originalApiKey = process.env.ANTHROPIC_API_KEY;
+
+	afterEach(() => {
+		if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+		else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+		if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+		else process.env.ANTHROPIC_API_KEY = originalApiKey;
+	});
+
+	it('materializes credentials and unsets ANTHROPIC_API_KEY when useUserCredentials resolves a credential', async () => {
+		process.env.ANTHROPIC_API_KEY = 'platform-key-should-be-removed';
+		const fakeCredentialsClient = { getCredentialsJson: vi.fn().mockResolvedValue({ claudeAiOauth: { refreshToken: 'rt-1' } }) };
+
+		const session = new HarnessSession(
+			{ sandboxControlUrl: 'http://sandbox.test', sandboxControlSecret: 'secret', userId: 'user-1', useUserCredentials: true },
+			fakeCredentialsClient,
+		);
+		await session.start('build me a todo app');
+
+		expect(fakeCredentialsClient.getCredentialsJson).toHaveBeenCalledWith('user-1');
+		expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
+		expect(process.env.CLAUDE_CONFIG_DIR).toBeDefined();
+
+		const fs = await import('node:fs/promises');
+		const path = await import('node:path');
+		const written = JSON.parse(await fs.readFile(path.join(process.env.CLAUDE_CONFIG_DIR!, '.credentials.json'), 'utf-8'));
+		expect(written).toEqual({ claudeAiOauth: { refreshToken: 'rt-1' } });
+	});
+
+	it('falls back to the platform key when useUserCredentials is set but nothing decrypts', async () => {
+		process.env.ANTHROPIC_API_KEY = 'platform-key-stays';
+		const fakeCredentialsClient = { getCredentialsJson: vi.fn().mockResolvedValue(null) };
+
+		const session = new HarnessSession(
+			{ sandboxControlUrl: 'http://sandbox.test', sandboxControlSecret: 'secret', userId: 'user-1', useUserCredentials: true },
+			fakeCredentialsClient,
+		);
+		await session.start('build me a todo app');
+
+		expect(process.env.ANTHROPIC_API_KEY).toBe('platform-key-stays');
+	});
+
+	it('never touches credentials when useUserCredentials is not set', async () => {
+		process.env.ANTHROPIC_API_KEY = 'platform-key-stays';
+		const fakeCredentialsClient = { getCredentialsJson: vi.fn() };
+
+		const session = new HarnessSession(
+			{ sandboxControlUrl: 'http://sandbox.test', sandboxControlSecret: 'secret' },
+			fakeCredentialsClient,
+		);
+		await session.start('build me a todo app');
+
+		expect(fakeCredentialsClient.getCredentialsJson).not.toHaveBeenCalled();
+		expect(process.env.ANTHROPIC_API_KEY).toBe('platform-key-stays');
 	});
 });

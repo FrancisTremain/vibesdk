@@ -57,6 +57,14 @@ resource "aws_iam_role_policy" "user_api_lambda_dynamodb" {
         Resource = [aws_dynamodb_table.identity.arn, aws_dynamodb_table.auth_flows.arn]
       },
       {
+        # PUT/DELETE /api/user/credentials writes/removes the
+        # HARNESSCREDENTIALS item -- separate statement since these are
+        # writes, unlike the read-only identity access above.
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
+        Resource = [aws_dynamodb_table.identity.arn]
+      },
+      {
         # GET /api/user/{id}/analytics, GET /api/agent/{id}/analytics.
         Effect   = "Allow"
         Action   = ["dynamodb:Query"]
@@ -100,13 +108,14 @@ resource "aws_lambda_function" "user_api" {
       JWT_SECRET           = var.jwt_secret != "" ? var.jwt_secret : data.aws_ssm_parameter.jwt_secret.value
       # Read by vibesdk-model-config-defaults (AGENT_CONFIG selection,
       # BYOK-platform-key check) -- see that package's README.
-      PLATFORM_MODEL_PROVIDERS = var.platform_model_providers
-      ANTHROPIC_API_KEY        = var.anthropic_api_key
-      OPENAI_API_KEY           = var.openai_api_key
-      GOOGLE_AI_STUDIO_API_KEY = var.google_ai_studio_api_key
-      CEREBRAS_API_KEY         = var.cerebras_api_key
-      GROQ_API_KEY             = var.groq_api_key
-      ORIGIN_VERIFY_SECRET     = random_password.origin_verify.result
+      PLATFORM_MODEL_PROVIDERS     = var.platform_model_providers
+      ANTHROPIC_API_KEY            = var.anthropic_api_key
+      OPENAI_API_KEY               = var.openai_api_key
+      GOOGLE_AI_STUDIO_API_KEY     = var.google_ai_studio_api_key
+      CEREBRAS_API_KEY             = var.cerebras_api_key
+      GROQ_API_KEY                 = var.groq_api_key
+      ORIGIN_VERIFY_SECRET         = random_password.origin_verify.result
+      USER_CREDENTIALS_KMS_KEY_ARN = aws_kms_key.user_credentials.arn
     }
   }
 
@@ -134,6 +143,9 @@ locals {
     "GET /api/agent/{id}/analytics",
     "GET /api/stats",
     "GET /api/stats/activity",
+    "GET /api/user/credentials",
+    "PUT /api/user/credentials",
+    "DELETE /api/user/credentials",
     "GET /api/user/providers",
     "GET /api/user/providers/{id}",
     "POST /api/user/providers",

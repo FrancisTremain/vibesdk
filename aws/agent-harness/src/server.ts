@@ -41,7 +41,15 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 let session: HarnessSession | undefined;
 
 async function handleStart(req: IncomingMessage, res: ServerResponse): Promise<void> {
-	type Body = { sessionId?: string; userPrompt: string; sandboxControlUrl: string; sandboxControlSecret: string; resumeAgentSessionId?: string };
+	type Body = {
+		sessionId?: string;
+		userPrompt: string;
+		sandboxControlUrl: string;
+		sandboxControlSecret: string;
+		resumeAgentSessionId?: string;
+		userId?: string;
+		useUserCredentials?: boolean;
+	};
 	const body = await readJsonBody<Body>(req);
 
 	if (!body.userPrompt || !body.sandboxControlUrl || !body.sandboxControlSecret) {
@@ -57,6 +65,8 @@ async function handleStart(req: IncomingMessage, res: ServerResponse): Promise<v
 		sandboxControlUrl: body.sandboxControlUrl,
 		sandboxControlSecret: body.sandboxControlSecret,
 		resumeAgentSessionId: body.resumeAgentSessionId,
+		userId: body.userId,
+		useUserCredentials: body.useUserCredentials,
 	});
 
 	try {
