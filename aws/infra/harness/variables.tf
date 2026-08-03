@@ -16,8 +16,14 @@ variable "allowed_ips" {
 }
 
 variable "anthropic_api_key" {
-  description = "Passed to every harness task so the Agent SDK's query() can call the Anthropic API directly. Sensitive. Empty default lets a plain apply fall back to SSM (/vibesdk/anthropic_api_key) -- see data.aws_ssm_parameter.anthropic_api_key in main.tf."
+  description = "Optional platform-wide fallback passed to harness tasks so the Agent SDK's query() can call the Anthropic API directly for sessions that haven't uploaded their own Claude Code OAuth credentials (see the auth.json branching path in aws/agent-harness/src/session.ts). Not required -- a deploy with no platform key never fails, and BYO-credentials sessions never use it. Sensitive. Empty default falls back to SSM only if enable_platform_anthropic_key is also true -- see data.aws_ssm_parameter.anthropic_api_key in main.tf."
   type        = string
   sensitive   = true
   default     = ""
+}
+
+variable "enable_platform_anthropic_key" {
+  description = "Whether to look up /vibesdk/anthropic_api_key from SSM as a platform-wide fallback for harness sessions. Leave false to run purely on user-uploaded BYO credentials with no platform key dependency at all -- terraform apply then never touches that SSM parameter and never requires it to exist."
+  type        = bool
+  default     = false
 }

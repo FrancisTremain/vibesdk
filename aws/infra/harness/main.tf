@@ -59,18 +59,22 @@ provider "aws" {
   }
 }
 
-# Same reasoning as the root stack's data.aws_ssm_parameter.jwt_secret
-# (see aws/infra/main.tf) -- lets a plain `terraform apply` run without
-# retyping the Anthropic key on every invocation once it's been seeded
-# into SSM (see aws/infra/README.md). var.anthropic_api_key still takes
-# precedence when explicitly passed.
+# Platform Anthropic key is entirely optional -- sessions can run purely
+# on a user's own uploaded Claude Code OAuth credentials (the auth.json
+# branching path, see credentials-client.ts) and never touch it. The SSM
+# lookup only fires when var.enable_platform_anthropic_key is set, so a
+# deploy with no platform key configured anywhere never fails apply just
+# because /vibesdk/anthropic_api_key hasn't been seeded (data sources
+# error on a missing parameter, so this must be skipped via count rather
+# than defaulted away with try()/coalesce()).
 data "aws_ssm_parameter" "anthropic_api_key" {
+  count           = var.anthropic_api_key == "" && var.enable_platform_anthropic_key ? 1 : 0
   name            = "/vibesdk/anthropic_api_key"
   with_decryption = true
 }
 
 locals {
-  anthropic_api_key  = var.anthropic_api_key != "" ? var.anthropic_api_key : data.aws_ssm_parameter.anthropic_api_key.value
+  anthropic_api_key  = var.anthropic_api_key != "" ? var.anthropic_api_key : try(data.aws_ssm_parameter.anthropic_api_key[0].value, "")
   harness_task_image = var.harness_task_image != "" ? var.harness_task_image : "${aws_ecr_repository.harness.repository_url}:latest"
 }
 
@@ -343,11 +347,16 @@ resource "aws_ecs_task_definition" "harness" {
       portMappings = [
         { containerPort = 8081, protocol = "tcp" }, # control plane
       ]
-      environment = [
-        { name = "CONTROL_PORT", value = "8081" },
-        { name = "CONTROLPLANE_SECRET", value = random_password.harness_controlplane_secret.result },
-        { name = "ANTHROPIC_API_KEY", value = local.anthropic_api_key },
-      ]
+      environment = concat(
+        [
+          { name = "CONTROL_PORT", value = "8081" },
+          { name = "CONTROLPLANE_SECRET", value = random_password.harness_controlplane_secret.result },
+        ],
+        # Omitted entirely (not even an empty string) when no platform key
+        # is configured, so a BYO-credentials-only deploy never ships an
+        # ANTHROPIC_API_KEY env var to the container at all.
+        local.anthropic_api_key != "" ? [{ name = "ANTHROPIC_API_KEY", value = local.anthropic_api_key }] : []
+      )
       logConfiguration = {
         logDriver = "awslogs"
         options = {
