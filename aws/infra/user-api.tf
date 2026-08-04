@@ -71,9 +71,13 @@ resource "aws_iam_role_policy" "user_api_lambda_dynamodb" {
         Resource = [aws_dynamodb_table.llm_usage.arn, "${aws_dynamodb_table.llm_usage.arn}/index/*"]
       },
       {
-        # GET /api/agent/{id}/analytics's ownership check (isSessionOwner).
+        # GET /api/agent/{id}/analytics and GET /api/agent/{id}/connect's
+        # ownership check (isSessionOwner); POST /api/agent creates the
+        # session row directly (see handler.ts's module comment on why --
+        # `query` must be populated before the client's WS $connect / bare
+        # generate_all message arrives).
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem"]
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem"]
         Resource = [aws_dynamodb_table.agent_sessions.arn]
       },
     ]
@@ -116,6 +120,11 @@ resource "aws_lambda_function" "user_api" {
       GROQ_API_KEY                 = var.groq_api_key
       ORIGIN_VERIFY_SECRET         = random_password.origin_verify.result
       USER_CREDENTIALS_KMS_KEY_ARN = aws_kms_key.user_credentials.arn
+      # Same-module resource reference (aws/infra/agent-runtime.tf) -- the
+      # browser connects directly to this wss:// endpoint, bypassing
+      # CloudFront entirely (see agent-runtime.tf's header comment on why
+      # no CloudFront behavior is needed for it).
+      AGENT_WS_ENDPOINT = aws_apigatewayv2_stage.agent_runtime.invoke_url
     }
   }
 
@@ -140,6 +149,8 @@ locals {
     "GET /api/user/apps",
     "PUT /api/user/profile",
     "GET /api/user/{id}/analytics",
+    "POST /api/agent",
+    "GET /api/agent/{id}/connect",
     "GET /api/agent/{id}/analytics",
     "GET /api/stats",
     "GET /api/stats/activity",

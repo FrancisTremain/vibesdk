@@ -327,6 +327,17 @@ export interface ApiKeysData {
   }>;
 }
 
+// Harness credentials (AWS-only -- the auth.json branching path). No
+// worker/ counterpart exists since this feature doesn't exist on the
+// original Cloudflare backend; see aws/user-api-lambda/src/handler.ts's
+// GET/PUT/DELETE /api/user/credentials.
+export type HarnessAuthMode = 'platform_key' | 'byo_credentials';
+
+export interface HarnessCredentialsStatus {
+  authMode: HarnessAuthMode;
+  updatedAt: number;
+}
+
 export type {
     GitHubExportOptions,
     GitHubExportResult,

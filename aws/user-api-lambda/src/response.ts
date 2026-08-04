@@ -23,3 +23,20 @@ export function successResponse(data: unknown, statusCode = 200): APIGatewayProx
 export function errorResponse(message: string, statusCode = 500): APIGatewayProxyResultV2 {
 	return jsonResponse(statusCode, { success: false, error: { message } });
 }
+
+/**
+ * POST /api/agent's response shape -- the frontend reads this as a raw
+ * NDJSON body (src/utils/ndjson-parser/ndjson-parser.ts, called with
+ * skipJsonParsing so it never expects the {success,data} envelope every
+ * other route here uses). One line is all the AWS backend has to send
+ * (no blueprint-chunk streaming -- see aws/apps-api-lambda's GET
+ * /api/capabilities, which already declares the "app" feature's phased/
+ * blueprint UX disabled on this backend, only "general" agentic).
+ */
+export function ndjsonResponse(line: Record<string, unknown>): APIGatewayProxyResultV2 {
+	return {
+		statusCode: 200,
+		headers: { 'Content-Type': 'application/x-ndjson' },
+		body: `${JSON.stringify(line)}\n`,
+	};
+}

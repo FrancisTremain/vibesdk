@@ -156,6 +156,20 @@ type StaticAnalysisResults = {
     staticAnalysis: StaticAnalysisResponse;
 }
 
+/**
+ * aws/agent-harness's own phase-progress signal (report_phase custom
+ * tool, relayed live by aws/harness-orchestrator-lambda's event-relay.ts)
+ * -- deliberately not shaped like PhaseGeneratingMessage/PhaseImplementedMessage
+ * below, which carry plan data (file lists, descriptions) that only
+ * exists in the original Cloudflare phased-generation pipeline. The
+ * AWS harness runs one agentic session and self-reports coarse
+ * name/status transitions only.
+ */
+type PhaseUpdateMessage = {
+	type: 'phase_update';
+	phase: { name: string; status: 'started' | 'completed' };
+};
+
 type PhaseGeneratingMessage = {
 	type: 'phase_generating';
 	message: string;
@@ -593,6 +607,7 @@ export type WebSocketMessage =
 	| RuntimeErrorFoundMessage
 	| CodeFixEdits
     | StaticAnalysisResults
+	| PhaseUpdateMessage
 	| PhaseGeneratingMessage
 	| PhaseGeneratedMessage
 	| PhaseImplementingMessage

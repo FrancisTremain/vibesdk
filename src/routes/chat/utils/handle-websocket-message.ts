@@ -733,6 +733,19 @@ export function createWebSocketMessageHandler(deps: HandleMessageDeps) {
                 break;
             }
 
+            case 'phase_update': {
+                // aws/agent-harness's own coarse phase signal -- see
+                // worker/api/websocketTypes.ts's PhaseUpdateMessage comment
+                // for why this doesn't carry the plan data (file lists,
+                // descriptions) the phase_generating/phase_implementing/etc.
+                // cases below expect.
+                const label = message.phase.status === 'started' ? `Starting ${message.phase.name}...` : `Finished ${message.phase.name}.`;
+                sendMessage(createAIMessage(`phase_update_${message.phase.name}_${message.phase.status}`, label, true));
+                setIsThinking(message.phase.status === 'started');
+                setIsPhaseProgressActive(message.phase.status === 'started');
+                break;
+            }
+
             case 'phase_generating': {
                 sendMessage(createAIMessage('phase_generating', message.message));
                 setIsThinking(true);

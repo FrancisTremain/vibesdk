@@ -91,6 +91,33 @@ data "aws_ssm_parameter" "identity_table_arn" {
   name = "/vibesdk/identity_table_arn"
 }
 
+# Bridges aws/infra/agent-runtime.tf's WebSocket connections table + WS
+# management endpoint into this separate root module, same pattern as the
+# two data sources above -- needed so aws/harness-orchestrator-lambda can
+# relay a harness task's pushed events straight to the browser's open
+# WebSocket connection (aws/harness-orchestrator-lambda/src/event-relay.ts),
+# without routing through aws/agent-runtime's Lambda (which only runs
+# reactively per inbound client message, so it has no server-push path).
+data "aws_ssm_parameter" "agent_connections_table_name" {
+  name = "/vibesdk/agent_connections_table_name"
+}
+
+data "aws_ssm_parameter" "agent_connections_table_arn" {
+  name = "/vibesdk/agent_connections_table_arn"
+}
+
+data "aws_ssm_parameter" "agent_runtime_ws_management_endpoint" {
+  name = "/vibesdk/agent_runtime_ws_management_endpoint"
+}
+
+data "aws_ssm_parameter" "agent_runtime_ws_execution_arn" {
+  name = "/vibesdk/agent_runtime_ws_execution_arn"
+}
+
+locals {
+  agent_connections_session_index = "session_id-index"
+}
+
 resource "aws_vpc" "harness" {
   cidr_block           = "10.44.0.0/16"
   enable_dns_support   = true
@@ -351,6 +378,11 @@ resource "aws_ecs_task_definition" "harness" {
         [
           { name = "CONTROL_PORT", value = "8081" },
           { name = "CONTROLPLANE_SECRET", value = random_password.harness_controlplane_secret.result },
+          # Same-module resource reference, no SSM bridge needed for this
+          # direction -- the harness task pushes its own real-time events
+          # here (aws/agent-harness/src/session.ts's pushEvent), reusing
+          # CONTROLPLANE_SECRET above to authenticate itself.
+          { name = "EVENTS_ENDPOINT", value = aws_apigatewayv2_api.harness_orchestrator_http.api_endpoint },
         ],
         # Omitted entirely (not even an empty string) when no platform key
         # is configured, so a BYO-credentials-only deploy never ships an

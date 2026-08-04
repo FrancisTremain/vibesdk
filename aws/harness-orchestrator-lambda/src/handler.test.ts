@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import type { APIGatewayProxyEventV2 } from 'aws-lambda';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { FakeDynamoDocumentClient } from './fake-dynamo';
@@ -10,6 +10,7 @@ async function handler(event: APIGatewayProxyEventV2 | { 'detail-type': string }
 }
 
 const SECRET = 'harness-orchestrator-test-secret';
+const CONTROLPLANE_SECRET = 'controlplane-test-secret';
 
 beforeAll(() => {
 	process.env.HARNESS_SESSIONS_TABLE = 'vibesdk-harness-sessions-test';
@@ -20,6 +21,9 @@ beforeAll(() => {
 	process.env.CONTROLPLANE_SECRET = 'controlplane-test-secret';
 	process.env.ORCHESTRATOR_SECRET = SECRET;
 	process.env.IDLE_TIMEOUT_SECONDS = '600';
+	process.env.AGENT_CONNECTIONS_TABLE = 'vibesdk-agent-connections-test';
+	process.env.AGENT_CONNECTIONS_SESSION_INDEX = 'session_id-index';
+	process.env.WS_MANAGEMENT_ENDPOINT = 'https://ws.test/prod';
 });
 
 function event(
@@ -73,6 +77,53 @@ describe('auth', () => {
 	it('rejects calls without the orchestrator secret', async () => {
 		const res = await handler(event('POST /api/harness/sessions', { headers: { 'x-orchestrator-secret': 'wrong' } }));
 		expect(res.statusCode).toBe(403);
+	});
+});
+
+describe('events relay', () => {
+	it('rejects a pushed event without the correct controlplane secret', async () => {
+		const res = await handler(
+			event('POST /api/harness/sessions/{id}/events', {
+				pathParameters: { id: 'session-1' },
+				headers: { 'x-controlplane-secret': 'wrong' },
+				body: { type: 'phase_update', phase: { name: 'planning', status: 'started' } },
+			}),
+		);
+		expect(res.statusCode).toBe(403);
+	});
+
+	it('relays a pushed event to the connections open for that session', async () => {
+		const query = vi.fn().mockResolvedValue(['conn-1']);
+		const send = vi.fn().mockResolvedValue({});
+		setTestOverrides({ connectionsLookup: { query }, managementApi: { send } });
+
+		const res = await handler(
+			event('POST /api/harness/sessions/{id}/events', {
+				pathParameters: { id: 'session-1' },
+				headers: { 'x-controlplane-secret': CONTROLPLANE_SECRET },
+				body: { type: 'file_generated', filePath: 'src/App.tsx', fileContents: 'export default App;' },
+			}),
+		);
+
+		expect(res.statusCode).toBe(200);
+		expect(query).toHaveBeenCalledWith('session-1');
+		expect(send).toHaveBeenCalledTimes(1);
+	});
+
+	it('rejects an event body without a type', async () => {
+		const query = vi.fn().mockResolvedValue([]);
+		const send = vi.fn();
+		setTestOverrides({ connectionsLookup: { query }, managementApi: { send } });
+
+		const res = await handler(
+			event('POST /api/harness/sessions/{id}/events', {
+				pathParameters: { id: 'session-1' },
+				headers: { 'x-controlplane-secret': CONTROLPLANE_SECRET },
+				body: { filePath: 'src/App.tsx' },
+			}),
+		);
+
+		expect(res.statusCode).toBe(400);
 	});
 });
 

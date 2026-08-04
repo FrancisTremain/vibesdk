@@ -30,7 +30,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { query, type Query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
-import { createHarnessTools } from './tools';
+import { createHarnessTools, type HarnessEvent } from './tools';
 import { SandboxClient } from './sandbox-client';
 import { UserCredentialsClient } from './credentials-client';
 
@@ -53,6 +53,21 @@ export interface HarnessSessionConfig {
 	/** Set together to route this session through the auth.json branching path instead of the platform's ANTHROPIC_API_KEY -- see ./credentials-client.ts. */
 	userId?: string;
 	useUserCredentials?: boolean;
+	/**
+	 * Set together (plus sessionId below) to push real-time HarnessEvents
+	 * (file_generated, terminal_output, phase_update) to
+	 * aws/harness-orchestrator-lambda's POST /api/harness/sessions/{id}/events
+	 * as they happen, instead of only exposing the coarse getStatus()
+	 * shape for polling. Optional -- a session with none of these set
+	 * still works, just without live push (status polling still reflects
+	 * phase/done/error either way).
+	 */
+	eventsEndpoint?: string;
+	eventsSecret?: string;
+	/** This session's id, needed to address the events POST above -- aws/harness-orchestrator-lambda's own session id, passed through from its /start call body. */
+	sessionId?: string;
+	/** Injectable for tests; defaults to the global fetch. */
+	fetchImpl?: typeof fetch;
 }
 
 /** Writes an uploaded `.credentials.json` export to a fresh temp dir and points CLAUDE_CONFIG_DIR at it, so the Agent SDK's in-process credential lookup (sdk.mjs reads `$CLAUDE_CONFIG_DIR/.credentials.json`) picks it up instead of the task-definition's ANTHROPIC_API_KEY. */
@@ -135,6 +150,7 @@ export class HarnessSession {
 			onPhaseReport: (phase) => {
 				this.phase = phase;
 			},
+			onEvent: (event) => this.pushEvent(event),
 		});
 
 		this.done = false;
@@ -172,6 +188,20 @@ export class HarnessSession {
 		return { agentSessionId: this.agentSessionId, phase: this.phase, done: this.done, error: this.error };
 	}
 
+	/** Fire-and-forget push of one HarnessEvent to the orchestrator's event-ingestion route. Never throws -- a delivery failure here must not interrupt the generation loop; getStatus() polling remains the source of truth regardless. */
+	private pushEvent(event: HarnessEvent): void {
+		const { eventsEndpoint, eventsSecret, sessionId } = this.config;
+		if (!eventsEndpoint || !sessionId) return;
+		const fetchImpl = this.config.fetchImpl ?? fetch;
+		fetchImpl(`${eventsEndpoint.replace(/\/$/, '')}/api/harness/sessions/${encodeURIComponent(sessionId)}/events`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json', ...(eventsSecret ? { 'x-controlplane-secret': eventsSecret } : {}) },
+			body: JSON.stringify(event),
+		}).catch(() => {
+			// Best-effort -- see method comment.
+		});
+	}
+
 	/** Closes the underlying query and stops accepting input. Returns the final status (including the resume id) so the caller can persist it. */
 	async shutdown(): Promise<HarnessStatus> {
 		this.queue.close();
@@ -197,6 +227,9 @@ export class HarnessSession {
 					this.done = true;
 					if (message.subtype !== 'success') {
 						this.error = message.errors.join('; ') || message.subtype;
+						this.pushEvent({ type: 'error', error: this.error });
+					} else {
+						this.pushEvent({ type: 'phase_update', phase: this.phase ?? { name: 'done', status: 'completed' } });
 					}
 				}
 			}

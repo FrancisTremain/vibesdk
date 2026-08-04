@@ -95,6 +95,48 @@ describe('HarnessSession', () => {
 	});
 });
 
+describe('HarnessSession real-time event push', () => {
+	it('pushes a phase_update event to eventsEndpoint when the turn completes', async () => {
+		const fetchImpl = vi.fn().mockResolvedValue({ ok: true });
+		const session = new HarnessSession({
+			sandboxControlUrl: 'http://sandbox.test',
+			sandboxControlSecret: 'secret',
+			sessionId: 'session-1',
+			eventsEndpoint: 'http://orchestrator.test',
+			eventsSecret: 'events-secret',
+			fetchImpl,
+		});
+
+		await session.start('build me a todo app');
+		await vi.waitFor(() => expect(session.getStatus().done).toBe(true));
+
+		expect(fetchImpl).toHaveBeenCalledWith(
+			'http://orchestrator.test/api/harness/sessions/session-1/events',
+			expect.objectContaining({
+				method: 'POST',
+				headers: expect.objectContaining({ 'x-controlplane-secret': 'events-secret' }),
+			}),
+		);
+		const [, options] = fetchImpl.mock.calls[0] as [string, { body: string }];
+		expect(JSON.parse(options.body)).toEqual({ type: 'phase_update', phase: { name: 'done', status: 'completed' } });
+	});
+
+	it('does not push events when eventsEndpoint or sessionId is missing', async () => {
+		const fetchImpl = vi.fn().mockResolvedValue({ ok: true });
+		const session = new HarnessSession({
+			sandboxControlUrl: 'http://sandbox.test',
+			sandboxControlSecret: 'secret',
+			eventsSecret: 'events-secret',
+			fetchImpl,
+		});
+
+		await session.start('build me a todo app');
+		await vi.waitFor(() => expect(session.getStatus().done).toBe(true));
+
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+});
+
 describe('HarnessSession auth.json branching path', () => {
 	const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
 	const originalApiKey = process.env.ANTHROPIC_API_KEY;

@@ -33,9 +33,10 @@
  * GET /api/auth/csrf-token, which mints the cookie this checks against.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { KMSClient, EncryptCommand } from '@aws-sdk/client-kms';
 import { AuthOrchestrator } from 'vibesdk-auth-orchestration';
 import { AnalyticsStore } from 'vibesdk-db-analytics';
@@ -51,7 +52,7 @@ import {
 	validateModelAccessForEnvironment,
 	type AgentActionKey,
 } from 'vibesdk-model-config-defaults';
-import { errorResponse, successResponse } from './response';
+import { errorResponse, successResponse, ndjsonResponse } from './response';
 
 function requireEnv(name: string): string {
 	const value = process.env[name];
@@ -302,6 +303,73 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 
 				const analytics = await getUsage().getUserAnalytics(targetUserId, days);
 				return successResponse(analytics);
+			}
+
+			case 'POST /api/agent': {
+				// Ported from worker/api/controllers/agent/controller.ts's
+				// startCodeGeneration -- reduced to the "general"/agentic path
+				// only, matching GET /api/capabilities' declared feature set
+				// (the "app" feature's phased/blueprint-streaming UX is
+				// enabled: false on this backend; there is no equivalent
+				// pre-generation blueprint stream to emit here). Session state
+				// (aws/agent-runtime's AgentSessionState, same DynamoDB table)
+				// is created here rather than left to WS $connect's
+				// lazy-init, specifically so `query` is already populated by
+				// the time the client's first `generate_all` message arrives
+				// with no message body of its own -- see aws/agent-runtime/src/messages.ts's
+				// generate_all case, which falls back to state.query.
+				const session = await getUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+
+				const body = parseJsonBody(event);
+				const query = typeof body?.query === 'string' ? body.query.trim() : '';
+				if (!query) return errorResponse('query is required', 400);
+				if (query.length > 20_000) return errorResponse('Prompt too large', 400);
+
+				const sessionId = randomUUID();
+				const now = new Date().toISOString();
+				await getDdb().send(
+					new PutCommand({
+						TableName: requireEnv('AGENT_SESSIONS_TABLE'),
+						Item: {
+							session_id: sessionId,
+							lock_version: 0,
+							user_id: session.user.id,
+							project_name: query.slice(0, 80),
+							query,
+							should_be_generating: false,
+							current_dev_state: 'IDLE',
+							conversation_messages: [],
+							pending_user_inputs: [],
+							generated_files: {},
+							created_at: now,
+							updated_at: now,
+							expires_at: Math.floor(Date.now() / 1000) + 4 * 60 * 60,
+						},
+					}),
+				);
+
+				const wsEndpoint = requireEnv('AGENT_WS_ENDPOINT');
+				const websocketUrl = `${wsEndpoint}?sessionId=${encodeURIComponent(sessionId)}&userId=${encodeURIComponent(session.user.id)}`;
+				return ndjsonResponse({
+					agentId: sessionId,
+					websocketUrl,
+					behaviorType: 'agentic',
+					projectType: 'general',
+					template: { files: [] },
+				});
+			}
+
+			case 'GET /api/agent/{id}/connect': {
+				const session = await getUser(event);
+				if (!session) return errorResponse('Unauthorized', 401);
+				const agentId = event.pathParameters?.id;
+				if (!agentId) return errorResponse('Agent ID is required', 400);
+				if (!(await isSessionOwner(agentId, session.user.id))) return errorResponse('Forbidden', 403);
+
+				const wsEndpoint = requireEnv('AGENT_WS_ENDPOINT');
+				const websocketUrl = `${wsEndpoint}?sessionId=${encodeURIComponent(agentId)}&userId=${encodeURIComponent(session.user.id)}`;
+				return successResponse({ agentId, websocketUrl });
 			}
 
 			case 'GET /api/agent/{id}/analytics': {

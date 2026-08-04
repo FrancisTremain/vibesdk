@@ -9,6 +9,8 @@ import {
 	Check,
 	Eye,
 	EyeOff,
+	ShieldCheck,
+	Upload,
 } from 'lucide-react';
 import { ModelConfigTabs } from '@/components/model-config-tabs';
 import type {
@@ -16,7 +18,9 @@ import type {
 	ModelConfigUpdate,
 	ActiveSessionsData,
 	ApiKeysData,
+	HarnessAuthMode,
 } from '@/api-types';
+import { Textarea } from '@/components/ui/textarea';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
@@ -91,6 +95,16 @@ export default function SettingsPage() {
 		copy: copyCreatedKey,
 		reset: resetCreatedKeyCopy,
 	} = useCopyToClipboard();
+
+	// Harness credentials state (AWS-only -- the auth.json branching path)
+	const [harnessCredentials, setHarnessCredentials] = useState<{
+		authMode: HarnessAuthMode;
+		loading: boolean;
+	}>({ authMode: 'platform_key', loading: true });
+	const [credentialsJsonInput, setCredentialsJsonInput] = useState('');
+	const [savingCredentials, setSavingCredentials] = useState(false);
+	const [clearingCredentials, setClearingCredentials] = useState(false);
+	const credentialsFileInputRef = React.useRef<HTMLInputElement>(null);
 
 	// Model configurations state
 	const [agentConfigs, setAgentConfigs] = useState<
@@ -393,6 +407,101 @@ export default function SettingsPage() {
 			toast.error('Failed to revoke API key');
 		} finally {
 			setRevokingKey(false);
+		}
+	};
+
+	// Load harness credentials status (AWS-only)
+	React.useEffect(() => {
+		apiClient
+			.getHarnessCredentialsStatus()
+			.then((response) => {
+				if (response.success && response.data) {
+					setHarnessCredentials({ authMode: response.data.authMode, loading: false });
+				} else {
+					setHarnessCredentials((prev) => ({ ...prev, loading: false }));
+				}
+			})
+			.catch((error) => {
+				console.error('Failed to load harness credentials status:', error);
+				setHarnessCredentials((prev) => ({ ...prev, loading: false }));
+			});
+	}, []);
+
+	const handleCredentialsFileSelected = async (
+		e: React.ChangeEvent<HTMLInputElement>,
+	) => {
+		const file = e.target.files?.[0];
+		e.target.value = '';
+		if (!file) return;
+		try {
+			setCredentialsJsonInput(await file.text());
+		} catch (error) {
+			console.error('Failed to read credentials file:', error);
+			toast.error('Could not read that file');
+		}
+	};
+
+	const handleSaveCredentials = async () => {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(credentialsJsonInput);
+		} catch {
+			toast.error("That doesn't look like valid JSON");
+			return;
+		}
+		if (
+			typeof parsed !== 'object' ||
+			parsed === null ||
+			Array.isArray(parsed) ||
+			!('claudeAiOauth' in parsed)
+		) {
+			toast.error(
+				'Missing the expected claudeAiOauth field — is this a Claude Code .credentials.json export?',
+			);
+			return;
+		}
+
+		setSavingCredentials(true);
+		try {
+			const response = await apiClient.setHarnessCredentials(
+				parsed as object,
+			);
+			if (response.success) {
+				setHarnessCredentials({ authMode: 'byo_credentials', loading: false });
+				setCredentialsJsonInput('');
+				toast.success(
+					'Your Claude Code credentials are now in use for new generation sessions.',
+				);
+			} else {
+				toast.error(
+					response.error?.message || 'Failed to save credentials',
+				);
+			}
+		} catch (error) {
+			console.error('Failed to save harness credentials:', error);
+			toast.error('Failed to save credentials');
+		} finally {
+			setSavingCredentials(false);
+		}
+	};
+
+	const handleClearCredentials = async () => {
+		setClearingCredentials(true);
+		try {
+			const response = await apiClient.clearHarnessCredentials();
+			if (response.success) {
+				setHarnessCredentials({ authMode: 'platform_key', loading: false });
+				toast.success('Reverted to the platform key.');
+			} else {
+				toast.error(
+					response.error?.message || 'Failed to clear credentials',
+				);
+			}
+		} catch (error) {
+			console.error('Failed to clear harness credentials:', error);
+			toast.error('Failed to clear credentials');
+		} finally {
+			setClearingCredentials(false);
 		}
 	};
 
@@ -828,6 +937,127 @@ export default function SettingsPage() {
 										</AlertDialogContent>
 									</AlertDialog>
 								</>
+							)}
+						</CardContent>
+					</Card>
+
+					{/* Claude Code Credentials Section (AWS-only) */}
+					<Card id="claude-credentials">
+						<CardHeader variant="minimal">
+							<div className="flex items-center gap-3 border-b w-full py-3 text-text-primary">
+								<ShieldCheck className="h-5 w-5" />
+								<div>
+									<CardTitle>Claude Code Credentials</CardTitle>
+								</div>
+							</div>
+						</CardHeader>
+						<CardContent className="space-y-4 mt-4 px-6">
+							<p className="text-sm text-text-secondary">
+								By default, new generation sessions run on this deployment&apos;s
+								shared Anthropic API key. Upload your own Claude Code OAuth
+								credentials (a <code className="font-mono text-xs">.credentials.json</code>{' '}
+								export) to run your sessions on your own Claude subscription
+								instead. This only ever applies to sessions started by your
+								account — no other user is affected, and the credentials are
+								encrypted before they ever leave this request.
+							</p>
+
+							{harnessCredentials.loading ? (
+								<div className="flex items-center gap-3">
+									<Settings className="h-5 w-5 animate-spin text-text-tertiary" />
+									<span className="text-sm text-text-tertiary">
+										Checking your credentials status...
+									</span>
+								</div>
+							) : harnessCredentials.authMode === 'byo_credentials' ? (
+								<div className="flex items-start justify-between gap-4 rounded-lg border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950 p-4">
+									<div className="flex items-start gap-3">
+										<ShieldCheck className="h-5 w-5 text-green-600 dark:text-green-400 mt-0.5" />
+										<div className="space-y-1">
+											<p className="font-medium text-sm text-green-900 dark:text-green-100">
+												Using your own Claude subscription
+											</p>
+											<p className="text-sm text-green-800 dark:text-green-200">
+												New generation sessions you start will run on your
+												uploaded credentials instead of the platform key.
+											</p>
+										</div>
+									</div>
+									<Button
+										variant="outline"
+										size="sm"
+										onClick={handleClearCredentials}
+										disabled={clearingCredentials}
+										className="shrink-0 gap-2"
+									>
+										<Trash2 className="h-4 w-4" />
+										{clearingCredentials ? 'Reverting…' : 'Revert to platform key'}
+									</Button>
+								</div>
+							) : (
+								<div className="space-y-3">
+									<div className="rounded-lg border border-dashed border-bg-4 bg-bg-2/50 p-4">
+										<div className="flex items-start gap-3">
+											<div className="h-10 w-10 shrink-0 rounded-full bg-bg-3 flex items-center justify-center">
+												<Key className="h-5 w-5 text-text-tertiary" />
+											</div>
+											<div className="space-y-1">
+												<p className="font-medium text-sm">
+													Currently using the platform key
+												</p>
+												<p className="text-sm text-text-tertiary">
+													No credentials uploaded yet.
+												</p>
+											</div>
+										</div>
+									</div>
+
+									<div className="space-y-2">
+										<div className="flex items-center justify-between gap-3">
+											<p className="text-sm font-medium">
+												Upload .credentials.json
+											</p>
+											<input
+												ref={credentialsFileInputRef}
+												type="file"
+												accept="application/json,.json"
+												className="hidden"
+												onChange={handleCredentialsFileSelected}
+											/>
+											<Button
+												variant="outline"
+												size="sm"
+												className="gap-2"
+												onClick={() => credentialsFileInputRef.current?.click()}
+											>
+												<Upload className="h-4 w-4" />
+												Choose file
+											</Button>
+										</div>
+										<Textarea
+											value={credentialsJsonInput}
+											onChange={(e) => setCredentialsJsonInput(e.target.value)}
+											placeholder='Paste the contents of your .credentials.json here, or choose the file above. Looks like {"claudeAiOauth": {...}}'
+											className="font-mono text-xs min-h-32"
+										/>
+										<div className="rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 p-3">
+											<p className="text-sm text-amber-800 dark:text-amber-200">
+												<strong>Important:</strong> This is a live credential for
+												your Claude account. Only paste it here if you trust
+												this deployment — treat it like a password.
+											</p>
+										</div>
+										<div className="flex justify-end">
+											<Button
+												onClick={handleSaveCredentials}
+												disabled={!credentialsJsonInput.trim() || savingCredentials}
+												className="gap-2"
+											>
+												{savingCredentials ? 'Saving…' : 'Use these credentials'}
+											</Button>
+										</div>
+									</div>
+								</div>
 							)}
 						</CardContent>
 					</Card>

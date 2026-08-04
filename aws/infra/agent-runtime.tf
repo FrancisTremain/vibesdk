@@ -79,6 +79,21 @@ resource "aws_dynamodb_table" "agent_connections" {
     type = "S"
   }
 
+  attribute {
+    name = "session_id"
+    type = "S"
+  }
+
+  # Looked up by aws/harness-orchestrator-lambda/src/event-relay.ts (a
+  # separate Terraform root module -- see the SSM parameters below) to
+  # find which connection(s) are open for a session id, so a harness
+  # task's pushed event can be relayed straight to the browser.
+  global_secondary_index {
+    name            = "session_id-index"
+    hash_key        = "session_id"
+    projection_type = "ALL"
+  }
+
   ttl {
     attribute_name = "expires_at"
     enabled        = true
@@ -137,6 +152,38 @@ resource "aws_apigatewayv2_stage" "agent_runtime" {
       integrationLatency = "$context.integrationLatency"
     })
   }
+}
+
+# Bridges this WebSocket API + connections table into aws/infra/harness's
+# separate Terraform root module, so aws/harness-orchestrator-lambda can
+# relay a harness task's pushed events straight to a browser's open
+# connection -- see aws/harness-orchestrator-lambda/src/event-relay.ts and
+# aws/infra/harness/main.tf's matching data sources. Same cross-module SSM
+# pattern as user-credentials.tf's KMS key/identity table bridge.
+resource "aws_ssm_parameter" "agent_connections_table_name" {
+  name  = "/vibesdk/agent_connections_table_name"
+  type  = "String"
+  value = aws_dynamodb_table.agent_connections.name
+}
+
+resource "aws_ssm_parameter" "agent_connections_table_arn" {
+  name  = "/vibesdk/agent_connections_table_arn"
+  type  = "String"
+  value = aws_dynamodb_table.agent_connections.arn
+}
+
+# ApiGatewayManagementApiClient's endpoint must be https://, not the
+# wss:// invoke_url the stage exposes for browser clients.
+resource "aws_ssm_parameter" "agent_runtime_ws_management_endpoint" {
+  name  = "/vibesdk/agent_runtime_ws_management_endpoint"
+  type  = "String"
+  value = replace(aws_apigatewayv2_stage.agent_runtime.invoke_url, "wss://", "https://")
+}
+
+resource "aws_ssm_parameter" "agent_runtime_ws_execution_arn" {
+  name  = "/vibesdk/agent_runtime_ws_execution_arn"
+  type  = "String"
+  value = aws_apigatewayv2_api.agent_ws.execution_arn
 }
 
 resource "aws_iam_role" "agent_runtime_lambda" {

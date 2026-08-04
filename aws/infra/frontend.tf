@@ -398,3 +398,14 @@ output "cloudfront_domain_name" {
 output "site_url" {
   value = "https://${local.site_domain}"
 }
+
+# For the frontend build/deploy step -- `aws s3 sync dist/ s3://$(terraform
+# output -raw frontend_bucket_name) --delete` followed by a CloudFront
+# invalidation on this distribution id.
+output "frontend_bucket_name" {
+  value = aws_s3_bucket.frontend.bucket
+}
+
+output "cloudfront_distribution_id" {
+  value = aws_cloudfront_distribution.site.id
+}

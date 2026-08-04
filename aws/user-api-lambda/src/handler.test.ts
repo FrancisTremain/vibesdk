@@ -5,6 +5,7 @@ import type {
 	APIGatewayProxyStructuredResultV2,
 } from 'aws-lambda';
 import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { GetCommand } from '@aws-sdk/lib-dynamodb';
 import { FakeDynamoDocumentClient } from './fake-dynamo';
 import { JWTUtils } from 'vibesdk-auth-orchestration';
 
@@ -17,6 +18,7 @@ process.env.AGENT_SESSIONS_TABLE = 'test-agent-sessions';
 process.env.JWT_SECRET = 'Test-Jwt-Secret-For-UserApiLambda-2024!';
 process.env.ORIGIN_VERIFY_SECRET = 'test-origin-verify-secret';
 process.env.USER_CREDENTIALS_KMS_KEY_ARN = 'arn:aws:kms:ap-southeast-2:123456789012:key/test-key';
+process.env.AGENT_WS_ENDPOINT = 'wss://ws.example.com/prod';
 
 const { handler, setDdbClientForTests, setKmsClientForTests } = await import('./handler');
 
@@ -541,6 +543,84 @@ describe('model-config routes', () => {
 		);
 		expect(result.statusCode).toBe(200);
 		expect(body(result).data).toMatchObject({ userId, totalRequests: 1, tokensIn: 100, tokensOut: 50 });
+	});
+
+	it('requires auth for POST /api/agent', async () => {
+		const result = asStructured(await handler(event({ routeKey: 'POST /api/agent', body: JSON.stringify({ query: 'build a todo app' }) })));
+		expect(result.statusCode).toBe(401);
+	});
+
+	it('rejects POST /api/agent without a query', async () => {
+		const { token } = await registerUser(ddb, 'agent-noquery@example.com');
+		const result = asStructured(
+			await handler(event({ routeKey: 'POST /api/agent', headers: { authorization: `Bearer ${token}` }, body: JSON.stringify({}) })),
+		);
+		expect(result.statusCode).toBe(400);
+	});
+
+	it('creates a session row and returns an NDJSON line with a websocketUrl scoped to the session and user', async () => {
+		const { token, userId } = await registerUser(ddb, 'agent-create@example.com');
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'POST /api/agent',
+					headers: { authorization: `Bearer ${token}` },
+					body: JSON.stringify({ query: 'build a todo app' }),
+				}),
+			),
+		);
+
+		expect(result.statusCode).toBe(200);
+		expect(result.headers?.['Content-Type']).toBe('application/x-ndjson');
+		const line = JSON.parse((result.body ?? '').trim());
+		expect(line.agentId).toBeTruthy();
+		expect(line.behaviorType).toBe('agentic');
+		expect(line.projectType).toBe('general');
+		expect(line.websocketUrl).toBe(`wss://ws.example.com/prod?sessionId=${line.agentId}&userId=${userId}`);
+
+		const stored = (await ddb.send(new GetCommand({ TableName: 'test-agent-sessions', Key: { session_id: line.agentId } }))) as { Item?: { query: string; user_id: string } };
+		expect(stored.Item?.query).toBe('build a todo app');
+		expect(stored.Item?.user_id).toBe(userId);
+	});
+
+	it('requires auth for GET /api/agent/{id}/connect', async () => {
+		const result = asStructured(
+			await handler(event({ routeKey: 'GET /api/agent/{id}/connect', pathParameters: { id: 'session-1' } })),
+		);
+		expect(result.statusCode).toBe(401);
+	});
+
+	it("rejects connecting to another user's session", async () => {
+		const { token } = await registerUser(ddb, 'connect-other@example.com');
+		ddb.seed({ session_id: 'someone-elses-session', user_id: 'a-different-user' });
+
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'GET /api/agent/{id}/connect',
+					pathParameters: { id: 'someone-elses-session' },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(403);
+	});
+
+	it('returns a websocketUrl for an owned session', async () => {
+		const { token, userId } = await registerUser(ddb, 'connect-owner@example.com');
+		ddb.seed({ session_id: 'my-session', user_id: userId });
+
+		const result = asStructured(
+			await handler(
+				event({
+					routeKey: 'GET /api/agent/{id}/connect',
+					pathParameters: { id: 'my-session' },
+					headers: { authorization: `Bearer ${token}` },
+				}),
+			),
+		);
+		expect(result.statusCode).toBe(200);
+		expect(body(result).data).toEqual({ agentId: 'my-session', websocketUrl: `wss://ws.example.com/prod?sessionId=my-session&userId=${userId}` });
 	});
 
 	it('requires auth for /api/agent/{id}/analytics', async () => {

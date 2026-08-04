@@ -16,15 +16,17 @@
  * relaunch a task and resume the same conversation.
  */
 
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { ECSClient } from '@aws-sdk/client-ecs';
 import { EC2Client } from '@aws-sdk/client-ec2';
+import { ApiGatewayManagementApiClient } from '@aws-sdk/client-apigatewaymanagementapi';
 import { EcsRunner } from './ecs-runner';
 import { HarnessSessionsStore, newExpiresAt } from './sessions-store';
 import { ControlPlaneClient, type HarnessStatus } from './control-plane-client';
+import { DynamoDbConnectionsLookup, relayEvent, type ConnectionsLookup } from './event-relay';
 import { errorResponse, successResponse } from './response';
 
 interface IdleSweepEvent {
@@ -55,6 +57,8 @@ let cachedEc2: Pick<EC2Client, 'send'> | null = null;
 let cachedStore: HarnessSessionsStore | null = null;
 let cachedRunner: EcsRunner | null = null;
 let fetchOverride: typeof fetch | null = null;
+let cachedConnectionsLookup: ConnectionsLookup | null = null;
+let cachedManagementApi: Pick<ApiGatewayManagementApiClient, 'send'> | null = null;
 
 /** Test-only, mirrors the sibling Lambda packages' setTestOverrides. */
 export function setTestOverrides(overrides: {
@@ -62,11 +66,15 @@ export function setTestOverrides(overrides: {
 	ecs?: Pick<ECSClient, 'send'> | null;
 	ec2?: Pick<EC2Client, 'send'> | null;
 	fetchImpl?: typeof fetch | null;
+	connectionsLookup?: ConnectionsLookup | null;
+	managementApi?: Pick<ApiGatewayManagementApiClient, 'send'> | null;
 }): void {
 	if ('ddb' in overrides) cachedDdb = overrides.ddb ?? null;
 	if ('ecs' in overrides) cachedEcs = overrides.ecs ?? null;
 	if ('ec2' in overrides) cachedEc2 = overrides.ec2 ?? null;
 	if ('fetchImpl' in overrides) fetchOverride = overrides.fetchImpl ?? null;
+	if ('connectionsLookup' in overrides) cachedConnectionsLookup = overrides.connectionsLookup ?? null;
+	if ('managementApi' in overrides) cachedManagementApi = overrides.managementApi ?? null;
 	cachedStore = null;
 	cachedRunner = null;
 }
@@ -105,6 +113,35 @@ function getRunner(): EcsRunner {
 
 function controlPlaneFor(publicIp: string): ControlPlaneClient {
 	return new ControlPlaneClient(`http://${publicIp}:${CONTROL_PORT}`, requireEnv('CONTROLPLANE_SECRET'), fetchOverride ?? fetch);
+}
+
+function getConnectionsLookup(): ConnectionsLookup {
+	if (cachedConnectionsLookup) return cachedConnectionsLookup;
+	cachedConnectionsLookup = new DynamoDbConnectionsLookup(getDdb(), requireEnv('AGENT_CONNECTIONS_TABLE'), requireEnv('AGENT_CONNECTIONS_SESSION_INDEX'));
+	return cachedConnectionsLookup;
+}
+
+function getManagementApi(): Pick<ApiGatewayManagementApiClient, 'send'> {
+	if (cachedManagementApi) return cachedManagementApi;
+	cachedManagementApi = new ApiGatewayManagementApiClient({ endpoint: requireEnv('WS_MANAGEMENT_ENDPOINT') });
+	return cachedManagementApi;
+}
+
+/** Constant-time comparison against CONTROLPLANE_SECRET -- the caller here is a harness task pushing an event, not aws/agent-runtime (which authenticates with ORCHESTRATOR_SECRET via verifyCaller instead). Same secret this Lambda already sends as X-Controlplane-Secret when it calls a harness task's own control plane -- shared knowledge between exactly these two parties. */
+function verifyHarnessCaller(event: APIGatewayProxyEventV2): APIGatewayProxyResultV2 | null {
+	const secret = requireEnv('CONTROLPLANE_SECRET');
+	const provided = event.headers?.['x-controlplane-secret'];
+	if (typeof provided !== 'string' || provided.length !== secret.length) return errorResponse('Forbidden', 403);
+	if (!timingSafeEqual(Buffer.from(provided), Buffer.from(secret))) return errorResponse('Forbidden', 403);
+	return null;
+}
+
+async function receiveEvent(sessionId: string, event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> {
+	const body = parseJsonBody(event);
+	if (!body || typeof body.type !== 'string') return errorResponse('Event body must include a type', 400);
+
+	await relayEvent(getConnectionsLookup(), getManagementApi(), sessionId, body);
+	return successResponse({ relayed: true });
 }
 
 function idleTimeoutSeconds(): number {
@@ -362,11 +399,24 @@ export async function handler(event: APIGatewayProxyEventV2 | IdleSweepEvent): P
 		return;
 	}
 
-	const authError = verifyCaller(event);
-	if (authError) return authError;
-
 	const routeKey = event.routeKey;
 	const sessionId = event.pathParameters?.id;
+
+	// Authenticated separately from every other route here -- the caller
+	// is a harness task pushing its own event, not aws/agent-runtime.
+	if (routeKey === 'POST /api/harness/sessions/{id}/events') {
+		const authError = verifyHarnessCaller(event);
+		if (authError) return authError;
+		if (!sessionId) return errorResponse('Session ID is required', 400);
+		try {
+			return await receiveEvent(sessionId, event);
+		} catch (err) {
+			return errorResponse((err as Error).message ?? 'Internal server error', 500);
+		}
+	}
+
+	const authError = verifyCaller(event);
+	if (authError) return authError;
 
 	try {
 		switch (routeKey) {

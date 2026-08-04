@@ -42,7 +42,7 @@ let session: HarnessSession | undefined;
 
 async function handleStart(req: IncomingMessage, res: ServerResponse): Promise<void> {
 	type Body = {
-		sessionId?: string;
+		sessionId: string;
 		userPrompt: string;
 		sandboxControlUrl: string;
 		sandboxControlSecret: string;
@@ -52,8 +52,8 @@ async function handleStart(req: IncomingMessage, res: ServerResponse): Promise<v
 	};
 	const body = await readJsonBody<Body>(req);
 
-	if (!body.userPrompt || !body.sandboxControlUrl || !body.sandboxControlSecret) {
-		sendJson(res, 400, { success: false, error: 'userPrompt, sandboxControlUrl, and sandboxControlSecret are required' });
+	if (!body.sessionId || !body.userPrompt || !body.sandboxControlUrl || !body.sandboxControlSecret) {
+		sendJson(res, 400, { success: false, error: 'sessionId, userPrompt, sandboxControlUrl, and sandboxControlSecret are required' });
 		return;
 	}
 	if (session) {
@@ -67,6 +67,14 @@ async function handleStart(req: IncomingMessage, res: ServerResponse): Promise<v
 		resumeAgentSessionId: body.resumeAgentSessionId,
 		userId: body.userId,
 		useUserCredentials: body.useUserCredentials,
+		sessionId: body.sessionId,
+		// Static per-task, not per-session -- set on the ECS task definition
+		// (aws/infra/harness/main.tf) once EVENTS_ENDPOINT is derived from
+		// this stack's own orchestrator API resource. Reuses CONTROLPLANE_SECRET
+		// (already known to both this task and the orchestrator) rather than
+		// provisioning a separate secret for the reverse direction.
+		eventsEndpoint: process.env.EVENTS_ENDPOINT,
+		eventsSecret: process.env.CONTROLPLANE_SECRET,
 	});
 
 	try {

@@ -62,6 +62,7 @@ import type{
 	ListAppTablesResponse,
 	QueryAppTableResponse,
 	WipeAppDatabaseResponse,
+	HarnessCredentialsStatus,
 } from '@/api-types';
 import {
 	RateLimitExceededError,
@@ -968,6 +969,28 @@ class ApiClient {
 	async resetVault(): Promise<ApiResponse<{ success: boolean }>> {
 		return this.request<{ success: boolean }>('/api/vault/reset', {
 			method: 'POST',
+		});
+	}
+
+	// ===============================
+	// Harness Credentials API Methods (AWS-only -- see api-types.ts)
+	// ===============================
+
+	async getHarnessCredentialsStatus(): Promise<ApiResponse<HarnessCredentialsStatus>> {
+		return this.request<HarnessCredentialsStatus>('/api/user/credentials');
+	}
+
+	/** credentialsJson is the parsed contents of a Claude Code `.credentials.json` export -- never logged or persisted client-side beyond this one request. */
+	async setHarnessCredentials(credentialsJson: object): Promise<ApiResponse<{ authMode: 'byo_credentials' }>> {
+		return this.request<{ authMode: 'byo_credentials' }>('/api/user/credentials', {
+			method: 'PUT',
+			body: { credentialsJson },
+		});
+	}
+
+	async clearHarnessCredentials(): Promise<ApiResponse<{ authMode: 'platform_key' }>> {
+		return this.request<{ authMode: 'platform_key' }>('/api/user/credentials', {
+			method: 'DELETE',
 		});
 	}
 

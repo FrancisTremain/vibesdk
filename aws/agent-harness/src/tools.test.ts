@@ -36,6 +36,16 @@ describe('report_phase', () => {
 
 		expect(onPhaseReport).toHaveBeenCalledWith({ name: 'planning', status: 'started' });
 	});
+
+	it('also pushes a phase_update event when onEvent is provided', async () => {
+		const onEvent = vi.fn();
+		const definitions = createHarnessToolDefinitions({ sandbox: fakeSandbox(), onPhaseReport: vi.fn(), onEvent });
+		const handler = getHandler(definitions, 'report_phase');
+
+		await handler({ name: 'planning', status: 'started' }, undefined);
+
+		expect(onEvent).toHaveBeenCalledWith({ type: 'phase_update', phase: { name: 'planning', status: 'started' } });
+	});
 });
 
 describe('write_file', () => {
@@ -49,6 +59,34 @@ describe('write_file', () => {
 		expect(sandbox.writeFiles).toHaveBeenCalledWith([{ filePath: 'a.txt', fileContents: 'hi' }], undefined);
 		expect((result.content[0] as { text: string }).text).toContain('Wrote 1 file');
 	});
+
+	it('pushes a file_generated event per successfully written file', async () => {
+		const sandbox = fakeSandbox({
+			writeFiles: vi.fn().mockResolvedValue({
+				success: true,
+				results: [
+					{ file: 'a.txt', success: true },
+					{ file: 'b.txt', success: false, error: 'disk full' },
+				],
+			}),
+		});
+		const onEvent = vi.fn();
+		const definitions = createHarnessToolDefinitions({ sandbox, onPhaseReport: vi.fn(), onEvent });
+		const handler = getHandler(definitions, 'write_file');
+
+		await handler(
+			{
+				files: [
+					{ filePath: 'a.txt', fileContents: 'hi' },
+					{ filePath: 'b.txt', fileContents: 'bye' },
+				],
+			},
+			undefined,
+		);
+
+		expect(onEvent).toHaveBeenCalledTimes(1);
+		expect(onEvent).toHaveBeenCalledWith({ type: 'file_generated', file: { filePath: 'a.txt', fileContents: 'hi', filePurpose: '' } });
+	});
 });
 
 describe('run_command', () => {
@@ -61,6 +99,19 @@ describe('run_command', () => {
 
 		expect(sandbox.executeCommands).toHaveBeenCalledWith(['ls'], undefined);
 		expect((result.content[0] as { text: string }).text).toContain('a.txt');
+	});
+
+	it('pushes a terminal_output event per executed command', async () => {
+		const sandbox = fakeSandbox();
+		const onEvent = vi.fn();
+		const definitions = createHarnessToolDefinitions({ sandbox, onPhaseReport: vi.fn(), onEvent });
+		const handler = getHandler(definitions, 'run_command');
+
+		await handler({ commands: ['ls'] }, undefined);
+
+		expect(onEvent).toHaveBeenCalledWith(
+			expect.objectContaining({ type: 'terminal_output', output: '$ ls\na.txt', outputType: 'stdout' }),
+		);
 	});
 });
 

@@ -77,6 +77,31 @@ resource "aws_iam_role_policy" "harness_orchestrator_lambda_dynamodb" {
   })
 }
 
+resource "aws_iam_role_policy" "harness_orchestrator_lambda_event_relay" {
+  name = "vibesdk-harness-orchestrator-lambda-event-relay"
+  role = aws_iam_role.harness_orchestrator_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Looks up which WebSocket connection(s) are open for a given
+        # session id, via the session_id-index GSI -- see
+        # aws/harness-orchestrator-lambda/src/event-relay.ts.
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query"]
+        Resource = [data.aws_ssm_parameter.agent_connections_table_arn.value, "${data.aws_ssm_parameter.agent_connections_table_arn.value}/index/*"]
+      },
+      {
+        # PostToConnection on aws/infra/agent-runtime.tf's WebSocket API.
+        Effect   = "Allow"
+        Action   = ["execute-api:ManageConnections"]
+        Resource = ["${data.aws_ssm_parameter.agent_runtime_ws_execution_arn.value}/*/POST/@connections/*"]
+      },
+    ]
+  })
+}
+
 resource "aws_iam_role_policy" "harness_orchestrator_lambda_ecs" {
   name = "vibesdk-harness-orchestrator-lambda-ecs"
   role = aws_iam_role.harness_orchestrator_lambda.id
@@ -136,6 +161,12 @@ resource "aws_lambda_function" "harness_orchestrator" {
       CONTROLPLANE_SECRET     = random_password.harness_controlplane_secret.result
       ORCHESTRATOR_SECRET     = random_password.harness_orchestrator_secret.result
       IDLE_TIMEOUT_SECONDS    = tostring(var.idle_timeout_seconds)
+
+      # Real-time event relay (aws/harness-orchestrator-lambda/src/event-relay.ts)
+      # -- see main.tf's SSM data sources for where these values come from.
+      AGENT_CONNECTIONS_TABLE         = data.aws_ssm_parameter.agent_connections_table_name.value
+      AGENT_CONNECTIONS_SESSION_INDEX = local.agent_connections_session_index
+      WS_MANAGEMENT_ENDPOINT          = data.aws_ssm_parameter.agent_runtime_ws_management_endpoint.value
     }
   }
 
@@ -171,6 +202,11 @@ locals {
     "POST /api/harness/sessions/{id}/messages",
     "POST /api/harness/sessions/{id}/activity",
     "DELETE /api/harness/sessions/{id}",
+    # Inbound: a harness task pushes its own real-time HarnessEvents here
+    # (aws/agent-harness/src/session.ts's pushEvent), authenticated with
+    # CONTROLPLANE_SECRET rather than every other route's ORCHESTRATOR_SECRET
+    # -- see handler.ts's verifyHarnessCaller.
+    "POST /api/harness/sessions/{id}/events",
   ]
 }
 
