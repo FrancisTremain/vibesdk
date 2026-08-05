@@ -205,14 +205,6 @@ resource "aws_security_group" "harness_task" {
   description = "Harness Fargate tasks -- control plane reachable only from var.allowed_ips plus the orchestrator Lambda (no static egress IP), outbound open for the Anthropic API and the sandbox task public IP"
   vpc_id      = aws_vpc.harness.id
 
-  ingress {
-    description = "Control-plane port (aws/agent-harness HTTP server): session start, streamInput follow-ups, status polling"
-    from_port   = 8081
-    to_port     = 8081
-    protocol    = "tcp"
-    cidr_blocks = var.allowed_ips
-  }
-
   egress {
     description = "Anthropic API calls, sandbox task control-plane calls (public IP, no VPC path), DynamoDB via gateway endpoint"
     from_port   = 0
@@ -220,6 +212,26 @@ resource "aws_security_group" "harness_task" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+}
+
+# Split into standalone aws_security_group_rule resources rather than
+# inline `ingress` blocks on aws_security_group.harness_task above --
+# mixing the two on the same security group is a known Terraform/AWS-
+# provider conflict: an aws_security_group with any inline ingress
+# block treats that block as the complete authoritative ingress list
+# and silently drops any ingress added via a separate
+# aws_security_group_rule on the same group on the next apply/refresh.
+# Caught live: this exact combination had dropped the any-source rule
+# below, leaving harness-orchestrator-lambda unable to reach the task's
+# control plane at all (every session start failed with "fetch failed").
+resource "aws_security_group_rule" "harness_task_control_plane_allowlist" {
+  type              = "ingress"
+  from_port         = 8081
+  to_port           = 8081
+  protocol          = "tcp"
+  cidr_blocks       = var.allowed_ips
+  security_group_id = aws_security_group.harness_task.id
+  description       = "Control-plane port (aws/agent-harness HTTP server): session start, streamInput follow-ups, status polling"
 }
 
 # Same reasoning as aws/infra/sandbox/main.tf's
