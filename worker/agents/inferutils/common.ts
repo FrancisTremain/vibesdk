@@ -47,6 +47,11 @@ export interface ConversationState {
     runningHistory: ConversationMessage[];
     // Full history of messages
     fullHistory: ConversationMessage[];
+    // Original user query that kicked off this session. Optional: only
+    // populated by the AWS runtime as a fallback delivery path for `query`
+    // when the agent_connected push (sent from the WebSocket $connect
+    // route) failed to reach the client -- see aws/agent-runtime/src/messages.ts.
+    query?: string;
 }
 
 /**

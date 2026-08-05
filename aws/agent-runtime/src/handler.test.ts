@@ -6,6 +6,7 @@ import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk
 
 process.env.AGENT_SESSIONS_TABLE = 'vibesdk-agent-sessions';
 process.env.AGENT_CONNECTIONS_TABLE = 'vibesdk-agent-connections';
+process.env.APPS_TABLE = 'vibesdk-apps';
 
 // ./llm.ts and ./generation.ts make real HTTP calls (vibesdk-llm-client,
 // aws/sandbox-orchestrator-lambda) -- mocked here so these tests exercise
@@ -15,7 +16,15 @@ process.env.AGENT_CONNECTIONS_TABLE = 'vibesdk-agent-connections';
 const generateAssistantReplyMock = vi.fn<(history: unknown[], message: string) => Promise<string>>();
 vi.mock('./llm', () => ({ generateAssistantReply: (...args: [unknown[], string]) => generateAssistantReplyMock(...args) }));
 
-const startHarnessGenerationMock = vi.fn<(description: string, sessionId: string, userId: string) => Promise<import('./messages').HarnessGenerationStart>>();
+const startHarnessGenerationMock = vi.fn<
+	(
+		description: string,
+		sessionId: string,
+		userId: string,
+		fetchImpl?: typeof fetch,
+		onProgress?: (stage: 'sandbox' | 'harness', status: 'started' | 'completed') => void | Promise<void>,
+	) => Promise<import('./messages').HarnessGenerationStart>
+>();
 vi.mock('./harness-generation', () => ({ startHarnessGeneration: (...args: [string, string, string]) => startHarnessGenerationMock(...args) }));
 
 const getHarnessStatusMock = vi.fn<(sessionId: string) => Promise<import('./messages').HarnessStatus>>();
@@ -43,7 +52,16 @@ vi.mock('./browser-capture-client', () => ({
 	captureScreenshot: (...args: [string, string, unknown, number]) => captureScreenshotMock(...args),
 }));
 
-const { handler } = await import('./handler');
+const { handler, setAppStoreForTests } = await import('./handler');
+
+// vibesdk-db-apps ships its own bundled copy of @aws-sdk/lib-dynamodb
+// (see setAppStoreForTests's doc comment in handler.ts) -- aws-sdk-
+// client-mock's instanceof-based command matching can't see commands
+// AppStore builds from that other copy, so its Get/Put calls are
+// exercised here via a stubbed AppStore instead of ddbMock.
+const ensureAppMock = vi.fn<(id: string, data: Record<string, unknown>) => Promise<unknown>>();
+const updateAppMock = vi.fn<(id: string, updates: Record<string, unknown>) => Promise<boolean>>();
+setAppStoreForTests({ ensureApp: ensureAppMock, updateApp: updateAppMock } as unknown as Parameters<typeof setAppStoreForTests>[0]);
 
 function asStructured(result: APIGatewayProxyResultV2): APIGatewayProxyStructuredResultV2 {
 	if (typeof result === 'string') throw new Error('Expected a structured result, got a bare string');
@@ -101,6 +119,10 @@ beforeEach(() => {
 	commitGeneratedFilesMock.mockResolvedValue({ commitSha: 'abc123' });
 	deployProjectMock.mockReset();
 	captureScreenshotMock.mockReset();
+	ensureAppMock.mockReset();
+	ensureAppMock.mockResolvedValue(undefined);
+	updateAppMock.mockReset();
+	updateAppMock.mockResolvedValue(true);
 });
 
 describe('$connect', () => {
@@ -133,6 +155,30 @@ describe('$connect', () => {
 
 		const [ack] = responsesSent();
 		expect(ack).toMatchObject({ type: 'agent_connected', state: { sessionId: 'session-1' } });
+	});
+
+	it('still returns 200 from $connect when the best-effort agent_connected push fails', async () => {
+		// API Gateway architecturally cannot deliver a push to a connection
+		// until $connect returns -- this push is known to fail here in
+		// production, every time, not as a transient race. It must stay
+		// best-effort (a single attempt, swallowed on failure) rather than
+		// retried, since retrying a guaranteed failure only adds latency to
+		// every $connect. The client's reliable channel for state.query is
+		// get_conversation_state's 'conversation_state' response instead
+		// (see messages.test.ts).
+		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: undefined });
+		ddbMock.on(PutCommand).resolves({});
+		apigwMock.on(PostToConnectionCommand).rejects(new Error('GoneException'));
+
+		const result = await callHandler(
+			wsEvent({
+				requestContext: { routeKey: '$connect', connectionId: 'conn-1' } as APIGatewayProxyWebsocketEventV2['requestContext'],
+				queryStringParameters: { sessionId: 'session-1', userId: 'user-1' },
+			}),
+		);
+
+		expect(result.statusCode).toBe(200);
+		expect(apigwMock.commandCalls(PostToConnectionCommand)).toHaveLength(1);
 	});
 
 	it('does not overwrite an existing session on reconnect', async () => {
@@ -306,7 +352,13 @@ describe('$default', () => {
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all', message: 'build me a todo app' }) }));
 
-		expect(startHarnessGenerationMock).toHaveBeenCalledWith('build me a todo app', 'session-1', 'user-1');
+		expect(startHarnessGenerationMock).toHaveBeenCalledWith(
+			'build me a todo app',
+			'session-1',
+			'user-1',
+			expect.any(Function),
+			expect.any(Function),
+		);
 		const puts = ddbMock.commandCalls(PutCommand, { TableName: 'vibesdk-agent-sessions' });
 		expect(puts).toHaveLength(1);
 		expect(puts[0]!.args[0]!.input.Item).toMatchObject({
@@ -323,6 +375,54 @@ describe('$default', () => {
 			previewUrl: 'http://203.0.113.5:3000',
 			phase: { name: 'planning', status: 'started' },
 		});
+
+		// The "My Apps" list (vibesdk-apps, read by user-api-lambda/
+		// apps-api-lambda) only ever shows a session if something writes
+		// a row here -- without this, a chat/generation session exists
+		// only as an AGENT_SESSIONS_TABLE row nobody lists, invisible
+		// outside the tab that started it.
+		expect(ensureAppMock).toHaveBeenCalledWith(
+			'session-1',
+			expect.objectContaining({
+				title: 'build me a todo app',
+				originalPrompt: 'build me a todo app',
+				userId: 'user-1',
+				status: 'generating',
+				visibility: 'private',
+			}),
+		);
+	});
+
+	it('pushes infra_status platform alerts as the onProgress callback fires during generate_all', async () => {
+		wireConnection();
+		ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: baseSession });
+		ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
+		startHarnessGenerationMock.mockImplementation(async (_description, _sessionId, _userId, _fetchImpl, onProgress) => {
+			await onProgress?.('sandbox', 'started');
+			await onProgress?.('sandbox', 'completed');
+			await onProgress?.('harness', 'started');
+			await onProgress?.('harness', 'completed');
+			return {
+				sandboxInstanceId: 'inst-1',
+				previewUrl: 'http://203.0.113.5:3000',
+				sandboxControlUrl: 'http://203.0.113.5:8080',
+				harnessSessionId: 'harness-1',
+				phase: { name: 'planning', status: 'started' },
+				done: false,
+			};
+		});
+
+		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all', message: 'build me a todo app' }) }));
+
+		const pushed = responsesSent();
+		expect(pushed).toEqual(
+			expect.arrayContaining([
+				{ type: 'infra_status', stage: 'sandbox', status: 'started' },
+				{ type: 'infra_status', stage: 'sandbox', status: 'completed' },
+				{ type: 'infra_status', stage: 'harness', status: 'started' },
+				{ type: 'infra_status', stage: 'harness', status: 'completed' },
+			]),
+		);
 	});
 
 	it('falls back to the last user conversation turn when generate_all has no message', async () => {
@@ -346,7 +446,13 @@ describe('$default', () => {
 
 		await callHandler(wsEvent({ body: JSON.stringify({ type: 'generate_all' }) }));
 
-		expect(startHarnessGenerationMock).toHaveBeenCalledWith('build a calculator', 'session-1', 'user-1');
+		expect(startHarnessGenerationMock).toHaveBeenCalledWith(
+			'build a calculator',
+			'session-1',
+			'user-1',
+			expect.any(Function),
+			expect.any(Function),
+		);
 	});
 
 	it('errors without persisting when generate_all has no description available', async () => {
@@ -424,8 +530,22 @@ describe('$default', () => {
 				current_dev_state: 'REVIEWING',
 				should_be_generating: false,
 			});
+			// Flips the "My Apps" row so it stops showing as still-generating.
+			expect(updateAppMock).toHaveBeenCalledWith('session-1', { status: 'completed' });
 			const [response] = responsesSent();
-			expect(response).toMatchObject({ type: 'generation_complete', files: [{ filePath: 'index.html', fileContents: '<h1>todo</h1>' }], gitCommitSha: 'abc123' });
+			// No file contents in this push -- the client already has every
+			// file from the incremental file_generated events the harness
+			// pushed during the run (aws/agent-harness/src/tools.ts's
+			// write_file), and API Gateway's WebSocket PostToConnection has
+			// a hard 128KB-per-message cap. Inlining the full generated
+			// project here blew straight through it on anything beyond a
+			// trivial app, throwing a 413 that silently ate the only
+			// signal telling the client generation was done (caught live:
+			// the UI polled forever, and each retry re-ran this same
+			// expensive done-transition, compounding into DynamoDB
+			// optimistic-lock exhaustion too).
+			expect(response).toMatchObject({ type: 'generation_complete', gitCommitSha: 'abc123' });
+			expect(response).not.toHaveProperty('files');
 		});
 
 		it('does not fail the poll when the git commit fails, and surfaces the error instead', async () => {
@@ -443,6 +563,27 @@ describe('$default', () => {
 			expect(puts[0]!.args[0]!.input.Item).toMatchObject({ git_commit_error: 'GIT_STORAGE_BUCKET not configured', should_be_generating: false });
 			const [response] = responsesSent();
 			expect(response).toMatchObject({ type: 'generation_complete', gitCommitError: 'GIT_STORAGE_BUCKET not configured' });
+		});
+
+		it('does not re-run the done-transition on a repeat poll after generation already completed', async () => {
+			// Guards against the scenario that caused live "Exceeded lock
+			// retry limit" errors: a client that keeps polling after
+			// completion (e.g. because it never received generation_complete)
+			// must not re-fetch sandbox files or re-commit to git on every
+			// retry -- each of those was racing the others for the same
+			// DynamoDB item.
+			wireConnection();
+			const alreadyDone = { ...baseSession, harness_session_id: 'harness-1', sandbox_instance_id: 'inst-1', should_be_generating: false, current_dev_state: 'REVIEWING' as const };
+			ddbMock.on(GetCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({ Item: alreadyDone });
+			ddbMock.on(PutCommand, { TableName: 'vibesdk-agent-sessions' }).resolves({});
+
+			await callHandler(wsEvent({ body: JSON.stringify({ type: 'poll_generation_status' }) }));
+
+			expect(getHarnessStatusMock).not.toHaveBeenCalled();
+			expect(getSandboxFilesMock).not.toHaveBeenCalled();
+			expect(commitGeneratedFilesMock).not.toHaveBeenCalled();
+			const [response] = responsesSent();
+			expect(response).toMatchObject({ type: 'generation_complete' });
 		});
 
 		it('is a no-op when no harness session has ever started', async () => {

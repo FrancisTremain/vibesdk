@@ -65,21 +65,28 @@ function requireEnv(name: string): string {
 	return value;
 }
 
+/** Coarse cold-start stage reporting -- the only real-time visibility available while createSandboxInstance/createHarnessSession are each blocked for however long their own ECS RunTask+waitForPublicIp+boot takes (seen live: tens of seconds of otherwise-silent "Thinking..."). aws/agent-runtime's handler.ts turns these into platform-level WebSocket pushes, not chat messages -- see its infra_status handling. */
+export type HarnessGenerationProgress = (stage: 'sandbox' | 'harness', status: 'started' | 'completed') => void | Promise<void>;
+
 export async function startHarnessGeneration(
 	description: string,
 	sessionId: string,
 	userId: string,
 	fetchImpl: typeof fetch = fetch,
+	onProgress?: HarnessGenerationProgress,
 ): Promise<HarnessGenerationStart> {
+	await onProgress?.('sandbox', 'started');
 	const sandbox = await createSandboxInstance([], 'generated-app', 'true', fetchImpl);
 	if (!sandbox.runId || !sandbox.previewURL) {
 		throw new Error('Sandbox instance creation did not return a runId/previewURL');
 	}
+	await onProgress?.('sandbox', 'completed');
 
 	const sandboxControlUrl = deriveControlUrl(sandbox.previewURL);
 	const sandboxControlSecret = requireEnv('SANDBOX_CONTROLPLANE_SECRET');
 	const useUserCredentials = await shouldUseUserCredentials(userId);
 
+	await onProgress?.('harness', 'started');
 	const harness: HarnessSessionStatus = await createHarnessSession(
 		sessionId,
 		description,
@@ -88,14 +95,26 @@ export async function startHarnessGeneration(
 		userId,
 		useUserCredentials,
 		fetchImpl,
+		sandbox.runId,
 	);
 	if (!harness.sessionId) {
 		throw new Error('Harness session creation did not return a sessionId');
 	}
+	if (harness.error) {
+		throw new Error(harness.error);
+	}
+	await onProgress?.('harness', 'completed');
 
 	return {
 		sandboxInstanceId: sandbox.runId,
-		previewUrl: sandbox.previewURL,
+		// Browser-facing URL prefers the ALB-fronted HTTPS hostname
+		// (sandbox.externalPreviewURL) -- the raw http://<ip>:3000 in
+		// sandbox.previewURL can never load inside the app at all (mixed
+		// content: an HTTPS page can't fetch/embed HTTP, confirmed live), and
+		// falls back to it only if ALB registration itself failed. Note
+		// sandboxControlUrl above is deliberately derived from the raw
+		// previewURL, not this -- the ALB only proxies port 3000.
+		previewUrl: sandbox.externalPreviewURL ?? sandbox.previewURL,
 		sandboxControlUrl,
 		harnessSessionId: harness.sessionId,
 		agentSessionId: harness.agentSessionId,

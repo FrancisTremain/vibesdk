@@ -1,4 +1,5 @@
 import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
+import path from 'node:path';
 
 const runIntegrationTests = process.env.VIBESDK_RUN_INTEGRATION_TESTS === '1';
 
@@ -6,6 +7,10 @@ export default defineWorkersConfig({
   resolve: {
     alias: {
       'bun:test': 'vitest',
+      // Matches vite.config.ts's '@' -> src alias, needed for unit tests
+      // that import plain-TS src/ logic (e.g. src/routes/chat/utils) --
+      // those files use '@/...' imports throughout.
+      '@': path.resolve(__dirname, './src'),
     },
   },
   test: {

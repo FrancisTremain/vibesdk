@@ -44,6 +44,22 @@ describe('createApp / read', () => {
 		expect(app).toMatchObject({ title: 'My App', starCount: 0, favoriteCount: 0, viewCount: 0 });
 	});
 
+	it('ensureApp creates the app at the caller-chosen id and is idempotent on a second call', async () => {
+		const { store } = makeStore();
+		const first = await store.ensureApp('chat-session-1', baseNewApp({ title: 'First title', status: 'generating' }));
+		expect(first.id).toBe('chat-session-1');
+
+		// A retry (e.g. after an optimistic-lock conflict upstream) must
+		// not clobber the existing row -- title/status here differ from
+		// the first call on purpose, and should be ignored.
+		const second = await store.ensureApp('chat-session-1', baseNewApp({ title: 'Second title', status: 'completed' }));
+		expect(second).toEqual(first);
+
+		const fetched = await store.getAppDetails('chat-session-1');
+		expect(fetched?.title).toBe('First title');
+		expect(fetched?.status).toBe('generating');
+	});
+
 	it('checks ownership correctly, including for a nonexistent app', async () => {
 		const { store } = makeStore();
 		const app = await store.createApp(baseNewApp({ userId: 'alice' }));

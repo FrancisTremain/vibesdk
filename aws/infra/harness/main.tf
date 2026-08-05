@@ -91,6 +91,17 @@ data "aws_ssm_parameter" "identity_table_arn" {
   name = "/vibesdk/identity_table_arn"
 }
 
+# The IAM policy below only needs the ARN, but the harness task's own
+# runtime code (aws/agent-harness/src/session.ts's UserCredentialsClient)
+# needs the table NAME to call DynamoDB -- this was missing entirely
+# from the environment block, so every credentials lookup failed with
+# "Value at 'TableName' failed to satisfy constraint: Member must have
+# length greater than or equal to 1" (caught live: process.env.IDENTITY_TABLE
+# defaulted to '' with no env var set at all).
+data "aws_ssm_parameter" "identity_table_name" {
+  name = "/vibesdk/identity_table_name"
+}
+
 # Bridges aws/infra/agent-runtime.tf's WebSocket connections table + WS
 # management endpoint into this separate root module, same pattern as the
 # two data sources above -- needed so aws/harness-orchestrator-lambda can
@@ -112,6 +123,20 @@ data "aws_ssm_parameter" "agent_runtime_ws_management_endpoint" {
 
 data "aws_ssm_parameter" "agent_runtime_ws_execution_arn" {
   name = "/vibesdk/agent_runtime_ws_execution_arn"
+}
+
+# Lets receiveEvent() (aws/harness-orchestrator-lambda/src/handler.ts) forward
+# real generation activity to the underlying sandbox instance via
+# aws/sandbox-activity-client.ts -- bridged the same way as the
+# agent_connections/ws params above, from aws/infra/sandbox/orchestrator.tf
+# (also a separate root module).
+data "aws_ssm_parameter" "sandbox_orchestrator_api_endpoint" {
+  name = "/vibesdk/sandbox_orchestrator_api_endpoint"
+}
+
+data "aws_ssm_parameter" "sandbox_orchestrator_secret" {
+  name            = "/vibesdk/sandbox_orchestrator_secret"
+  with_decryption = true
 }
 
 locals {
@@ -383,6 +408,7 @@ resource "aws_ecs_task_definition" "harness" {
           # here (aws/agent-harness/src/session.ts's pushEvent), reusing
           # CONTROLPLANE_SECRET above to authenticate itself.
           { name = "EVENTS_ENDPOINT", value = aws_apigatewayv2_api.harness_orchestrator_http.api_endpoint },
+          { name = "IDENTITY_TABLE", value = data.aws_ssm_parameter.identity_table_name.value },
         ],
         # Omitted entirely (not even an empty string) when no platform key
         # is configured, so a BYO-credentials-only deploy never ships an

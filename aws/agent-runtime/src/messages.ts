@@ -80,6 +80,18 @@ export interface MessageDeps {
 		viewport?: { width: number; height: number },
 		waitSeconds?: number,
 	) => Promise<CaptureResult>;
+	/**
+	 * Best-effort: makes this session resumable from the "My Apps" list
+	 * (vibesdk-db-apps, same table the frontend's apps-api/user-api
+	 * Lambdas read) -- without this, a generation session only exists
+	 * discoverably as an AGENT_SESSIONS_TABLE row nobody ever lists, so
+	 * the chat is invisible outside the tab that started it. Idempotent
+	 * (see AppStore.ensureApp) -- safe to call again on a mutate retry.
+	 * A failure here must never fail generation itself.
+	 */
+	ensureAppRecord: (params: { id: string; userId: string; title: string; originalPrompt: string }) => Promise<void>;
+	/** Flips the app record's status to 'completed' once a generation turn is done -- same best-effort semantics as ensureAppRecord. */
+	markAppCompleted: (id: string) => Promise<void>;
 }
 
 export interface MessagePlan {
@@ -188,11 +200,22 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 
 		case 'get_conversation_state':
 			return {
+				// Also carries `query`, even though the shared ConversationState
+				// shape (worker/agents/inferutils/common.ts) doesn't otherwise
+				// need it -- this is the fallback delivery path for the
+				// original user prompt when agent_connected (pushed from the
+				// WebSocket $connect route) never reaches the client. AWS API
+				// Gateway only considers a connection reachable via
+				// PostToConnectionCommand once $connect returns, so pushing
+				// from inside that same invocation can never succeed; this
+				// $default-route response is sent after the connection is
+				// already established, so it reliably does.
 				buildResponse: (state) => ({
 					type: 'conversation_state',
 					state: {
 						conversationMessages: state.conversation_messages,
 						pendingUserInputs: state.pending_user_inputs,
+						query: state.query,
 					},
 				}),
 			};
@@ -236,6 +259,14 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 						throw new Error('No project description available -- include a message with generate_all, or send a user_suggestion first.');
 					}
 					const result = await deps.startHarnessGeneration(description, state.session_id, state.user_id);
+					await deps
+						.ensureAppRecord({
+							id: state.session_id,
+							userId: state.user_id,
+							title: description.slice(0, 100),
+							originalPrompt: description,
+						})
+						.catch(() => {});
 					const now = new Date().toISOString();
 					return {
 						...state,
@@ -266,6 +297,16 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 			return {
 				mutate: async (state) => {
 					if (!state.harness_session_id) return state;
+					// Already completed a prior poll's done-transition -- a
+					// no-op re-poll shouldn't re-fetch sandbox files or
+					// re-commit to git. Mainly a safety net (the client is
+					// expected to stop polling once it receives
+					// generation_complete), but a dropped/oversized push
+					// previously left the client polling indefinitely, and
+					// every one of those retries re-ran this whole expensive
+					// transition concurrently, exhausting the optimistic-lock
+					// retry budget (caught live).
+					if (state.current_dev_state === 'REVIEWING') return state;
 
 					const status = await deps.pollHarnessStatus(state.harness_session_id);
 					const now = new Date().toISOString();
@@ -290,6 +331,7 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 					} catch (err) {
 						gitCommitError = err instanceof Error ? err.message : String(err);
 					}
+					await deps.markAppCompleted(state.session_id).catch(() => {});
 					return {
 						...state,
 						current_phase: status.phase,
@@ -306,10 +348,18 @@ export function planMessage(incoming: IncomingMessage, deps: MessageDeps): Messa
 					if (state.should_be_generating) {
 						return { type: 'phase_update', phase: state.current_phase };
 					}
+					// No file contents here -- the client already has every
+					// file from the incremental file_generated events the
+					// harness pushed during the run (aws/agent-harness/src/
+					// tools.ts's write_file), and API Gateway's WebSocket
+					// PostToConnection has a hard 128KB-per-message cap.
+					// Inlining the full generated project blew through that
+					// on anything beyond a trivial app, throwing a 413 that
+					// silently ate the only signal telling the client
+					// generation was done (caught live).
 					return {
 						type: 'generation_complete',
 						projectName: state.project_name,
-						files: Object.entries(state.generated_files).map(([filePath, fileContents]) => ({ filePath, fileContents })),
 						previewUrl: state.preview_url,
 						gitCommitSha: state.git_commit_sha,
 						gitCommitError: state.git_commit_error,

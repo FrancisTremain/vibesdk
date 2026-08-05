@@ -39,6 +39,19 @@ async function call<T>(method: string, path: string, body: unknown, fetchImpl: t
 	return json.data as T;
 }
 
+// API Gateway HTTP APIs have a hard, non-configurable 29s integration
+// timeout. Fargate task launch + ENI/public-IP assignment + the
+// container's own boot can legitimately take longer than that -- the
+// Lambda keeps running to completion regardless (API Gateway giving up
+// doesn't cancel it) and persists the session's real end state, but the
+// caller only ever sees a 503 with no body. Retrying the POST would hit
+// 409 (we already sent our own sessionId, so the session now exists);
+// instead fall back to polling the status route, which is a cheap
+// DynamoDB read that reflects whatever the still-running Lambda
+// eventually wrote.
+const SESSION_START_POLL_INTERVAL_MS = 3_000;
+const SESSION_START_POLL_TIMEOUT_MS = 90_000;
+
 export async function createHarnessSession(
 	sessionId: string,
 	userPrompt: string,
@@ -47,13 +60,39 @@ export async function createHarnessSession(
 	userId?: string,
 	useUserCredentials?: boolean,
 	fetchImpl: typeof fetch = fetch,
+	sandboxInstanceId?: string,
 ): Promise<HarnessSessionStatus> {
-	return call(
-		'POST',
-		'/api/harness/sessions',
-		{ sessionId, userPrompt, sandboxControlUrl, sandboxControlSecret, userId, useUserCredentials },
-		fetchImpl,
-	);
+	try {
+		return await call<HarnessSessionStatus>(
+			'POST',
+			'/api/harness/sessions',
+			{ sessionId, userPrompt, sandboxControlUrl, sandboxControlSecret, userId, useUserCredentials, sandboxInstanceId },
+			fetchImpl,
+		);
+	} catch {
+		return pollUntilStarted(sessionId, fetchImpl);
+	}
+}
+
+async function pollUntilStarted(sessionId: string, fetchImpl: typeof fetch): Promise<HarnessSessionStatus> {
+	const deadline = Date.now() + SESSION_START_POLL_TIMEOUT_MS;
+	while (Date.now() < deadline) {
+		await new Promise((resolve) => setTimeout(resolve, SESSION_START_POLL_INTERVAL_MS));
+		const status = await getHarnessStatus(sessionId, fetchImpl).catch(() => undefined);
+		const provisioningStatus = (status as { status?: string } | undefined)?.status;
+		if (provisioningStatus === 'ERROR') {
+			throw new Error(status?.error ?? 'Harness session failed to start');
+		}
+		if (status && provisioningStatus !== 'PROVISIONING') {
+			// The container's own GET /status (aws/agent-harness/src/server.ts)
+			// reports agentSessionId/phase/done but has no reason to echo
+			// back the orchestrator-level sessionId it doesn't track --
+			// createHarnessSession's caller needs it, so fill it in from
+			// what we already know we polled for.
+			return { ...status, sessionId: status.sessionId ?? sessionId };
+		}
+	}
+	throw new Error('Harness session did not become ready in time');
 }
 
 export async function sendHarnessMessage(sessionId: string, content: string, fetchImpl: typeof fetch = fetch): Promise<HarnessSessionStatus> {

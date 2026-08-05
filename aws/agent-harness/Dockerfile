@@ -22,4 +22,14 @@ ENV CONTROL_PORT=8081
 
 EXPOSE 8081
 
+# session.ts passes permissionMode: 'bypassPermissions' (Claude Code's
+# --dangerously-skip-permissions) so the harness can run non-interactively
+# with no human to approve tool calls -- but the Claude Code CLI itself
+# refuses that flag outright when running as root/sudo, "for security
+# reasons" (caught live: every session failed at CLI startup with exit
+# code 1). The node:20-slim base has no non-root user by default, so one
+# has to be created explicitly.
+RUN useradd --create-home --shell /bin/bash harness && chown -R harness:harness /workspace
+USER harness
+
 CMD ["npx", "tsx", "src/server.ts"]

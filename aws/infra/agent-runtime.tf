@@ -232,6 +232,16 @@ resource "aws_iam_role_policy" "agent_runtime_lambda_dynamodb" {
         Action   = ["dynamodb:GetItem"]
         Resource = [aws_dynamodb_table.identity.arn]
       },
+      {
+        # ./messages.ts's ensureAppRecord/markAppCompleted (vibesdk-
+        # db-apps's AppStore) -- makes each chat/generation session show
+        # up in the "My Apps" list (read by aws/user-api-lambda and
+        # aws/apps-api-lambda) instead of only existing as an
+        # AGENT_SESSIONS_TABLE row nobody lists.
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+        Resource = [aws_dynamodb_table.apps.arn]
+      },
     ]
   })
 }
@@ -302,6 +312,9 @@ resource "aws_lambda_function" "agent_runtime" {
       AGENT_SESSIONS_TABLE    = aws_dynamodb_table.agent_sessions.name
       AGENT_CONNECTIONS_TABLE = aws_dynamodb_table.agent_connections.name
       LLM_USAGE_TABLE         = aws_dynamodb_table.llm_usage.name
+      # ./messages.ts's ensureAppRecord/markAppCompleted -- same table
+      # aws/user-api-lambda and aws/apps-api-lambda read for "My Apps".
+      APPS_TABLE = aws_dynamodb_table.apps.name
       # ./harness-generation.ts's shouldUseUserCredentials -- the
       # auth.json branching path's per-user auth-mode lookup.
       IDENTITY_TABLE = aws_dynamodb_table.identity.name

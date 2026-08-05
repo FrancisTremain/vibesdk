@@ -145,6 +145,20 @@ export class HarnessSession {
 			// rather than failing the whole session over an auth-path edge case.
 		}
 
+		// Without either credential path, the Agent SDK's bundled Claude
+		// Code CLI subprocess has nothing to authenticate with -- caught
+		// live: it doesn't error, it just never emits a session id, so
+		// waitForSessionId()'s 30s deadline was the only thing that ever
+		// ended the call, and even then with no error message (getStatus()
+		// looked identical to "still starting"). Check up front instead of
+		// spending 30s discovering the same thing the hard way.
+		if (!process.env.ANTHROPIC_API_KEY && !process.env.CLAUDE_CONFIG_DIR) {
+			this.done = true;
+			this.error =
+				'No Anthropic credentials configured for this session -- set the platform ANTHROPIC_API_KEY or upload Claude Code credentials for this account.';
+			return this.getStatus();
+		}
+
 		const tools = createHarnessTools({
 			sandbox: this.sandbox,
 			onPhaseReport: (phase) => {
@@ -164,7 +178,9 @@ export class HarnessSession {
 				systemPrompt:
 					'You are generating a full-stack web application inside an isolated sandbox. ' +
 					'You have no local filesystem or shell access -- use write_file, read_file, run_command, ' +
-					'and run_static_analysis, which all operate on the sandbox project. ' +
+					'run_static_analysis, and get_runtime_errors, which all operate on the sandbox project. ' +
+					'Call get_runtime_errors after starting or restarting the dev server, and again before ' +
+					'finishing, to catch issues you would otherwise never see. ' +
 					'Call report_phase(name, "started") at the beginning of each major phase ' +
 					'(e.g. planning, scaffold, implementation, review) and report_phase(name, "completed") ' +
 					'when it finishes -- this is the only way the user sees progress, so call it for every phase.',
@@ -223,6 +239,10 @@ export class HarnessSession {
 				const sessionId = (message as { session_id?: string }).session_id;
 				if (sessionId) this.agentSessionId = sessionId;
 
+				if (message.type === 'assistant') {
+					this.pushAssistantText(message);
+				}
+
 				if (message.type === 'result') {
 					this.done = true;
 					if (message.subtype !== 'success') {
@@ -236,6 +256,26 @@ export class HarnessSession {
 		} catch (err) {
 			this.error = (err as Error).message;
 			this.done = true;
+		}
+	}
+
+	/**
+	 * The model's own running commentary -- what it's thinking/planning
+	 * between tool calls, not the tool calls themselves. Tool activity
+	 * (file writes, commands, analysis) already has its own dedicated,
+	 * better-typed events pushed directly from ./tools.ts's handlers, so
+	 * this only extracts plain text blocks, not tool_use blocks -- trying
+	 * to reconstruct tool status from raw content blocks here would just
+	 * duplicate what those handlers already report more reliably.
+	 */
+	private pushAssistantText(message: { message?: { content?: unknown } }): void {
+		const content = message.message?.content;
+		if (!Array.isArray(content)) return;
+		for (const block of content) {
+			if (block && typeof block === 'object' && (block as { type?: string }).type === 'text') {
+				const text = (block as { text?: string }).text;
+				if (text) this.pushEvent({ type: 'conversation_response', message: text });
+			}
 		}
 	}
 }

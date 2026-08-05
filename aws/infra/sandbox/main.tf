@@ -182,6 +182,19 @@ resource "aws_security_group" "sandbox_task" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  # This resource's inline ingress blocks are only ever this stack's
+  # original two rules; every rule added later
+  # (sandbox_task_control_plane_any_source, sandbox_task_dev_server_from_alb
+  # in alb.tf) is a standalone aws_security_group_rule instead, deliberately
+  # -- but the AWS provider treats an aws_security_group's inline blocks as
+  # authoritative over the *entire* rule set on the group, so every plan
+  # otherwise proposes deleting those separately-managed rules. Ignoring
+  # ingress drift here is the documented workaround for mixing both
+  # management styles on one security group.
+  lifecycle {
+    ignore_changes = [ingress]
+  }
 }
 
 # The orchestrator Lambda (aws/sandbox-orchestrator-lambda) calls each

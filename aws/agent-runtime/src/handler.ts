@@ -23,6 +23,7 @@ import type { APIGatewayProxyWebsocketEventV2, APIGatewayProxyResultV2 } from 'a
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
 import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
+import { AppStore } from 'vibesdk-db-apps';
 import { newSessionState, nowEpochSeconds, type AgentSessionState, type WsConnectionRecord } from './state';
 import { planMessage, type IncomingMessage, type MessageDeps, type OutgoingMessage } from './messages';
 import { generateAssistantReply } from './llm';
@@ -32,6 +33,30 @@ import { getSandboxFiles } from './sandbox-client';
 import { commitGeneratedFiles } from './git-commit';
 import { deployProject } from './deploy';
 import { captureScreenshot } from './browser-capture-client';
+
+const AGENT_SESSIONS_TABLE = requireEnv('AGENT_SESSIONS_TABLE');
+const AGENT_CONNECTIONS_TABLE = requireEnv('AGENT_CONNECTIONS_TABLE');
+
+const CONNECTION_TTL_SECONDS = 60 * 60 * 4; // 4h, same ceiling as aws/actor-spike
+const LOCK_RETRY_LIMIT = 5;
+
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+let apps = new AppStore(ddb, requireEnv('APPS_TABLE'));
+
+/**
+ * Test-only override for the vibesdk-db-apps AppStore. Needed because
+ * that package ships its own bundled copy of @aws-sdk/lib-dynamodb
+ * (esbuild's `--external:@aws-sdk/*` still resolves against
+ * db-apps/node_modules at runtime, not this package's) -- aws-sdk-
+ * client-mock's `.on(Command, ...)` matches via `instanceof` against
+ * *this* file's imported Command classes, which fails silently against
+ * commands built from that other copy. Same problem, same fix
+ * (dependency injection instead of relying on the shared mock) as
+ * aws/auth-api-lambda and aws/user-api-lambda's `setDdbClientForTests`.
+ */
+export function setAppStoreForTests(store: AppStore | null): void {
+	apps = store ?? new AppStore(ddb, requireEnv('APPS_TABLE'));
+}
 
 const messageDeps: MessageDeps = {
 	generateReply: generateAssistantReply,
@@ -45,15 +70,35 @@ const messageDeps: MessageDeps = {
 	commitToGitStorage: commitGeneratedFiles,
 	deployProject,
 	captureScreenshot,
+	ensureAppRecord: async ({ id, userId, title, originalPrompt }) => {
+		await apps.ensureApp(id, {
+			title,
+			description: null,
+			iconUrl: null,
+			originalPrompt,
+			finalPrompt: null,
+			framework: null,
+			userId,
+			sessionToken: null,
+			visibility: 'private',
+			status: 'generating',
+			deploymentId: null,
+			githubRepositoryUrl: null,
+			githubRepositoryVisibility: null,
+			isArchived: false,
+			isFeatured: false,
+			version: 1,
+			parentAppId: null,
+			previewVersion: 0,
+			screenshotUrl: null,
+			screenshotCapturedAt: null,
+			lastDeployedAt: null,
+		});
+	},
+	markAppCompleted: async (id) => {
+		await apps.updateApp(id, { status: 'completed' });
+	},
 };
-
-const AGENT_SESSIONS_TABLE = requireEnv('AGENT_SESSIONS_TABLE');
-const AGENT_CONNECTIONS_TABLE = requireEnv('AGENT_CONNECTIONS_TABLE');
-
-const CONNECTION_TTL_SECONDS = 60 * 60 * 4; // 4h, same ceiling as aws/actor-spike
-const LOCK_RETRY_LIMIT = 5;
-
-const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 function requireEnv(name: string): string {
 	const value = process.env[name];
@@ -116,6 +161,15 @@ async function handleConnect(
 		});
 	}
 
+	// API Gateway does not consider a connection reachable via
+	// PostToConnectionCommand until this handler returns -- pushing from
+	// inside $connect is architecturally guaranteed to fail, not a
+	// transient race, so retrying here would only add latency for no
+	// benefit (confirmed live: every attempt failed). This push is
+	// therefore best-effort only; the client's real, reliable channel for
+	// state.query is get_conversation_state's 'conversation_state'
+	// response (sent over the already-established $default route -- see
+	// messages.ts), which is what use-chat.ts actually falls back to.
 	await pushToConnection(event, connectionId, {
 		type: 'agent_connected',
 		state: {
@@ -127,9 +181,37 @@ async function handleConnect(
 			conversationMessages: state.conversation_messages,
 			pendingUserInputs: state.pending_user_inputs,
 		},
-	});
+	}).catch(() => {});
 
 	return { statusCode: 200, body: 'connected' };
+}
+
+const PUSH_RETRY_ATTEMPTS = 3;
+const PUSH_RETRY_DELAY_MS = 150;
+
+/**
+ * Only safe to use for pushes sent from the $default route (an already-
+ * established connection), where a failure is a genuinely transient
+ * network blip worth retrying -- NOT from $connect, where API Gateway
+ * architecturally cannot deliver a push until the handler returns, so
+ * retrying inside that same invocation can never succeed (see
+ * handleConnect's single best-effort push above).
+ */
+async function pushToConnectionWithRetry(
+	event: APIGatewayProxyWebsocketEventV2,
+	connectionId: string,
+	payload: OutgoingMessage,
+): Promise<void> {
+	for (let attempt = 0; attempt < PUSH_RETRY_ATTEMPTS; attempt++) {
+		try {
+			await pushToConnection(event, connectionId, payload);
+			return;
+		} catch {
+			if (attempt < PUSH_RETRY_ATTEMPTS - 1) {
+				await new Promise((resolve) => setTimeout(resolve, PUSH_RETRY_DELAY_MS));
+			}
+		}
+	}
 }
 
 async function handleDisconnect(connectionId: string): Promise<APIGatewayProxyResultV2> {
@@ -150,7 +232,21 @@ async function handleMessage(
 	}
 
 	const incoming = parseMessage(event.body);
-	const plan = planMessage(incoming, messageDeps);
+	// generate_all's cold start (ECS RunTask + waitForPublicIp + boot for
+	// both the sandbox and harness tasks) can run tens of seconds with no
+	// other signal to the client -- overriding just this one dep, per
+	// request, lets startHarnessGeneration report progress as
+	// platform-level 'infra_status' pushes without messages.ts (which
+	// stays connection-agnostic and unit-testable) knowing this Lambda
+	// invocation even has a WebSocket connection to push to.
+	const deps: MessageDeps = {
+		...messageDeps,
+		startHarnessGeneration: (description, sessionId, userId) =>
+			startHarnessGeneration(description, sessionId, userId, fetch, (stage, status) =>
+				pushToConnectionWithRetry(event, connectionId, { type: 'infra_status', stage, status }),
+			),
+	};
+	const plan = planMessage(incoming, deps);
 
 	if (plan.immediateError) {
 		await pushToConnection(event, connectionId, { type: 'error', error: plan.immediateError });

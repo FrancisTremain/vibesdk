@@ -23,9 +23,11 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { ECSClient } from '@aws-sdk/client-ecs';
 import { EC2Client } from '@aws-sdk/client-ec2';
+import { ElasticLoadBalancingV2Client } from '@aws-sdk/client-elastic-load-balancing-v2';
 import { EcsRunner } from './ecs-runner';
 import { SandboxInstancesStore, newExpiresAt, type SandboxInstanceRecord } from './instances-store';
 import { ControlPlaneClient } from './control-plane-client';
+import { AlbManager } from './alb-manager';
 import { errorResponse, successResponse } from './response';
 
 function requireEnv(name: string): string {
@@ -37,8 +39,18 @@ function requireEnv(name: string): string {
 const WORKSPACE_DIR = '/workspace/app';
 const CONTROL_PORT = 8080;
 const DEV_PORT = 3000;
-const BOOTSTRAP_RETRY_ATTEMPTS = 5;
-const BOOTSTRAP_RETRY_DELAY_MS = 2000;
+// Confirmed live: 5 attempts * 2s (10s total) was not enough headroom for
+// the container's control-plane process to start accepting connections
+// after ECS reports the task RUNNING -- a real generation attempt failed
+// with a generic "fetch failed" here, then the same task answered fine to
+// a manual request made a couple of minutes later. 20 * 3s = 60s total is
+// still comfortably inside orchestrator_lambda_timeout_seconds's 180s
+// budget alongside RunTask+waitForNetworking, and now that createInstance's
+// own synchronous HTTP response is no longer the only way the caller finds
+// out (see getInstanceStatus's poll-fallback contract), a slower-but-real
+// success beats a fast, wrong failure.
+const BOOTSTRAP_RETRY_ATTEMPTS = 20;
+const BOOTSTRAP_RETRY_DELAY_MS = 3000;
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -47,8 +59,10 @@ function sleep(ms: number): Promise<void> {
 let cachedDdb: DynamoDBDocumentClient | null = null;
 let cachedEcs: Pick<ECSClient, 'send'> | null = null;
 let cachedEc2: Pick<EC2Client, 'send'> | null = null;
+let cachedElb: Pick<ElasticLoadBalancingV2Client, 'send'> | null = null;
 let cachedStore: SandboxInstancesStore | null = null;
 let cachedRunner: EcsRunner | null = null;
+let cachedAlbManager: AlbManager | null = null;
 let fetchOverride: typeof fetch | null = null;
 
 /** Test-only, mirrors the sibling Lambda packages' setDdbClientForTests. */
@@ -56,14 +70,17 @@ export function setTestOverrides(overrides: {
 	ddb?: DynamoDBDocumentClient | null;
 	ecs?: Pick<ECSClient, 'send'> | null;
 	ec2?: Pick<EC2Client, 'send'> | null;
+	elb?: Pick<ElasticLoadBalancingV2Client, 'send'> | null;
 	fetchImpl?: typeof fetch | null;
 }): void {
 	if ('ddb' in overrides) cachedDdb = overrides.ddb ?? null;
 	if ('ecs' in overrides) cachedEcs = overrides.ecs ?? null;
 	if ('ec2' in overrides) cachedEc2 = overrides.ec2 ?? null;
+	if ('elb' in overrides) cachedElb = overrides.elb ?? null;
 	if ('fetchImpl' in overrides) fetchOverride = overrides.fetchImpl ?? null;
 	cachedStore = null;
 	cachedRunner = null;
+	cachedAlbManager = null;
 }
 
 function getDdb(): DynamoDBDocumentClient {
@@ -76,6 +93,21 @@ function getEcs(): Pick<ECSClient, 'send'> {
 
 function getEc2(): Pick<EC2Client, 'send'> {
 	return cachedEc2 ?? new EC2Client({});
+}
+
+function getElb(): Pick<ElasticLoadBalancingV2Client, 'send'> {
+	return cachedElb ?? new ElasticLoadBalancingV2Client({});
+}
+
+function getAlbManager(): AlbManager {
+	if (cachedAlbManager) return cachedAlbManager;
+	cachedAlbManager = new AlbManager({
+		elb: getElb(),
+		listenerArn: requireEnv('ALB_LISTENER_ARN'),
+		vpcId: requireEnv('SANDBOX_VPC_ID'),
+		previewDomain: requireEnv('PREVIEW_DOMAIN'),
+	});
+	return cachedAlbManager;
 }
 
 function getStore(): SandboxInstancesStore {
@@ -158,12 +190,22 @@ async function createInstance(event: APIGatewayProxyEventV2): Promise<APIGateway
 	const projectName = typeof body.projectName === 'string' ? body.projectName : undefined;
 	const envVars = typeof body.envVars === 'object' && body.envVars !== null ? (body.envVars as Record<string, string>) : undefined;
 	const initCommand = typeof body.initCommand === 'string' ? body.initCommand : 'bun run dev';
+	// Caller-supplied, matching aws/harness-orchestrator-lambda/src/handler.ts's
+	// createSession sessionId pattern: this whole call can legitimately run
+	// past API Gateway's ~29s hard integration timeout (ECS RunTask + wait
+	// for networking + bootstrap easily exceeds it), so
+	// aws/agent-runtime/src/sandbox-client.ts needs to know the instanceId
+	// up front to poll GET .../status by if the synchronous response never
+	// arrives -- it can't wait for a response body that never came back.
+	const instanceId = typeof body.instanceId === 'string' && body.instanceId ? body.instanceId : randomUUID();
 
 	if (!projectName) return errorResponse('projectName is required', 400);
 
-	const instanceId = randomUUID();
 	const store = getStore();
 	const runner = getRunner();
+
+	const existing = await store.get(instanceId);
+	if (existing) return errorResponse('Instance already exists', 409);
 
 	let taskArn: string;
 	try {
@@ -172,38 +214,75 @@ async function createInstance(event: APIGatewayProxyEventV2): Promise<APIGateway
 		return errorResponse((err as Error).message, 502);
 	}
 
+	const createdAt = Date.now();
 	await store.put({
 		instanceId,
 		taskArn,
 		status: 'PROVISIONING',
 		projectName,
-		createdAt: Date.now(),
+		createdAt,
+		lastActivityAt: createdAt,
 		expiresAt: newExpiresAt(),
 	});
 
 	let publicIp: string;
+	let privateIp: string;
 	try {
-		publicIp = await runner.waitForPublicIp(taskArn);
+		({ publicIp, privateIp } = await runner.waitForNetworking(taskArn));
 	} catch (err) {
 		await store.update(instanceId, { status: 'ERROR', error: (err as Error).message });
+		// A task that never reached usable networking is not going to
+		// self-correct -- leaving it running just burns money with nothing
+		// that can ever reach or clean it up (shutdownInstance needs a
+		// non-ERROR record to route through the control plane, and nothing
+		// else in this codebase sweeps ECS directly). Best-effort: a stop
+		// failure here shouldn't mask the real error being returned.
+		await runner.stopTask(taskArn).catch((stopErr) => {
+			console.error('Failed to stop task after networking failure', instanceId, stopErr);
+		});
 		return errorResponse((err as Error).message, 502);
 	}
-	await store.update(instanceId, { publicIp, status: 'RUNNING' });
+	await store.update(instanceId, { publicIp, privateIp, status: 'RUNNING' });
 
 	try {
 		const cp = controlPlaneFor(publicIp);
 		const result = await bootstrapWithRetry(cp, { files, projectName, envVars, initCommand });
 		if (result.status >= 400) {
 			await store.update(instanceId, { status: 'ERROR', error: JSON.stringify(result.body) });
+			await runner.stopTask(taskArn).catch((stopErr) => {
+				console.error('Failed to stop task after bootstrap failure', instanceId, stopErr);
+			});
 			return errorResponse('Sandbox bootstrap failed', 502);
 		}
+
+		// Registered only once bootstrap succeeds -- an instance that never
+		// gets past bootstrap may never have DELETE called on it, and
+		// registering earlier would leave that target group/rule orphaned
+		// with nothing to clean it up (see alb-manager.ts's own comments for
+		// what's created here).
+		let externalPreviewURL: string | undefined;
+		try {
+			const route = await getAlbManager().registerRoute(instanceId, privateIp);
+			await store.update(instanceId, { albRuleArn: route.ruleArn, albTargetGroupArn: route.targetGroupArn, externalPreviewURL: `https://${route.hostname}` });
+			externalPreviewURL = `https://${route.hostname}`;
+		} catch (err) {
+			// The sandbox itself is fine at this point -- falling back to the
+			// raw-IP previewURL (still valid, just not TLS-fronted) beats
+			// failing the whole instance creation over ALB routing trouble.
+			console.error('ALB route registration failed, falling back to direct previewURL', err);
+		}
+
 		return successResponse({
 			...(result.body as Record<string, unknown>),
 			runId: instanceId,
 			previewURL: `http://${publicIp}:${DEV_PORT}`,
+			...(externalPreviewURL ? { externalPreviewURL } : {}),
 		});
 	} catch (err) {
 		await store.update(instanceId, { status: 'ERROR', error: (err as Error).message });
+		await runner.stopTask(taskArn).catch((stopErr) => {
+			console.error('Failed to stop task after unexpected error', instanceId, stopErr);
+		});
 		return errorResponse((err as Error).message, 502);
 	}
 }
@@ -220,12 +299,25 @@ async function getInstanceDetails(instanceId: string): Promise<APIGatewayProxyRe
 	return successResponse({ instance: toInstanceDetails(record) });
 }
 
+/**
+ * Matches worker/services/sandbox/sandboxTypes.ts's
+ * BootstrapStatusResponseSchema (the original contract this route is
+ * porting) -- `pending` covers both "ECS task still launching" and "task
+ * up but its own POST /bootstrap hasn't finished", `previewURL` is filled
+ * in here (the orchestrator's job -- the container itself has no way to
+ * know its own public IP/ALB hostname). This is what
+ * aws/agent-runtime/src/sandbox-client.ts polls when createInstance's own
+ * synchronous response never arrives (API Gateway's ~29s hard timeout can
+ * outrun the real launch+bootstrap time), so runId must always be present
+ * regardless of which branch below returns.
+ */
 async function getInstanceStatus(instanceId: string): Promise<APIGatewayProxyResultV2> {
 	const record = await getStore().get(instanceId);
 	if (!record) return errorResponse('Instance not found', 404);
 
 	if (record.status !== 'RUNNING' || !record.publicIp) {
 		return successResponse({
+			runId: instanceId,
 			pending: record.status === 'PROVISIONING',
 			isHealthy: false,
 			error: record.status === 'ERROR' ? record.error : undefined,
@@ -233,7 +325,25 @@ async function getInstanceStatus(instanceId: string): Promise<APIGatewayProxyRes
 	}
 
 	const result = await controlPlaneFor(record.publicIp).status();
-	return successResponse(result.body);
+	const body = result.body as Record<string, unknown>;
+	return successResponse({
+		...body,
+		runId: instanceId,
+		previewURL: `http://${record.publicIp}:${DEV_PORT}`,
+		...(record.externalPreviewURL ? { externalPreviewURL: record.externalPreviewURL } : {}),
+	});
+}
+
+/** Refreshes the idle clock reaper.ts sweeps on -- called by aws/harness-orchestrator-lambda's sandbox-activity-client.ts whenever the harness pushes a real generation event, and available for any other caller with a live signal. Mirrors the harness orchestrator's own recordActivity route. */
+async function recordActivity(instanceId: string): Promise<APIGatewayProxyResultV2> {
+	const store = getStore();
+	const record = await store.get(instanceId);
+	if (!record) return errorResponse('Instance not found', 404);
+
+	if (record.status === 'RUNNING' || record.status === 'PROVISIONING') {
+		await store.update(instanceId, { lastActivityAt: Date.now() });
+	}
+	return successResponse({ status: record.status });
 }
 
 async function shutdownInstance(instanceId: string): Promise<APIGatewayProxyResultV2> {
@@ -246,6 +356,9 @@ async function shutdownInstance(instanceId: string): Promise<APIGatewayProxyResu
 		} catch {
 			// Best-effort -- the task gets stopped below regardless.
 		}
+	}
+	if (record.albRuleArn || record.albTargetGroupArn) {
+		await getAlbManager().deregisterRoute({ ruleArn: record.albRuleArn, targetGroupArn: record.albTargetGroupArn });
 	}
 	await getRunner().stopTask(record.taskArn);
 	await getStore().delete(instanceId);
@@ -290,6 +403,10 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 			case 'DELETE /api/sandbox/instances/{id}':
 				if (!instanceId) return errorResponse('Instance ID is required', 400);
 				return await shutdownInstance(instanceId);
+
+			case 'POST /api/sandbox/instances/{id}/activity':
+				if (!instanceId) return errorResponse('Instance ID is required', 400);
+				return await recordActivity(instanceId);
 
 			case 'POST /api/sandbox/instances/{id}/files': {
 				if (!instanceId) return errorResponse('Instance ID is required', 400);

@@ -103,11 +103,20 @@ async function handleBootstrap(req: IncomingMessage, res: ServerResponse): Promi
 			await writeFile(dest, file.fileContents, 'utf-8');
 		}
 
-		// Install deps -- prefer bun (already in the base image), fall back to npm.
-		try {
+		// aws/agent-runtime's harness-generation.ts creates the sandbox
+		// instance up front with an empty file list and a no-op initCommand
+		// ('true') -- files arrive incrementally afterward as the harness
+		// generates them. There's nothing to install yet in that case (no
+		// package.json), so skip straight to initCommand instead of running
+		// bun install against an empty workspace.
+		//
+		// npm isn't installed in this image (see aws/sandbox-container's
+		// Dockerfile -- plain oven/bun, no Node/npm), so a bun-install
+		// failure has no real fallback here; let the actual bun error
+		// surface instead of masking it behind a guaranteed-to-fail
+		// "npm: not found".
+		if (body.files.length > 0) {
 			await exec('bun install', { cwd: WORKSPACE_DIR, timeout: 120_000 });
-		} catch {
-			await exec('npm install', { cwd: WORKSPACE_DIR, timeout: 180_000 });
 		}
 
 		const initCommand = body.initCommand ?? 'bun run dev';

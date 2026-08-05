@@ -22,11 +22,21 @@ export interface SandboxInstanceRecord {
 	instanceId: string;
 	taskArn: string;
 	publicIp?: string;
+	privateIp?: string;
 	status: SandboxInstanceStatus;
 	projectName: string;
 	createdAt: number;
+	/** Refreshed by POST .../activity (aws/harness-orchestrator-lambda forwards real generation events here, see sandbox-activity-client.ts) and by reaper.ts's own idle-sweep criterion -- distinct from expiresAt, which stays a fixed hard cap from creation regardless of activity. */
+	lastActivityAt: number;
 	expiresAt: number;
 	error?: string;
+	/** ALB target-group/rule ARNs (aws/infra/sandbox/alb.tf, alb-manager.ts) for the
+	 *  browser-facing HTTPS preview route -- absent if registration never
+	 *  completed (e.g. bootstrap failed first), in which case shutdown just
+	 *  skips ALB cleanup. */
+	albRuleArn?: string;
+	albTargetGroupArn?: string;
+	externalPreviewURL?: string;
 }
 
 // Sandbox sessions are short-lived; TTL cleans up stale rows (e.g. a

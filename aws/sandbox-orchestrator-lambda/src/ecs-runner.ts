@@ -2,10 +2,10 @@
  * Drives ECS RunTask/DescribeTasks/StopTask for aws/infra/sandbox's
  * Fargate cluster -- launches one task per sandbox instance (no
  * standing pool, per that stack's design), waits for it to reach
- * RUNNING with an attached ENI, then resolves the ENI's public IP
- * (the task's `assign_public_ip = true` config means there's no ALB
- * to look this up through -- see aws/infra/sandbox/main.tf's header
- * comment for why).
+ * RUNNING with an attached ENI, then resolves both the ENI's public IP
+ * (control-plane calls from this Lambda, and direct-debug access) and
+ * private IP (the ALB target -- aws/infra/sandbox/alb.tf's preview ALB
+ * lives in the same VPC and reaches tasks over private networking).
  */
 
 import { RunTaskCommand, DescribeTasksCommand, StopTaskCommand, type ECSClient } from '@aws-sdk/client-ecs';
@@ -69,8 +69,13 @@ export class EcsRunner {
 		return taskArn;
 	}
 
-	/** Polls until the task is RUNNING with a resolvable public IP, or throws. */
-	async waitForPublicIp(taskArn: string): Promise<string> {
+	/**
+	 * Polls until the task is RUNNING with a resolvable public IP, or throws.
+	 * Also resolves the private IP -- needed as the ALB target (aws/infra/sandbox/alb.tf's
+	 * ALB lives in the same VPC and reaches tasks over private networking,
+	 * not through the internet gateway the public IP implies).
+	 */
+	async waitForNetworking(taskArn: string): Promise<{ publicIp: string; privateIp: string }> {
 		const deadline = Date.now() + this.runningTimeoutMs;
 
 		while (Date.now() < deadline) {
@@ -86,8 +91,10 @@ export class EcsRunner {
 			if (task?.lastStatus === 'RUNNING') {
 				const eniId = task.attachments?.[0]?.details?.find((d) => d.name === 'networkInterfaceId')?.value;
 				if (eniId) {
-					const publicIp = await this.resolvePublicIp(eniId);
-					if (publicIp) return publicIp;
+					const networking = await this.resolveNetworking(eniId);
+					if (networking?.publicIp && networking.privateIp) {
+						return { publicIp: networking.publicIp, privateIp: networking.privateIp };
+					}
 				}
 			}
 
@@ -97,11 +104,12 @@ export class EcsRunner {
 		throw new Error('Timed out waiting for sandbox task to reach RUNNING with a public IP');
 	}
 
-	private async resolvePublicIp(networkInterfaceId: string): Promise<string | undefined> {
+	private async resolveNetworking(networkInterfaceId: string): Promise<{ publicIp?: string; privateIp?: string } | undefined> {
 		const result = await this.config.ec2.send(
 			new DescribeNetworkInterfacesCommand({ NetworkInterfaceIds: [networkInterfaceId] }),
 		);
-		return result.NetworkInterfaces?.[0]?.Association?.PublicIp;
+		const eni = result.NetworkInterfaces?.[0];
+		return { publicIp: eni?.Association?.PublicIp, privateIp: eni?.PrivateIpAddress };
 	}
 
 	async stopTask(taskArn: string): Promise<void> {

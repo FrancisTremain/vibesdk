@@ -60,10 +60,15 @@ resource "aws_iam_role_policy" "sandbox_orchestrator_lambda_dynamodb" {
   })
 }
 
-# ecs:RunTask/StopTask/DescribeTasks scoped to this cluster's task
-# definition family; the two iam:PassRole grants are what let RunTask
-# actually launch a task using the execution/task roles main.tf
-# defines (ECS itself requires the caller to hold PassRole for both).
+# ecs:RunTask's resource is the task *definition* family; ecs:StopTask and
+# ecs:DescribeTasks instead operate on running task *instances*, a
+# different ARN shape (arn:...:task/<cluster>/<task-id>) -- lumping all
+# three under the task-definition ARN silently leaves StopTask/DescribeTasks
+# unauthorized (caught live: DescribeTasks failing with AccessDenied for
+# the sandbox orchestrator during a real generation run). The two
+# iam:PassRole grants are what let RunTask actually launch a task using
+# the execution/task roles main.tf defines (ECS itself requires the
+# caller to hold PassRole for both).
 resource "aws_iam_role_policy" "sandbox_orchestrator_lambda_ecs" {
   name = "vibesdk-sandbox-orchestrator-lambda-ecs"
   role = aws_iam_role.sandbox_orchestrator_lambda.id
@@ -73,8 +78,31 @@ resource "aws_iam_role_policy" "sandbox_orchestrator_lambda_ecs" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["ecs:RunTask", "ecs:StopTask", "ecs:DescribeTasks"]
+        Action   = ["ecs:RunTask"]
         Resource = [aws_ecs_task_definition.sandbox.arn, replace(aws_ecs_task_definition.sandbox.arn, ":${aws_ecs_task_definition.sandbox.revision}", ":*")]
+        Condition = {
+          ArnEquals = { "ecs:cluster" = aws_ecs_cluster.sandbox.arn }
+        }
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ecs:StopTask", "ecs:DescribeTasks"]
+        Resource = "${replace(aws_ecs_cluster.sandbox.arn, "cluster/", "task/")}/*"
+        Condition = {
+          ArnEquals = { "ecs:cluster" = aws_ecs_cluster.sandbox.arn }
+        }
+      },
+      {
+        # ListTasks (sandbox-orchestrator-lambda/src/reaper.ts's sweep)
+        # authorizes against a container-instance/* resource pattern, not
+        # the cluster ARN itself or a task/* pattern like StopTask/
+        # DescribeTasks above -- confirmed live (AccessDeniedException
+        # naming exactly this ARN shape) even though Fargate tasks have no
+        # real EC2 container instances behind them; ECS's IAM model still
+        # evaluates ListTasks this way regardless of launch type.
+        Effect   = "Allow"
+        Action   = "ecs:ListTasks"
+        Resource = "${replace(aws_ecs_cluster.sandbox.arn, "cluster/", "container-instance/")}/*"
         Condition = {
           ArnEquals = { "ecs:cluster" = aws_ecs_cluster.sandbox.arn }
         }
@@ -89,6 +117,43 @@ resource "aws_iam_role_policy" "sandbox_orchestrator_lambda_ecs" {
         Effect   = "Allow"
         Action   = "ec2:DescribeNetworkInterfaces"
         Resource = "*" # DescribeNetworkInterfaces does not support resource-level restriction.
+      },
+    ]
+  })
+}
+
+# alb-manager.ts's target-group/rule lifecycle (one pair created per
+# session, torn down on shutdown -- see alb.tf's header comment for why
+# this exists at all). CreateTargetGroup/DescribeRules/DescribeTargetGroups
+# don't support resource-level restriction (the target group ARN doesn't
+# exist yet when CreateTargetGroup is called, and Describe* need to see
+# every target group/rule to find a free listener-rule priority); the
+# rest are scoped to this stack's own listener and the "sbx-" target-group
+# name prefix alb-manager.ts always uses.
+resource "aws_iam_role_policy" "sandbox_orchestrator_lambda_elb" {
+  name = "vibesdk-sandbox-orchestrator-lambda-elb"
+  role = aws_iam_role.sandbox_orchestrator_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["elasticloadbalancing:CreateTargetGroup", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetGroups"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["elasticloadbalancing:DeleteTargetGroup", "elasticloadbalancing:RegisterTargets", "elasticloadbalancing:DeregisterTargets", "elasticloadbalancing:DescribeTargetHealth"]
+        Resource = "arn:aws:elasticloadbalancing:${var.aws_region}:${data.aws_caller_identity.current.account_id}:targetgroup/sbx-*/*"
+      },
+      {
+        Effect = "Allow"
+        Action = ["elasticloadbalancing:CreateRule", "elasticloadbalancing:DeleteRule"]
+        Resource = [
+          aws_lb_listener.sandbox_preview_https.arn,
+          "arn:aws:elasticloadbalancing:${var.aws_region}:${data.aws_caller_identity.current.account_id}:listener-rule/app/${aws_lb.sandbox_preview.name}/*",
+        ]
       },
     ]
   })
@@ -122,10 +187,81 @@ resource "aws_lambda_function" "sandbox_orchestrator" {
       ECS_CONTAINER_NAME      = "sandbox"
       CONTROLPLANE_SECRET     = random_password.controlplane_secret.result
       ORCHESTRATOR_SECRET     = random_password.orchestrator_secret.result
+      ALB_LISTENER_ARN        = aws_lb_listener.sandbox_preview_https.arn
+      SANDBOX_VPC_ID          = aws_vpc.sandbox.id
+      PREVIEW_DOMAIN          = var.preview_domain
     }
   }
 
   depends_on = [aws_cloudwatch_log_group.sandbox_orchestrator_lambda]
+}
+
+# Scheduled safety net against orphaned sandbox ECS tasks -- see
+# sandbox-orchestrator-lambda/src/reaper.ts's header comment for why this
+# exists as a second, independent line of defense beyond createInstance's
+# own stopTask-on-failure cleanup (a live incident during this migration
+# found 18 tasks running with zero DynamoDB tracking records, silently
+# accruing cost for days -- the table's own TTL deletes the tracking row,
+# not the actual ECS task). Reuses the orchestrator's IAM role/zip rather
+# than standing up a parallel package: same account, same cluster, and the
+# permissions it needs (ecs:ListTasks/StopTask, dynamodb Scan/DeleteItem,
+# elb DeleteRule/DeleteTargetGroup) are already granted to that role.
+resource "aws_cloudwatch_log_group" "sandbox_reaper_lambda" {
+  name              = "/aws/lambda/vibesdk-sandbox-reaper"
+  retention_in_days = 14
+}
+
+resource "aws_lambda_function" "sandbox_reaper" {
+  function_name = "vibesdk-sandbox-reaper"
+  role          = aws_iam_role.sandbox_orchestrator_lambda.arn
+  handler       = "reaper.handler"
+  runtime       = "nodejs20.x"
+  memory_size   = var.lambda_memory_mb
+  # Just ListTasks + a handful of StopTask/DeleteItem/deregister calls per
+  # run, not a cold-start-and-bootstrap sandbox -- nowhere near
+  # orchestrator_lambda_timeout_seconds's 180s.
+  timeout = 60
+
+  filename         = "${path.module}/../../sandbox-orchestrator-lambda/sandbox-orchestrator-lambda.zip"
+  source_code_hash = filebase64sha256("${path.module}/../../sandbox-orchestrator-lambda/sandbox-orchestrator-lambda.zip")
+
+  environment {
+    variables = {
+      SANDBOX_INSTANCES_TABLE = aws_dynamodb_table.sandbox_instances.name
+      ECS_CLUSTER             = aws_ecs_cluster.sandbox.name
+      ALB_LISTENER_ARN        = aws_lb_listener.sandbox_preview_https.arn
+      SANDBOX_VPC_ID          = aws_vpc.sandbox.id
+      PREVIEW_DOMAIN          = var.preview_domain
+      # Matches reaper.ts's own default -- set explicitly rather than left
+      # implicit so this value is the one place both the schedule interval
+      # below and the actual idle threshold need to be kept sane relative
+      # to each other (checking every 5 min against a 15 min threshold
+      # gives a worst-case detection lag of ~5 min past the real cutoff,
+      # not a full extra sweep interval).
+      IDLE_TIMEOUT_SECONDS = "900"
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.sandbox_reaper_lambda]
+}
+
+resource "aws_cloudwatch_event_rule" "sandbox_reaper_schedule" {
+  name                = "vibesdk-sandbox-reaper-schedule"
+  description         = "Periodic sweep for orphaned/expired/idle sandbox ECS tasks -- see aws_lambda_function.sandbox_reaper's comment. 5 minutes so a 15-minute idle threshold is enforced with reasonable precision, not just eventually."
+  schedule_expression = "rate(5 minutes)"
+}
+
+resource "aws_cloudwatch_event_target" "sandbox_reaper" {
+  rule = aws_cloudwatch_event_rule.sandbox_reaper_schedule.name
+  arn  = aws_lambda_function.sandbox_reaper.arn
+}
+
+resource "aws_lambda_permission" "sandbox_reaper_eventbridge_invoke" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.sandbox_reaper.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.sandbox_reaper_schedule.arn
 }
 
 # Shared secret this Lambda's own caller (the not-yet-built
@@ -135,6 +271,26 @@ resource "aws_lambda_function" "sandbox_orchestrator" {
 resource "random_password" "orchestrator_secret" {
   length  = 32
   special = false
+}
+
+# Bridges this endpoint/secret into aws/infra/harness (a separate root
+# module, so it can't reference this module's resources directly) -- same
+# cross-module SSM pattern as aws/infra/agent-runtime.tf's
+# agent_connections_table_name/agent_runtime_ws_management_endpoint
+# bridge into that same harness module. Lets
+# aws/harness-orchestrator-lambda/src/sandbox-activity-client.ts forward
+# real generation activity as this instance's own activity signal
+# (reaper.ts's idle-sweep) without the caller resupplying it.
+resource "aws_ssm_parameter" "sandbox_orchestrator_api_endpoint" {
+  name  = "/vibesdk/sandbox_orchestrator_api_endpoint"
+  type  = "String"
+  value = aws_apigatewayv2_api.sandbox_orchestrator_http.api_endpoint
+}
+
+resource "aws_ssm_parameter" "sandbox_orchestrator_secret_bridge" {
+  name  = "/vibesdk/sandbox_orchestrator_secret"
+  type  = "SecureString"
+  value = random_password.orchestrator_secret.result
 }
 
 resource "aws_apigatewayv2_api" "sandbox_orchestrator_http" {
@@ -161,6 +317,7 @@ locals {
     "GET /api/sandbox/instances/{id}",
     "GET /api/sandbox/instances/{id}/status",
     "DELETE /api/sandbox/instances/{id}",
+    "POST /api/sandbox/instances/{id}/activity",
     "POST /api/sandbox/instances/{id}/files",
     "GET /api/sandbox/instances/{id}/files",
     "POST /api/sandbox/instances/{id}/commands",

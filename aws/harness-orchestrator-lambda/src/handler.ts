@@ -27,6 +27,7 @@ import { EcsRunner } from './ecs-runner';
 import { HarnessSessionsStore, newExpiresAt } from './sessions-store';
 import { ControlPlaneClient, type HarnessStatus } from './control-plane-client';
 import { DynamoDbConnectionsLookup, relayEvent, type ConnectionsLookup } from './event-relay';
+import { touchSandboxActivity } from './sandbox-activity-client';
 import { errorResponse, successResponse } from './response';
 
 interface IdleSweepEvent {
@@ -140,8 +141,37 @@ async function receiveEvent(sessionId: string, event: APIGatewayProxyEventV2): P
 	const body = parseJsonBody(event);
 	if (!body || typeof body.type !== 'string') return errorResponse('Event body must include a type', 400);
 
-	await relayEvent(getConnectionsLookup(), getManagementApi(), sessionId, body);
+	await Promise.all([
+		relayEvent(getConnectionsLookup(), getManagementApi(), sessionId, body),
+		recordEventActivity(sessionId),
+	]);
 	return successResponse({ relayed: true });
+}
+
+/**
+ * Refreshes this session's own idle clock and forwards the same signal to
+ * the underlying sandbox instance (touchSandboxActivity) -- real
+ * generation activity (file writes, commands, phase updates) reaching
+ * here is a far better idle signal than the coarse record_activity UI
+ * heartbeat alone, for both this session's own idleSweep and
+ * aws/sandbox-orchestrator-lambda's reaper. Best-effort: any failure here
+ * must not fail the event relay in receiveEvent above, which is the part
+ * users actually notice.
+ */
+async function recordEventActivity(sessionId: string): Promise<void> {
+	try {
+		const store = getStore();
+		const record = await store.get(sessionId);
+		if (!record) return;
+		if (record.status === 'RUNNING') {
+			await store.update(sessionId, { lastActivityAt: Date.now(), expiresAt: newExpiresAt() });
+		}
+		if (record.sandboxInstanceId) {
+			await touchSandboxActivity(record.sandboxInstanceId, fetchOverride ?? fetch);
+		}
+	} catch (err) {
+		console.error('Failed to record activity from harness event', sessionId, err);
+	}
 }
 
 function idleTimeoutSeconds(): number {
@@ -249,6 +279,7 @@ async function createSession(event: APIGatewayProxyEventV2): Promise<APIGatewayP
 	const sessionId = typeof body.sessionId === 'string' && body.sessionId ? body.sessionId : randomUUID();
 	const userId = typeof body.userId === 'string' ? body.userId : undefined;
 	const useUserCredentials = body.useUserCredentials === true;
+	const sandboxInstanceId = typeof body.sandboxInstanceId === 'string' ? body.sandboxInstanceId : undefined;
 
 	if (!userPrompt) return errorResponse('userPrompt is required', 400);
 	if (!sandboxControlUrl || !sandboxControlSecret) return errorResponse('sandboxControlUrl and sandboxControlSecret are required', 400);
@@ -265,6 +296,7 @@ async function createSession(event: APIGatewayProxyEventV2): Promise<APIGatewayP
 		sandboxControlSecret,
 		userId,
 		useUserCredentials,
+		sandboxInstanceId,
 		createdAt: now,
 		lastActivityAt: now,
 		expiresAt: newExpiresAt(),

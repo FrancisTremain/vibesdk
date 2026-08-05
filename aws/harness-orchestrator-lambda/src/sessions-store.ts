@@ -40,6 +40,8 @@ export interface HarnessSessionRecord {
 	/** Captured once at session creation so a resume-after-idle-teardown relaunch stays on the same auth branch without the caller resupplying it -- see aws/agent-harness/src/credentials-client.ts. */
 	userId?: string;
 	useUserCredentials?: boolean;
+	/** The sandbox instance this harness session is driving -- captured once at creation (aws/agent-runtime/src/harness-generation.ts passes its own sandbox.runId through) so receiveEvent() can forward real generation activity as the sandbox's own activity signal (aws/sandbox-orchestrator-lambda's reaper idle-sweep), without the caller resupplying it on every event push. */
+	sandboxInstanceId?: string;
 	createdAt: number;
 	lastActivityAt: number;
 	expiresAt: number;

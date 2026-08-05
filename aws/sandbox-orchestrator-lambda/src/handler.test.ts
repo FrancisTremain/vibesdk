@@ -3,6 +3,7 @@ import type { APIGatewayProxyEventV2 } from 'aws-lambda';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { FakeDynamoDocumentClient } from './fake-dynamo';
 import { FakeEcsClient, FakeEc2Client } from './fake-ecs';
+import { FakeElbClient } from './fake-elb';
 import { handler as rawHandler, setTestOverrides } from './handler';
 
 // handler()'s declared return type is the full APIGatewayProxyResultV2
@@ -23,6 +24,9 @@ beforeAll(() => {
 	process.env.ECS_SECURITY_GROUP_ID = 'sg-123';
 	process.env.CONTROLPLANE_SECRET = 'controlplane-test-secret';
 	process.env.ORCHESTRATOR_SECRET = SECRET;
+	process.env.ALB_LISTENER_ARN = 'arn:aws:elasticloadbalancing:ap-southeast-2:111111111111:listener/app/vibesdk-sandbox-preview/x/y';
+	process.env.SANDBOX_VPC_ID = 'vpc-123';
+	process.env.PREVIEW_DOMAIN = 'preview.test';
 });
 
 function event(
@@ -54,13 +58,16 @@ function makeFakeFetch(responses: Record<string, { status: number; body: unknown
 }
 
 let fakeDdb: FakeDynamoDocumentClient;
+let fakeElb: FakeElbClient;
 
 function wire(opts: { ecsOpts?: ConstructorParameters<typeof FakeEcsClient>[0]; publicIp?: string; fetchResponses?: Record<string, { status: number; body: unknown }> } = {}) {
 	fakeDdb = new FakeDynamoDocumentClient();
+	fakeElb = new FakeElbClient();
 	setTestOverrides({
 		ddb: fakeDdb as unknown as DynamoDBDocumentClient,
 		ecs: new FakeEcsClient({ eniId: 'eni-123', ...opts.ecsOpts }),
 		ec2: new FakeEc2Client(opts.publicIp ?? '203.0.113.5'),
+		elb: fakeElb,
 		fetchImpl: makeFakeFetch(opts.fetchResponses ?? {}),
 	});
 }
@@ -96,6 +103,35 @@ describe('createInstance', () => {
 		expect(body.data.previewURL).toBe('http://203.0.113.5:3000');
 		expect(body.data.runId).toBeTruthy();
 		expect(fakeDdb.size).toBe(1);
+
+		// The internal previewURL (used by aws/agent-runtime's deriveControlUrl
+		// to reach the control-plane port) stays the raw IP -- only the
+		// browser-facing field switches to the ALB-fronted HTTPS hostname.
+		expect(body.data.externalPreviewURL).toBe(`https://${body.data.runId}.preview.test`);
+		expect(fakeElb.registeredTargets).toEqual([
+			{ targetGroupArn: expect.stringContaining('sbx-'), id: '10.42.1.10', port: 3000 },
+		]);
+		expect(fakeElb.rules).toHaveLength(1);
+	});
+
+	it('still succeeds (falling back to the raw previewURL) if ALB registration fails', async () => {
+		wire({
+			fetchResponses: {
+				'POST /bootstrap': { status: 200, body: { success: true, processId: 'x', message: 'Bootstrap complete' } },
+			},
+		});
+		fakeElb.failNextCreateRuleWith = 'ValidationException';
+
+		const res = await handler(
+			event('POST /api/sandbox/instances', {
+				body: { files: [], projectName: 'demo-app' },
+			}),
+		);
+
+		expect(res.statusCode).toBe(200);
+		const body = JSON.parse(res.body!) as any;
+		expect(body.data.previewURL).toBe('http://203.0.113.5:3000');
+		expect(body.data.externalPreviewURL).toBeUndefined();
 	});
 
 	it('returns 502 and does not create a DynamoDB record when RunTask fails', async () => {
@@ -110,6 +146,75 @@ describe('createInstance', () => {
 	it('requires a projectName', async () => {
 		const res = await handler(event('POST /api/sandbox/instances', { body: { files: [] } }));
 		expect(res.statusCode).toBe(400);
+	});
+
+	it('stops the task when bootstrap returns an error status, instead of leaving it running orphaned', async () => {
+		const ecs = new FakeEcsClient({ eniId: 'eni-123' });
+		fakeDdb = new FakeDynamoDocumentClient();
+		fakeElb = new FakeElbClient();
+		setTestOverrides({
+			ddb: fakeDdb as unknown as DynamoDBDocumentClient,
+			ecs,
+			ec2: new FakeEc2Client('203.0.113.5'),
+			elb: fakeElb,
+			fetchImpl: makeFakeFetch({
+				'POST /bootstrap': { status: 500, body: { success: false, message: 'boom' } },
+			}),
+		});
+
+		const res = await handler(event('POST /api/sandbox/instances', { body: { files: [], projectName: 'demo-app' } }));
+
+		expect(res.statusCode).toBe(502);
+		expect(ecs.stopTaskCalls).toHaveLength(1);
+	});
+
+	it('stops the task when waitForNetworking fails, instead of leaving it running orphaned', async () => {
+		const ecs = new FakeEcsClient({ lastStatus: 'STOPPED', stoppedReason: 'OutOfMemoryError' });
+		fakeDdb = new FakeDynamoDocumentClient();
+		fakeElb = new FakeElbClient();
+		setTestOverrides({
+			ddb: fakeDdb as unknown as DynamoDBDocumentClient,
+			ecs,
+			ec2: new FakeEc2Client('203.0.113.5'),
+			elb: fakeElb,
+			fetchImpl: makeFakeFetch({}),
+		});
+
+		const res = await handler(event('POST /api/sandbox/instances', { body: { files: [], projectName: 'demo-app' } }));
+
+		expect(res.statusCode).toBe(502);
+		expect(ecs.stopTaskCalls).toHaveLength(1);
+	});
+
+	it('uses a caller-supplied instanceId instead of generating one, so a poll-fallback after a 503 can find the same instance', async () => {
+		wire({
+			fetchResponses: {
+				'POST /bootstrap': { status: 200, body: { success: true, processId: 'x', message: 'Bootstrap complete' } },
+			},
+		});
+
+		const res = await handler(
+			event('POST /api/sandbox/instances', {
+				body: { files: [], projectName: 'demo-app', instanceId: 'caller-supplied-id' },
+			}),
+		);
+
+		expect(res.statusCode).toBe(200);
+		const body = JSON.parse(res.body!) as any;
+		expect(body.data.runId).toBe('caller-supplied-id');
+	});
+
+	it('returns 409 when the caller-supplied instanceId already has a record', async () => {
+		wire({
+			fetchResponses: {
+				'POST /bootstrap': { status: 200, body: { success: true, processId: 'x', message: 'Bootstrap complete' } },
+			},
+		});
+		await handler(event('POST /api/sandbox/instances', { body: { files: [], projectName: 'demo-app', instanceId: 'dup-id' } }));
+
+		const res = await handler(event('POST /api/sandbox/instances', { body: { files: [], projectName: 'demo-app', instanceId: 'dup-id' } }));
+
+		expect(res.statusCode).toBe(409);
 	});
 });
 
@@ -132,6 +237,77 @@ describe('getInstanceStatus', () => {
 		expect(res.statusCode).toBe(200);
 		expect(body.data.pending).toBe(true);
 		expect(body.data.isHealthy).toBe(false);
+		expect(body.data.runId).toBe('i1');
+	});
+
+	it('includes previewURL/externalPreviewURL/runId once RUNNING, merged with the container\'s own status -- this is what the poll-fallback in aws/agent-runtime/src/sandbox-client.ts relies on', async () => {
+		wire({ fetchResponses: { 'GET /status': { status: 200, body: { success: true, pending: false, isHealthy: true, processId: 'i1' } } } });
+		await fakeDdb.send(
+			new (await import('@aws-sdk/lib-dynamodb')).PutCommand({
+				TableName: 'x',
+				Item: {
+					instanceId: 'i1',
+					taskArn: 'arn',
+					publicIp: '203.0.113.5',
+					status: 'RUNNING',
+					projectName: 'p',
+					createdAt: Date.now(),
+					expiresAt: 0,
+					externalPreviewURL: 'https://i1.preview.test',
+				},
+			}),
+		);
+
+		const res = await handler(event('GET /api/sandbox/instances/{id}/status', { pathParameters: { id: 'i1' } }));
+		const body = JSON.parse(res.body!) as any;
+
+		expect(res.statusCode).toBe(200);
+		expect(body.data.isHealthy).toBe(true);
+		expect(body.data.runId).toBe('i1');
+		expect(body.data.previewURL).toBe('http://203.0.113.5:3000');
+		expect(body.data.externalPreviewURL).toBe('https://i1.preview.test');
+	});
+});
+
+describe('recordActivity', () => {
+	it('returns 404 for an unknown instance', async () => {
+		const res = await handler(event('POST /api/sandbox/instances/{id}/activity', { pathParameters: { id: 'nope' } }));
+		expect(res.statusCode).toBe(404);
+	});
+
+	it('refreshes lastActivityAt for a RUNNING instance', async () => {
+		const { PutCommand, GetCommand } = await import('@aws-sdk/lib-dynamodb');
+		await fakeDdb.send(
+			new PutCommand({
+				TableName: 'x',
+				Item: { instanceId: 'i1', taskArn: 'arn', publicIp: '203.0.113.5', status: 'RUNNING', projectName: 'p', createdAt: Date.now(), lastActivityAt: 1, expiresAt: 0 },
+			}),
+		);
+
+		const res = await handler(event('POST /api/sandbox/instances/{id}/activity', { pathParameters: { id: 'i1' } }));
+
+		expect(res.statusCode).toBe(200);
+		const record = (await fakeDdb.send(new GetCommand({ TableName: 'x', Key: { instanceId: 'i1' } }))) as {
+			Item: { lastActivityAt: number };
+		};
+		expect(record.Item.lastActivityAt).toBeGreaterThan(1);
+	});
+
+	it('does not touch lastActivityAt for an instance already in ERROR status', async () => {
+		const { PutCommand, GetCommand } = await import('@aws-sdk/lib-dynamodb');
+		await fakeDdb.send(
+			new PutCommand({
+				TableName: 'x',
+				Item: { instanceId: 'i1', taskArn: 'arn', status: 'ERROR', error: 'fetch failed', projectName: 'p', createdAt: Date.now(), lastActivityAt: 1, expiresAt: 0 },
+			}),
+		);
+
+		await handler(event('POST /api/sandbox/instances/{id}/activity', { pathParameters: { id: 'i1' } }));
+
+		const record = (await fakeDdb.send(new GetCommand({ TableName: 'x', Key: { instanceId: 'i1' } }))) as {
+			Item: { lastActivityAt: number };
+		};
+		expect(record.Item.lastActivityAt).toBe(1);
 	});
 });
 
@@ -186,6 +362,31 @@ describe('shutdownInstance', () => {
 		const res = await handler(event('DELETE /api/sandbox/instances/{id}', { pathParameters: { id: 'i1' } }));
 		expect(res.statusCode).toBe(200);
 		expect(fakeDdb.size).toBe(0);
+	});
+
+	it('tears down the ALB rule and target group when the instance registered one', async () => {
+		wire({ fetchResponses: { 'POST /shutdown': { status: 200, body: { success: true } } } });
+		await fakeDdb.send(
+			new (await import('@aws-sdk/lib-dynamodb')).PutCommand({
+				TableName: 'x',
+				Item: {
+					instanceId: 'i1',
+					taskArn: 'arn',
+					publicIp: '203.0.113.5',
+					status: 'RUNNING',
+					projectName: 'p',
+					createdAt: Date.now(),
+					expiresAt: 0,
+					albRuleArn: 'arn:existing-rule',
+					albTargetGroupArn: 'arn:existing-tg',
+				},
+			}),
+		);
+
+		const res = await handler(event('DELETE /api/sandbox/instances/{id}', { pathParameters: { id: 'i1' } }));
+		expect(res.statusCode).toBe(200);
+		expect(fakeElb.deletedRules).toEqual(['arn:existing-rule']);
+		expect(fakeElb.deletedTargetGroups).toEqual(['arn:existing-tg']);
 	});
 });
 

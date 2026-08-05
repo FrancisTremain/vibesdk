@@ -270,7 +270,11 @@ describe('auth-api-lambda handler', () => {
 			await handler(event({ routeKey: 'GET /api/auth/sessions', headers: { authorization: `Bearer ${token}` } })),
 		);
 		expect(result.statusCode).toBe(200);
-		expect(body(result).data.sessions.length).toBeGreaterThanOrEqual(1);
+		const sessions = body(result).data.sessions;
+		expect(sessions.length).toBeGreaterThanOrEqual(1);
+		expect(sessions.some((s: { isCurrent: boolean }) => s.isCurrent === true)).toBe(true);
+		expect(sessions[0]).not.toHaveProperty('accessTokenHash');
+		expect(sessions[0]).not.toHaveProperty('refreshTokenHash');
 	});
 
 	it('revokes a session by id', async () => {

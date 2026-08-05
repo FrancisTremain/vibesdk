@@ -39,6 +39,20 @@ export interface StaticAnalysisResult {
 	typecheck: { issues: unknown[]; summary: { errorCount: number; warningCount: number; infoCount: number }; rawOutput: string };
 }
 
+/** Matches worker/services/sandbox/sandboxTypes.ts's SimpleErrorSchema/RuntimeErrorSchema exactly -- aws/sandbox-controlplane's process-monitor.ts already produces records in this shape, so this is a pass-through, not a new format. */
+export interface RuntimeError {
+	timestamp: string;
+	level: number;
+	message: string;
+	rawOutput: string;
+}
+
+export interface GetErrorsResult {
+	success: boolean;
+	errors: RuntimeError[];
+	hasErrors: boolean;
+}
+
 export class SandboxClient {
 	constructor(private readonly config: SandboxClientConfig) {}
 
@@ -70,5 +84,9 @@ export class SandboxClient {
 
 	runStaticAnalysis(lintFiles?: string[]): Promise<StaticAnalysisResult> {
 		return this.request('POST', '/analysis', { lintFiles });
+	}
+
+	getErrors(): Promise<GetErrorsResult> {
+		return this.request('GET', '/errors');
 	}
 }

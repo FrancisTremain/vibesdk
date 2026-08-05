@@ -383,7 +383,16 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 				const session = await requireUser(event);
 				if (!session) return errorResponse('Unauthorized', 401);
 				const sessions = await getSessions().getUserSessions(session.user.id);
-				return successResponse({ sessions });
+				return successResponse({
+					sessions: sessions.map((s) => ({
+						id: s.id,
+						userAgent: s.userAgent ?? null,
+						ipAddress: s.ipAddress ?? null,
+						lastActivity: s.lastActivity,
+						createdAt: s.createdAt,
+						isCurrent: s.id === session.sessionId,
+					})),
+				});
 			}
 
 			case 'DELETE /api/auth/sessions/{sessionId}': {

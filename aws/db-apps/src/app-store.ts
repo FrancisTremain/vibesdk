@@ -96,6 +96,10 @@ function newId(): string {
 	return crypto.randomUUID();
 }
 
+function isConditionalCheckFailed(err: unknown): boolean {
+	return err instanceof Error && err.name === 'ConditionalCheckFailedException';
+}
+
 function qualifiesForPublicListing(app: Pick<App, 'visibility' | 'userId' | 'status'>): boolean {
 	const visibilityOk = app.visibility === 'public' || app.userId === null;
 	const statusOk = app.status === 'completed' || app.status === 'generating';
@@ -136,6 +140,40 @@ export class AppStore {
 
 		await this.putApp(app);
 		return app;
+	}
+
+	/**
+	 * Idempotent create against a caller-chosen id -- for callers (e.g.
+	 * aws/agent-runtime) where the app id must equal an id already in use
+	 * elsewhere (the chat/session id the frontend routes on), unlike
+	 * createApp's random id. A second call for the same id (e.g. a
+	 * message-handler retry after an optimistic-lock conflict) is a
+	 * no-op that returns the existing row rather than clobbering its
+	 * counters.
+	 */
+	async ensureApp(id: string, appData: NewApp): Promise<App> {
+		const existing = await this.getAppRaw(id);
+		if (existing) return stripStorage(existing);
+
+		const now = Date.now();
+		const app: App = {
+			...appData,
+			id,
+			createdAt: appData.createdAt ?? now,
+			updatedAt: appData.updatedAt ?? now,
+			starCount: 0,
+			favoriteCount: 0,
+			viewCount: 0,
+		};
+		try {
+			await this.putApp(app, true);
+			return app;
+		} catch (err) {
+			if (!isConditionalCheckFailed(err)) throw err;
+			// Raced with another invocation creating the same id concurrently.
+			const raced = await this.getAppRaw(id);
+			return raced ? stripStorage(raced) : app;
+		}
 	}
 
 	async updateApp(appId: string, updates: Partial<App>): Promise<boolean> {
@@ -552,7 +590,7 @@ export class AppStore {
 	// INTERNAL
 	// ========================================
 
-	private async putApp(app: App): Promise<void> {
+	private async putApp(app: App, ifNotExists = false): Promise<void> {
 		const item: StoredApp = {
 			...app,
 			pk: appPk(app.id),
@@ -562,7 +600,13 @@ export class AppStore {
 				? { gsi2pk: LISTING_PARTITION, gsi2sk: app.updatedAt }
 				: {}),
 		};
-		await this.ddb.send(new PutCommand({ TableName: this.tableName, Item: item }));
+		await this.ddb.send(
+			new PutCommand({
+				TableName: this.tableName,
+				Item: item,
+				...(ifNotExists ? { ConditionExpression: 'attribute_not_exists(pk)' } : {}),
+			}),
+		);
 	}
 
 	private async getAppRaw(appId: string): Promise<StoredApp | undefined> {

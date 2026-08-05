@@ -80,6 +80,13 @@ type GenerationCompleteMessage = {
 	type: 'generation_complete';
 	instanceId?: string;
 	previewURL?: string;
+	// AWS agent-runtime (aws/agent-runtime/src/messages.ts) sends this
+	// generation_complete shape instead of the Cloudflare Worker's --
+	// lowercase previewUrl, plus commit metadata, no instanceId/previewURL.
+	previewUrl?: string;
+	projectName?: string;
+	gitCommitSha?: string;
+	gitCommitError?: string;
 };
 
 export type DeploymentStartedMessage = {
@@ -168,6 +175,21 @@ type StaticAnalysisResults = {
 type PhaseUpdateMessage = {
 	type: 'phase_update';
 	phase: { name: string; status: 'started' | 'completed' };
+};
+
+/**
+ * AWS-only (no worker/ counterpart -- Cloudflare's Durable Object has no
+ * comparable cold-start, the DO itself just wakes up). Reports the coarse
+ * ECS RunTask+waitForPublicIp+boot progress for the sandbox and harness
+ * Fargate tasks generate_all launches; see
+ * aws/agent-runtime/src/harness-generation.ts's onProgress. Meant as a
+ * platform-level alert (toast), not a chat message -- see
+ * handle-websocket-message.ts's handling.
+ */
+type InfraStatusMessage = {
+	type: 'infra_status';
+	stage: 'sandbox' | 'harness';
+	status: 'started' | 'completed';
 };
 
 type PhaseGeneratingMessage = {
@@ -608,6 +630,7 @@ export type WebSocketMessage =
 	| CodeFixEdits
     | StaticAnalysisResults
 	| PhaseUpdateMessage
+	| InfraStatusMessage
 	| PhaseGeneratingMessage
 	| PhaseGeneratedMessage
 	| PhaseImplementingMessage

@@ -228,6 +228,23 @@ export function useChat({
 		]);
 	}, []);
 
+	// Guards the poll_generation_status loop below against sending a
+	// second poll while an earlier one's mutate (getSandboxFiles +
+	// commitToGitStorage on the 'done' transition can take a few
+	// seconds) is still in flight -- see the loop's own comment for why
+	// overlapping polls corrupt the session's optimistic lock.
+	const pollInFlightRef = useRef(false);
+	// Flipped true the instant generation_complete/error is handled --
+	// checked directly in the poll tick below (not just via React state)
+	// so an already-scheduled tick can't slip through and get its own
+	// independent generation_complete before the state-driven cleanup
+	// (canPollGeneration -> false) has actually re-rendered.
+	const pollStoppedRef = useRef(false);
+	// True only once 'generation_started' confirms generate_all's own
+	// mutate has landed server-side -- see the poll effect's comment for
+	// why polling any earlier races that still-in-flight mutate.
+	const [canPollGeneration, setCanPollGeneration] = useState(false);
+
 	// Create the WebSocket message handler
 	const handleWebSocketMessage = useMemo(
 		() =>
@@ -280,6 +297,9 @@ export function useChat({
 			onTerminalMessage,
 			onVaultUnlockRequired,
 			clearDeploymentTimeout,
+			onPollResponse: () => { pollInFlightRef.current = false; },
+			onGenerationConfirmed: () => setCanPollGeneration(true),
+			onGenerationSettled: () => { pollStoppedRef.current = true; },
 			onPresentationFileEvent: (evt) => {
 				if (!evt.path.includes('/slides/')) return;
 				window.dispatchEvent(new CustomEvent('presentation-file-event', { detail: evt }));
@@ -342,6 +362,19 @@ export function useChat({
 					}
 				}, 30000);
 
+				// API Gateway WebSocket connections drop after 10 minutes of no
+				// traffic in either direction -- a hard AWS-enforced limit, not
+				// configurable (confirmed live: every open session's connection
+				// cycled almost exactly every 10 minutes, forcing a reconnect and
+				// the "Seems we lost connection for a while there" message even
+				// mid-session with nothing actually wrong). record_activity
+				// already exists server-side for this exact purpose
+				// (aws/agent-runtime/src/messages.ts) but no client code ever
+				// sent it. Interval lives on this connection attempt's closure
+				// (not React state) so it starts/stops in lockstep with the
+				// socket that owns it, same as connectionTimeout above.
+				let heartbeatInterval: ReturnType<typeof setInterval> | undefined;
+
 				ws.addEventListener('open', () => {
 					// Ignore stale open events
 					if (!shouldReconnectRef.current) {
@@ -378,6 +411,12 @@ export function useChat({
 						setIsGenerating(true);
 						sendWebSocketMessage(ws, 'generate_all');
 					}
+
+					// Sent well under API Gateway's 10-minute idle limit to
+					// tolerate normal network jitter.
+					heartbeatInterval = setInterval(() => {
+						sendWebSocketMessage(ws, 'record_activity');
+					}, 4 * 60 * 1000);
 				});
 
 				ws.addEventListener('message', (event) => {
@@ -391,6 +430,7 @@ export function useChat({
 
 				ws.addEventListener('error', (error) => {
 					clearTimeout(connectionTimeout);
+					clearInterval(heartbeatInterval);
 					// Only handle error for the latest attempt and when we should reconnect
 					if (myAttemptId !== connectAttemptIdRef.current) return;
 					if (!shouldReconnectRef.current) return;
@@ -400,6 +440,7 @@ export function useChat({
 
 				ws.addEventListener('close', (event) => {
 					clearTimeout(connectionTimeout);
+					clearInterval(heartbeatInterval);
 					logger.info(
 						`🔌 WebSocket connection closed with code ${event.code}: ${event.reason || 'No reason provided'}`,
 						event,
@@ -474,6 +515,54 @@ export function useChat({
 	}, [connectWithRetry, handleConnectionFailure]);
 
     // No legacy wrapper; call connectWithRetry directly
+
+	// AWS runtime's generate_all only accepts the session and returns once
+	// it's started -- it never pushes a final result on its own (unlike
+	// the harness's own infra_status/terminal_output/phase_update pushes,
+	// which happen mid-run). aws/agent-runtime/src/messages.ts's
+	// poll_generation_status is explicitly designed to be "sent repeatedly
+	// by the client while should_be_generating is true" (that file's own
+	// comment), with the client deciding its own cadence -- but nothing
+	// here ever sent it, so a generation could finish successfully on the
+	// harness (confirmed live via its own /status endpoint reporting
+	// done:true) while the UI sat on "Thinking..." forever, since it never
+	// asked whether the result was ready.
+	//
+	// Gated on canPollGeneration, NOT isGenerating directly: isGenerating
+	// is set optimistically the instant generate_all is *sent*, but that
+	// call's own server-side mutate (startHarnessGeneration -- sandbox +
+	// harness cold start) can take up to a minute. Polling as soon as
+	// isGenerating flips true raced that still-in-flight mutate for the
+	// same DynamoDB item and blew the optimistic-lock retry budget
+	// ("Exceeded lock retry limit (5)", caught live) -- canPollGeneration
+	// only flips true once 'generation_started' confirms the mutate
+	// already landed.
+	useEffect(() => {
+		if (!isGenerating) setCanPollGeneration(false);
+	}, [isGenerating]);
+	useEffect(() => {
+		if (!canPollGeneration || !websocket || websocket.readyState !== WebSocket.OPEN) return;
+		pollInFlightRef.current = false;
+		pollStoppedRef.current = false;
+		const interval = setInterval(() => {
+			// pollStoppedRef: generation_complete/error already landed for
+			// this cycle -- stop immediately rather than waiting for
+			// isGenerating's re-render to tear this interval down (see
+			// that ref's own comment).
+			if (pollStoppedRef.current) return;
+			// Skip this tick entirely if the previous poll hasn't answered
+			// yet (cleared by onPollResponse above, or by the safety-net
+			// timeout below if a response is ever dropped) -- sending
+			// while one's still outstanding is what caused the DynamoDB
+			// optimistic-lock conflicts (caught live: "Exceeded lock retry
+			// limit (5)").
+			if (pollInFlightRef.current) return;
+			pollInFlightRef.current = true;
+			sendWebSocketMessage(websocket, 'poll_generation_status');
+			setTimeout(() => { pollInFlightRef.current = false; }, 15000);
+		}, 3000);
+		return () => clearInterval(interval);
+	}, [canPollGeneration, websocket]);
 
 	useEffect(() => {
 		async function init() {

@@ -22,6 +22,7 @@ function fakeSandbox(overrides: Partial<SandboxClient> = {}): SandboxClient {
 			lint: { issues: [], summary: { errorCount: 0, warningCount: 0, infoCount: 0 } },
 			typecheck: { issues: [], summary: { errorCount: 0, warningCount: 0, infoCount: 0 }, rawOutput: '' },
 		}),
+		getErrors: vi.fn().mockResolvedValue({ success: true, errors: [], hasErrors: false }),
 		...overrides,
 	} as unknown as SandboxClient;
 }
@@ -60,7 +61,7 @@ describe('write_file', () => {
 		expect((result.content[0] as { text: string }).text).toContain('Wrote 1 file');
 	});
 
-	it('pushes a file_generated event per successfully written file', async () => {
+	it('pushes file_generating before and file_generated after each successfully written file, but no post-event for a failed one', async () => {
 		const sandbox = fakeSandbox({
 			writeFiles: vi.fn().mockResolvedValue({
 				success: true,
@@ -84,8 +85,29 @@ describe('write_file', () => {
 			undefined,
 		);
 
-		expect(onEvent).toHaveBeenCalledTimes(1);
+		expect(onEvent).toHaveBeenCalledWith({ type: 'file_generating', filePath: 'a.txt', filePurpose: '' });
+		expect(onEvent).toHaveBeenCalledWith({ type: 'file_generating', filePath: 'b.txt', filePurpose: '' });
 		expect(onEvent).toHaveBeenCalledWith({ type: 'file_generated', file: { filePath: 'a.txt', fileContents: 'hi', filePurpose: '' } });
+		expect(onEvent).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'file_generated', file: expect.objectContaining({ filePath: 'b.txt' }) }));
+		expect(onEvent).toHaveBeenCalledTimes(3);
+	});
+
+	it('treats a second write to the same path as a regeneration, not a fresh generation', async () => {
+		const sandbox = fakeSandbox();
+		const onEvent = vi.fn();
+		const definitions = createHarnessToolDefinitions({ sandbox, onPhaseReport: vi.fn(), onEvent });
+		const handler = getHandler(definitions, 'write_file');
+
+		await handler({ files: [{ filePath: 'a.txt', fileContents: 'v1' }] }, undefined);
+		onEvent.mockClear();
+		await handler({ files: [{ filePath: 'a.txt', fileContents: 'v2' }] }, undefined);
+
+		expect(onEvent).toHaveBeenCalledWith({ type: 'file_regenerating', filePath: 'a.txt' });
+		expect(onEvent).toHaveBeenCalledWith({
+			type: 'file_regenerated',
+			file: { filePath: 'a.txt', fileContents: 'v2', filePurpose: '' },
+			original_issues: '',
+		});
 	});
 });
 
@@ -113,6 +135,37 @@ describe('run_command', () => {
 			expect.objectContaining({ type: 'terminal_output', output: '$ ls\na.txt', outputType: 'stdout' }),
 		);
 	});
+
+	it('pushes command_executing before running, and command_executed after a successful run', async () => {
+		const sandbox = fakeSandbox();
+		const onEvent = vi.fn();
+		const definitions = createHarnessToolDefinitions({ sandbox, onPhaseReport: vi.fn(), onEvent });
+		const handler = getHandler(definitions, 'run_command');
+
+		await handler({ commands: ['ls', 'pwd'] }, undefined);
+
+		expect(onEvent).toHaveBeenCalledWith({ type: 'command_executing', message: 'Running 2 command(s)', commands: ['ls', 'pwd'] });
+		expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'command_executed', commands: ['ls', 'pwd'] }));
+	});
+
+	it('pushes command_execution_failed instead of command_executed when any command fails', async () => {
+		const sandbox = fakeSandbox({
+			executeCommands: vi.fn().mockResolvedValue({
+				success: false,
+				results: [{ command: 'bad-cmd', success: false, output: '', error: 'not found', exitCode: 127 }],
+			}),
+		});
+		const onEvent = vi.fn();
+		const definitions = createHarnessToolDefinitions({ sandbox, onPhaseReport: vi.fn(), onEvent });
+		const handler = getHandler(definitions, 'run_command');
+
+		await handler({ commands: ['bad-cmd'] }, undefined);
+
+		expect(onEvent).toHaveBeenCalledWith(
+			expect.objectContaining({ type: 'command_execution_failed', commands: ['bad-cmd'], error: expect.stringContaining('not found') }),
+		);
+		expect(onEvent).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'command_executed' }));
+	});
 });
 
 describe('run_static_analysis', () => {
@@ -125,5 +178,49 @@ describe('run_static_analysis', () => {
 
 		expect(sandbox.runStaticAnalysis).toHaveBeenCalled();
 		expect((result.content[0] as { text: string }).text).toContain('0 error(s)');
+	});
+
+	it('pushes a static_analysis_results event with the full result', async () => {
+		const sandbox = fakeSandbox();
+		const onEvent = vi.fn();
+		const definitions = createHarnessToolDefinitions({ sandbox, onPhaseReport: vi.fn(), onEvent });
+		const handler = getHandler(definitions, 'run_static_analysis');
+
+		await handler({}, undefined);
+
+		expect(onEvent).toHaveBeenCalledWith({
+			type: 'static_analysis_results',
+			staticAnalysis: {
+				success: true,
+				lint: { issues: [], summary: { errorCount: 0, warningCount: 0, infoCount: 0 } },
+				typecheck: { issues: [], summary: { errorCount: 0, warningCount: 0, infoCount: 0 }, rawOutput: '' },
+			},
+		});
+	});
+});
+
+describe('get_runtime_errors', () => {
+	it('reports no errors when the sandbox has none', async () => {
+		const sandbox = fakeSandbox();
+		const definitions = createHarnessToolDefinitions({ sandbox, onPhaseReport: vi.fn() });
+		const handler = getHandler(definitions, 'get_runtime_errors');
+
+		const result = await handler({}, undefined);
+
+		expect(sandbox.getErrors).toHaveBeenCalled();
+		expect((result.content[0] as { text: string }).text).toBe('No runtime errors found.');
+	});
+
+	it('pushes a runtime_error_found event and surfaces errors in the tool result text', async () => {
+		const error = { timestamp: '2026-01-01T00:00:00.000Z', level: 50, message: 'TypeError: x is not a function', rawOutput: 'raw' };
+		const sandbox = fakeSandbox({ getErrors: vi.fn().mockResolvedValue({ success: true, errors: [error], hasErrors: true }) });
+		const onEvent = vi.fn();
+		const definitions = createHarnessToolDefinitions({ sandbox, onPhaseReport: vi.fn(), onEvent });
+		const handler = getHandler(definitions, 'get_runtime_errors');
+
+		const result = await handler({}, undefined);
+
+		expect(onEvent).toHaveBeenCalledWith({ type: 'runtime_error_found', errors: [error], count: 1 });
+		expect((result.content[0] as { text: string }).text).toContain('TypeError: x is not a function');
 	});
 });

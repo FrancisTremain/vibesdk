@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import type { APIGatewayProxyEventV2 } from 'aws-lambda';
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { FakeDynamoDocumentClient } from './fake-dynamo';
 import { FakeEcsClient, FakeEc2Client } from './fake-ecs';
 import { handler as rawHandler, setTestOverrides } from './handler';
@@ -24,6 +24,8 @@ beforeAll(() => {
 	process.env.AGENT_CONNECTIONS_TABLE = 'vibesdk-agent-connections-test';
 	process.env.AGENT_CONNECTIONS_SESSION_INDEX = 'session_id-index';
 	process.env.WS_MANAGEMENT_ENDPOINT = 'https://ws.test/prod';
+	process.env.SANDBOX_ORCHESTRATOR_ENDPOINT = 'https://sandbox-orchestrator.test';
+	process.env.SANDBOX_ORCHESTRATOR_SECRET = 'sandbox-orchestrator-test-secret';
 });
 
 function event(
@@ -110,6 +112,66 @@ describe('events relay', () => {
 		expect(send).toHaveBeenCalledTimes(1);
 	});
 
+	it('refreshes the session\'s own lastActivityAt/expiresAt when its status is RUNNING', async () => {
+		const query = vi.fn().mockResolvedValue([]);
+		const send = vi.fn().mockResolvedValue({});
+		setTestOverrides({ connectionsLookup: { query }, managementApi: { send } });
+		await putSession({ sessionId: 'session-activity-1', status: 'RUNNING', lastActivityAt: 1, expiresAt: 1 });
+
+		await handler(
+			event('POST /api/harness/sessions/{id}/events', {
+				pathParameters: { id: 'session-activity-1' },
+				headers: { 'x-controlplane-secret': CONTROLPLANE_SECRET },
+				body: { type: 'terminal_output', output: 'building...', outputType: 'stdout', timestamp: Date.now() },
+			}),
+		);
+
+		const record = (await fakeDdb.send(new GetCommand({ TableName: 'x', Key: { sessionId: 'session-activity-1' } }))) as {
+			Item: { lastActivityAt: number; expiresAt: number };
+		};
+		expect(record.Item.lastActivityAt).toBeGreaterThan(1);
+		expect(record.Item.expiresAt).toBeGreaterThan(1);
+	});
+
+	it('forwards the event as an activity touch to the underlying sandbox instance when one is recorded on the session', async () => {
+		const query = vi.fn().mockResolvedValue([]);
+		const send = vi.fn().mockResolvedValue({});
+		const sandboxTouchFetch = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+		setTestOverrides({ connectionsLookup: { query }, managementApi: { send }, fetchImpl: sandboxTouchFetch });
+		await putSession({ sessionId: 'session-activity-2', status: 'RUNNING', sandboxInstanceId: 'sandbox-inst-2' });
+
+		await handler(
+			event('POST /api/harness/sessions/{id}/events', {
+				pathParameters: { id: 'session-activity-2' },
+				headers: { 'x-controlplane-secret': CONTROLPLANE_SECRET },
+				body: { type: 'terminal_output', output: 'building...', outputType: 'stdout', timestamp: Date.now() },
+			}),
+		);
+
+		expect(sandboxTouchFetch).toHaveBeenCalledWith(
+			'https://sandbox-orchestrator.test/api/sandbox/instances/sandbox-inst-2/activity',
+			expect.objectContaining({ method: 'POST', headers: expect.objectContaining({ 'x-orchestrator-secret': 'sandbox-orchestrator-test-secret' }) }),
+		);
+	});
+
+	it('does not touch the sandbox when the session has no sandboxInstanceId recorded', async () => {
+		const query = vi.fn().mockResolvedValue([]);
+		const send = vi.fn().mockResolvedValue({});
+		const sandboxTouchFetch = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+		setTestOverrides({ connectionsLookup: { query }, managementApi: { send }, fetchImpl: sandboxTouchFetch });
+		await putSession({ sessionId: 'session-activity-3', status: 'RUNNING' });
+
+		await handler(
+			event('POST /api/harness/sessions/{id}/events', {
+				pathParameters: { id: 'session-activity-3' },
+				headers: { 'x-controlplane-secret': CONTROLPLANE_SECRET },
+				body: { type: 'terminal_output', output: 'building...', outputType: 'stdout', timestamp: Date.now() },
+			}),
+		);
+
+		expect(sandboxTouchFetch).not.toHaveBeenCalled();
+	});
+
 	it('rejects an event body without a type', async () => {
 		const query = vi.fn().mockResolvedValue([]);
 		const send = vi.fn();
@@ -147,6 +209,32 @@ describe('createSession', () => {
 		expect(body.data.sessionId).toBeTruthy();
 		expect(body.data.agentSessionId).toBe('agent-1');
 		expect(fakeDdb.size).toBe(1);
+	});
+
+	it('stores the caller-supplied sandboxInstanceId on the session record for later activity forwarding', async () => {
+		wire({
+			fetchResponses: {
+				'POST /start': { status: 200, body: { agentSessionId: 'agent-1', done: false, phase: { name: 'planning', status: 'started' } } },
+			},
+		});
+
+		const res = await handler(
+			event('POST /api/harness/sessions', {
+				body: {
+					sessionId: 'session-with-sandbox',
+					userPrompt: 'Build me a todo app',
+					sandboxControlUrl: 'http://198.51.100.9:8080',
+					sandboxControlSecret: 'sandbox-secret',
+					sandboxInstanceId: 'sandbox-inst-created',
+				},
+			}),
+		);
+
+		expect(res.statusCode).toBe(200);
+		const record = (await fakeDdb.send(new GetCommand({ TableName: 'x', Key: { sessionId: 'session-with-sandbox' } }))) as {
+			Item: { sandboxInstanceId?: string };
+		};
+		expect(record.Item.sandboxInstanceId).toBe('sandbox-inst-created');
 	});
 
 	it('returns 502 and leaves no usable record when RunTask fails', async () => {

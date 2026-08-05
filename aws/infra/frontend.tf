@@ -336,7 +336,7 @@ resource "aws_cloudfront_distribution" "site" {
   }
 
   ordered_cache_behavior {
-    path_pattern             = "/api/agent/*"
+    path_pattern             = "/api/agent*"
     allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
     cached_methods           = ["GET", "HEAD"]
     target_origin_id         = "user-api"

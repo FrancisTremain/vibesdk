@@ -16,6 +16,7 @@ import {
     handleRateLimitError,
     handleStreamingMessage,
     appendToolEvent,
+    addOrUpdateMessage,
     type ChatMessage,
 } from './message-helpers';
 import { completeStages, type ProjectStage } from './project-stage-helpers';
@@ -142,6 +143,46 @@ export interface HandleMessageDeps {
         source?: string
     }) => void;
     onVaultUnlockRequired?: (reason: string) => void;
+    /**
+     * Called whenever a response that could be answering an outstanding
+     * poll_generation_status arrives ('phase_update' while still
+     * generating, or the terminal 'generation_complete'/'error') -- lets
+     * the poll loop (use-chat.ts) know it's safe to send the next poll.
+     * Not correlated to a specific request (this protocol has no request
+     * ids), so an unrelated phase_update just unblocks polling a little
+     * early; harmless. Without this, a fixed-interval poll can outrun a
+     * slow poll_generation_status round trip (the 'done' transition
+     * pulls sandbox files and commits to git) and send a second
+     * concurrent mutate against the same DynamoDB item, which fails with
+     * "Exceeded lock retry limit" (caught live).
+     */
+    onPollResponse?: () => void;
+    /**
+     * Called once generate_all's own server-side mutate has actually
+     * completed ('generation_started' arriving -- aws/agent-runtime/src/
+     * messages.ts only sends it after startHarnessGeneration returns,
+     * which alone can take up to a minute on a cold sandbox+harness).
+     * The poll loop must not start before this: setIsGenerating(true) is
+     * set optimistically the instant generate_all is *sent*, so gating
+     * polling on isGenerating alone let poll_generation_status requests
+     * race the still-in-flight generate_all mutate for the same
+     * DynamoDB item -- caught live as the same "Exceeded lock retry
+     * limit" error even after de-duplicating polls against each other.
+     */
+    onGenerationConfirmed?: () => void;
+    /**
+     * Called on 'generation_complete'/'error' -- must take effect
+     * immediately (a plain ref write in the caller, not gated behind a
+     * React state update) so the poll loop's next tick sees it even if
+     * it fires before React has re-rendered isGenerating/canPollGeneration
+     * to false. Once the backend's done-transition became idempotent
+     * (the REVIEWING guard in messages.ts), repeat polls answer almost
+     * instantly, so several in-flight-but-answered ticks could each
+     * independently receive their own real generation_complete before
+     * the state-based stop propagated -- caught live as 4 duplicate
+     * "Code generation has been completed" bubbles.
+     */
+    onGenerationSettled?: () => void;
 }
 
 export function createWebSocketMessageHandler(deps: HandleMessageDeps) {
@@ -204,7 +245,25 @@ export function createWebSocketMessageHandler(deps: HandleMessageDeps) {
             onDebugMessage,
             onTerminalMessage,
             clearDeploymentTimeout,
+            onPollResponse,
+            onGenerationConfirmed,
+            onGenerationSettled,
         } = deps;
+
+        // API Gateway pushes its own system frames directly over the
+        // connection when a Lambda invocation outruns the WebSocket
+        // route's 29s integration wait (e.g. `{"message":"Endpoint
+        // request timed out",...}`, no `type` field at all) -- the real
+        // response can still arrive moments later via a separate
+        // PostToConnection call once that invocation finishes (see
+        // aws/infra/agent-runtime.tf's header comment). These aren't one
+        // of our app's messages; skip them rather than crash reading
+        // `.type.length` below, which previously left `isThinking` stuck
+        // since the switch below never ran to process whatever came next.
+        if (typeof message?.type !== 'string') {
+            logger.warn('Ignoring non-app WebSocket frame:', message);
+            return;
+        }
 
         // Log messages except for frequent ones
         if (message.type !== 'file_chunk_generated' && message.type !== 'cf_agent_state' && message.type.length <= 50) {
@@ -441,6 +500,14 @@ export function createWebSocketMessageHandler(deps: HandleMessageDeps) {
                 const history: ReadonlyArray<ConversationMessage> = state?.runningHistory ?? [];
                 logger.debug('Received conversation_state with messages:', history.length, 'deepDebugSession:', deepDebugSession);
 
+                // Fallback delivery path for the "You" bubble's prompt text:
+                // agent_connected (the primary path) is pushed from the
+                // WebSocket $connect route, which AWS API Gateway cannot
+                // reliably deliver to -- see aws/agent-runtime/src/messages.ts.
+                if (state?.query && !query) {
+                    setQuery(state.query);
+                }
+
                 const restoredMessages: ChatMessage[] = [];
                 let currentAssistant: ChatMessage | null = null;
                 
@@ -632,6 +699,7 @@ export function createWebSocketMessageHandler(deps: HandleMessageDeps) {
                 updateStage('code', { status: 'active' });
                 setTotalFiles(message.totalFiles);
                 setIsGenerating(true);
+                onGenerationConfirmed?.();
                 break;
             }
 
@@ -640,20 +708,49 @@ export function createWebSocketMessageHandler(deps: HandleMessageDeps) {
                 setFiles((prev) => setAllFilesCompleted(prev));
                 setProjectStages((prev) => completeStages(prev, ['code']));
 
+                // Drops the initial 'main' "Thinking..." placeholder if
+                // it's still sitting there -- same stale-bubble issue as
+                // the 'error' case above, just on the success path this
+                // time (createAIMessage('generation-complete', ...) below
+                // gets its own id, so addOrUpdateMessage never treats it
+                // as replacing 'main').
+                setMessages(prev => prev.filter(m => !(m.conversationId === 'main' && m.ui?.isThinking)));
+
                 // Think runs are conversational — every assistant turn
                 // is its own "completion", so a stand-alone
                 // `Code generation has been completed` banner is
                 // misleading. Phasic/agentic emit this once at the end
                 // of a multi-phase build, which is when the banner
                 // makes sense.
+                // Guards against duplicate banners if more than one
+                // in-flight poll independently receives its own real
+                // generation_complete before onGenerationSettled below
+                // stops the loop (see that callback's doc comment).
                 if (behaviorType !== 'think') {
-                    sendMessage(createAIMessage('generation-complete', 'Code generation has been completed.'));
+                    setMessages(prev =>
+                        prev.some(m => m.conversationId === 'generation-complete')
+                            ? prev
+                            : addOrUpdateMessage(prev, createAIMessage('generation-complete', 'Code generation has been completed.')),
+                    );
+                }
+
+                // AWS agent-runtime carries the preview URL on this message
+                // (aws/agent-runtime/src/messages.ts) instead of a separate
+                // deployment_completed push -- that message type is Cloudflare-only
+                // and the AWS harness never sends it for the main generation flow.
+                // Without this, previewUrl state never gets set on AWS: the
+                // in-app preview tab (ViewModeSwitch) stays hidden forever
+                // because previewAvailable depends on it (caught live).
+                if (message.previewUrl) {
+                    setPreviewUrl(message.previewUrl);
                 }
 
                 // Reset all phase indicators
                 setIsPhaseProgressActive(false);
                 setIsThinking(false);
                 setIsGenerating(false);
+                onPollResponse?.();
+                onGenerationSettled?.();
                 break;
             }
 
@@ -743,6 +840,34 @@ export function createWebSocketMessageHandler(deps: HandleMessageDeps) {
                 sendMessage(createAIMessage(`phase_update_${message.phase.name}_${message.phase.status}`, label, true));
                 setIsThinking(message.phase.status === 'started');
                 setIsPhaseProgressActive(message.phase.status === 'started');
+                onPollResponse?.();
+                break;
+            }
+
+            case 'infra_status': {
+                // AWS-only cold-start progress (ECS RunTask/waitForPublicIp/
+                // boot for the sandbox and harness Fargate tasks). This
+                // used to surface as a toast, which put a second, separate
+                // "what's happening" indicator on screen alongside the
+                // "Thinking..." placeholder that was already there and not
+                // saying anything useful. Update that same 'main' bubble
+                // in place instead -- one place the user looks, and it
+                // always has the most specific thing known right now.
+                const infraLabel: Record<typeof message.stage, string> = {
+                    sandbox: 'Setting up preview environment',
+                    harness: 'Starting build environment',
+                };
+                if (message.status === 'started') {
+                    sendMessage(createAIMessage('main', `${infraLabel[message.stage]}...`, true));
+                    setIsThinking(true);
+                } else {
+                    // Infra's ready but the model hasn't said or done
+                    // anything yet -- back to the generic placeholder
+                    // rather than leaving "Setting up preview
+                    // environment..." sitting there stale once it no
+                    // longer describes what's actually happening.
+                    sendMessage(createAIMessage('main', 'Thinking...', true));
+                }
                 break;
             }
 
@@ -1122,13 +1247,25 @@ export function createWebSocketMessageHandler(deps: HandleMessageDeps) {
 
             case 'error': {
                 const errorData = message;
-                
+
                 logger.info('🚨 Error message received:', {
                     showAsPopup: errorData.showAsPopup,
                     code: errorData.code,
                     error: errorData.error
                 });
-                
+
+                // Unlike every other terminal message case (phase_update,
+                // generation_complete, etc.), this one was never clearing
+                // isThinking/isGenerating -- leaving a stale "Thinking..."
+                // bubble behind the real error message whenever a
+                // generate_all attempt failed (caught live: "No Anthropic
+                // credentials configured" landed while "Thinking..." kept
+                // showing above it).
+                setIsThinking(false);
+                setIsGenerating(false);
+                onPollResponse?.();
+                onGenerationSettled?.();
+
                 // Check if error should be shown as dialog instead of chat message
                 if (errorData.showAsPopup && errorData.code === 'USAGE_LIMIT_EXCEEDED') {
                     logger.info('🚨 Opening backend error dialog');
@@ -1146,9 +1283,16 @@ export function createWebSocketMessageHandler(deps: HandleMessageDeps) {
                     });
                 } else {
                     logger.info('🚨 Adding error to chat messages');
-                    // Show as chat message for non-popup errors
+                    // Show as chat message for non-popup errors. Also drops
+                    // the initial 'main' "Thinking..." placeholder (use-
+                    // chat.ts seeds it when a new chat opens) if it's still
+                    // sitting there unthinking-flag-cleared -- setIsThinking
+                    // above only resets the global flag (an animation/phase-
+                    // timeline signal), it doesn't touch this literal
+                    // placeholder message, which otherwise stayed forever
+                    // next to the real error (caught live).
                     setMessages(prev => [
-                        ...prev,
+                        ...prev.filter(m => !(m.conversationId === 'main' && m.ui?.isThinking)),
                         createAIMessage(`error_${Date.now()}`, `❌ ${errorData.error}`)
                     ]);
                 }

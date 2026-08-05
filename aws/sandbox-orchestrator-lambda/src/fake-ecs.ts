@@ -48,12 +48,15 @@ export class FakeEcsClient {
 }
 
 export class FakeEc2Client {
-	constructor(private readonly publicIp = '203.0.113.5') {}
+	constructor(
+		private readonly publicIp = '203.0.113.5',
+		private readonly privateIp = '10.42.1.10',
+	) {}
 
 	async send(command: unknown): Promise<unknown> {
 		const kind = (command as { constructor?: { name?: string } })?.constructor?.name;
 		if (kind === 'DescribeNetworkInterfacesCommand') {
-			return { NetworkInterfaces: [{ Association: { PublicIp: this.publicIp } }] };
+			return { NetworkInterfaces: [{ Association: { PublicIp: this.publicIp }, PrivateIpAddress: this.privateIp }] };
 		}
 		throw new Error(`FakeEc2Client: unhandled command ${kind}`);
 	}

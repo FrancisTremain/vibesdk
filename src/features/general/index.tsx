@@ -1,20 +1,6 @@
 import type { ViewDefinition } from '@/api-types';
 import type { FeatureModule, FeatureContext } from '../core/types';
-
-// General projects don't have a preview - show a placeholder
-function GeneralPreview({ className }: { className?: string }) {
-	return (
-		<div className={`${className ?? ''} flex items-center justify-center bg-bg-3 border border-text/10 rounded-lg`}>
-			<div className="text-center p-8">
-				<p className="text-text-primary/70 text-sm">
-					This project type does not have a live preview.
-					<br />
-					View the generated code in the Editor tab.
-				</p>
-			</div>
-		</div>
-	);
-}
+import { AppPreview } from '../app/components/AppPreview';
 
 const GENERAL_VIEWS: ViewDefinition[] = [
 	{
@@ -22,6 +8,12 @@ const GENERAL_VIEWS: ViewDefinition[] = [
 		label: 'Code',
 		iconName: 'Code2',
 		tooltip: 'View and edit code',
+	},
+	{
+		id: 'preview',
+		label: 'Preview',
+		iconName: 'Eye',
+		tooltip: 'Live preview of your app',
 	},
 	{
 		id: 'docs',
@@ -38,7 +30,15 @@ const generalFeatureModule: FeatureModule = {
 		return GENERAL_VIEWS;
 	},
 
-	PreviewComponent: GeneralPreview,
+	// The "general"/agentic behavior is the only enabled feature on the AWS
+	// backend (aws/user-api-lambda/src/handler.ts's POST /api/agent comment
+	// -- the phased "app" feature's blueprint-streaming UX has no AWS
+	// equivalent). It still produces a standard Vite dev-server preview via
+	// the harness, so it gets the same live-iframe component as "app"
+	// rather than the static "no preview" placeholder this used to render
+	// unconditionally, which hid every AWS-generated app's preview even
+	// once previewUrl was populated (caught live).
+	PreviewComponent: AppPreview,
 
 	onActivate(context: FeatureContext) {
 		console.log('[GeneralFeature] Activated for project:', context.projectType);

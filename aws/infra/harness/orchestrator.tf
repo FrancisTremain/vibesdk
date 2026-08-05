@@ -111,8 +111,22 @@ resource "aws_iam_role_policy" "harness_orchestrator_lambda_ecs" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["ecs:RunTask", "ecs:StopTask", "ecs:DescribeTasks"]
+        Action   = ["ecs:RunTask"]
         Resource = [aws_ecs_task_definition.harness.arn, replace(aws_ecs_task_definition.harness.arn, ":${aws_ecs_task_definition.harness.revision}", ":*")]
+        Condition = {
+          ArnEquals = { "ecs:cluster" = aws_ecs_cluster.harness.arn }
+        }
+      },
+      {
+        # ecs:StopTask/DescribeTasks operate on running task *instances*
+        # (arn:...:task/<cluster>/<task-id>), a different ARN shape from
+        # RunTask's task-*definition* resource above -- lumping all three
+        # under the task-definition ARN silently leaves these two
+        # unauthorized (caught live: aws/infra/sandbox/orchestrator.tf had
+        # the identical bug, hit first during a real generation run).
+        Effect   = "Allow"
+        Action   = ["ecs:StopTask", "ecs:DescribeTasks"]
+        Resource = "${replace(aws_ecs_cluster.harness.arn, "cluster/", "task/")}/*"
         Condition = {
           ArnEquals = { "ecs:cluster" = aws_ecs_cluster.harness.arn }
         }
@@ -167,6 +181,13 @@ resource "aws_lambda_function" "harness_orchestrator" {
       AGENT_CONNECTIONS_TABLE         = data.aws_ssm_parameter.agent_connections_table_name.value
       AGENT_CONNECTIONS_SESSION_INDEX = local.agent_connections_session_index
       WS_MANAGEMENT_ENDPOINT          = data.aws_ssm_parameter.agent_runtime_ws_management_endpoint.value
+
+      # Forwards real generation activity to the sandbox instance's own
+      # idle clock (aws/sandbox-activity-client.ts) -- see main.tf's SSM
+      # data sources for where these come from (aws/infra/sandbox, a
+      # separate root module).
+      SANDBOX_ORCHESTRATOR_ENDPOINT = data.aws_ssm_parameter.sandbox_orchestrator_api_endpoint.value
+      SANDBOX_ORCHESTRATOR_SECRET   = data.aws_ssm_parameter.sandbox_orchestrator_secret.value
     }
   }
 
